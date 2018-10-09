@@ -1,0 +1,9 @@
+[package]
+name = "optizee"
+version = "0.1.0"
+authors = ["Jonathan Stites <mail@jonstites.com>"]
+
+[dependencies]
+clap = "2"
+permutohedron = "0.2.4"
+itertools = "0.7.8"
