@@ -5,8 +5,7 @@ extern crate itertools;
 use itertools::Itertools;
 use permutohedron::Heap;
 use std::collections::HashSet;
-use optizee::ScoreCard;
-use optizee::State;
+use optizee::GameState;
 use optizee::DiceCounts;
 
 fn recursive(i: i32, cache: &mut HashSet<i32>) -> i32 {
@@ -20,19 +19,15 @@ fn recursive(i: i32, cache: &mut HashSet<i32>) -> i32 {
 
 fn main() {
     println!("Hello, world!!@");
-    let mut states: Vec<State> = Vec::new();
+    let mut states: Vec<GameState> = Vec::new();
     let mut cache: HashSet<i32> = HashSet::new();
     println!("{}", recursive(5, &mut cache));
     println!("{:?}", cache);
     for i in 0..2100000 {
-        let gs = ScoreCard {
+        let state = GameState {
             entries: [false; 15],
-        };
-
-        let state = State {
-            score_card: gs,
             upper_score: 2,
-            dice: DiceCounts::new([0; 6]),
+            dice_kept: DiceCounts::new([0; 6]),
             rolls_left: 1
         };
 
