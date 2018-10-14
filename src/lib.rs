@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 pub struct DiceCounts {
     counts: HashMap<UpperCategory, i32>
@@ -13,6 +14,10 @@ impl DiceCounts {
             total += die_value * count;
         }
         total
+    }
+
+    pub fn largest_sequence(&self) -> i32 {
+        3
     }
     
     pub fn value(&self, category: Category) -> i32 {
@@ -37,7 +42,34 @@ impl DiceCounts {
                 }
                 return 0;
             },
-            _ => 2
+            Category::Lower(LowerCategory::FullHouse) => {
+                let values = self.counts.values().collect::<HashSet<_>>();
+                if values.contains(&3) && values.contains(&2) {
+                    return 25;
+                }
+                return 0;
+            }
+            Category::Lower(LowerCategory::SmallStraight) => {
+                if self.largest_sequence() >= 4 {
+                    return 35;
+                }
+                return 0;
+            }
+            Category::Lower(LowerCategory::LargeStraight) => {
+                if self.largest_sequence() >= 5 {
+                    return 45;
+                }
+                return 0;
+            }
+            Category::Lower(LowerCategory::Yahtzee) => {
+                if self.counts.values().max() >= Some(&5) {
+                    return 50;
+                }
+                return 0;
+            }
+            Category::Lower(LowerCategory::Chance) => {
+                self.counts.values().sum()
+            }
         }
     }
 }
