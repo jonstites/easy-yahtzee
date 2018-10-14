@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::cmp::max;
 
+//const MAX_DICE: i32 = 5;
+
+#[derive(Debug)]
 pub struct DiceCounts {
     counts: HashMap<i32, i32>
 }
@@ -15,7 +18,13 @@ impl DiceCounts {
     }
 
     pub fn insert(&mut self, key: i32, value: i32) {
-        self.counts.insert(key, value);
+        // normalize here so zeros are removed
+        if value == 0 {
+            self.counts.remove(&key);
+        }
+        else {
+            self.counts.insert(key, value);
+        }
     }
 
     pub fn sum(&self) -> i32 {
@@ -47,6 +56,10 @@ impl DiceCounts {
             previous_die = die;
         }
         largest_length
+    }
+
+    pub fn is_yahtzee(&self) -> bool {
+        self.counts.values().max() >= Some(&5)
     }
     
     pub fn value(&self, category: Category) -> i32 {
@@ -92,7 +105,7 @@ impl DiceCounts {
                 return 0;
             }
             Category::Lower(LowerCategory::Yahtzee) => {
-                if self.counts.values().max() >= Some(&5) {
+                if self.is_yahtzee() {
                     return 50;
                 }
                 return 0;
@@ -104,7 +117,7 @@ impl DiceCounts {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord, Debug)]
 pub enum UpperCategory {
     Ones = 1,
     Twos = 2,
@@ -114,7 +127,7 @@ pub enum UpperCategory {
     Sixes = 6
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub enum LowerCategory {
     ThreeOfAKind,
     FourOfAKind,
@@ -125,23 +138,114 @@ pub enum LowerCategory {
     Chance
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub enum Category {
     Upper(UpperCategory),
     Lower(LowerCategory),
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum YahtzeeState {
-    Unset,
     Zero,
     NonZero,
 }
 
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
 pub enum CategoryState {
-    Standard(bool),
-    Yahtzee(YahtzeeState),
+    Standard(Category),
+    Yahtzee(Category, YahtzeeState),
 }
 
+#[derive(Debug)]
+pub struct PartialGameState {
+    categories: HashSet<CategoryState>,
+    upper_value: i32,
+}
+
+impl PartialGameState {
+
+    pub fn new() -> PartialGameState {
+        PartialGameState {
+            categories: HashSet::new(),
+            upper_value: 0,
+        }
+    }
+
+    pub fn child(&self, dice: DiceCounts, category: Category) -> PartialGameState {
+
+        let upper_value = match category {
+            Category::Upper(_) => max(dice.value(category) + self.upper_value, 63),
+            Category::Lower(_) => self.upper_value
+        };
+
+        let category_state = match category {
+            Category::Lower(LowerCategory::Yahtzee) => {
+                if dice.is_yahtzee() {
+                    CategoryState::Yahtzee(category, YahtzeeState::NonZero)
+                }
+                else {
+                    CategoryState::Yahtzee(category, YahtzeeState::Zero)
+                }
+            }
+            _ => CategoryState::Standard(category),
+        };
+        
+        let mut categories = self.categories.clone();
+        categories.insert(category_state);
+        
+        PartialGameState {
+            categories,
+            upper_value,
+        }
+    }
+
+    pub fn valid_categories(&self) -> Vec<Category> {
+        use UpperCategory::*;
+        use LowerCategory::*;
+        use Category::*;
+        static POSSIBILITIES : [Category; 13] =
+            [
+                Upper(Ones),
+                Upper(Twos),
+                Upper(Threes),
+                Upper(Fours),
+                Upper(Fives),
+                Upper(Sixes),
+                Lower(ThreeOfAKind),
+                Lower(FourOfAKind),
+                Lower(FullHouse),
+                Lower(SmallStraight),
+                Lower(LargeStraight),
+                Lower(Yahtzee),
+                Lower(Chance),
+            ];
+
+        let mut valid = Vec::new();
+        for category in POSSIBILITIES.into_iter() {
+            if let Lower(Yahtzee) = category {
+                let zero = CategoryState::Yahtzee(Lower(Yahtzee), YahtzeeState::Zero);
+                let nonzero = CategoryState::Yahtzee(Lower(Yahtzee), YahtzeeState::NonZero);
+                if !self.categories.contains(&zero) &&
+                    !self.categories.contains(&nonzero) {
+                        valid.push(*category);
+                }
+            }
+            else {
+                let state = CategoryState::Standard(*category);
+                if !self.categories.contains(&state) {
+                    valid.push(*category);
+                }
+            }
+        }
+        valid
+    }
+}
+
+#[derive(Debug)]
+pub struct LocalRoundState {
+    dice: DiceCounts,
+    rolls_left: i32,
+}
 
 #[cfg(test)]
 mod tests {
@@ -296,5 +400,12 @@ mod tests {
         let score = dice.value(category);
         assert_eq!(score, 56);
     }
-    
+
+    #[test]
+    fn test_partial_game_state() {
+        let state = PartialGameState::new();
+        println!("state: {:?}", state);
+
+        assert_eq!(1, 0);
+    }
 }
