@@ -1,9 +1,16 @@
+extern crate itertools;
+
+use itertools::Itertools;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
+//use std::iter::Iterator;
 use std::cmp::max;
 
-//const MAX_DICE: i32 = 5;
 
+const MAX_DICE: i32 = 5;
+const NUM_DIE_FACES: i32 = 6;
+    
 #[derive(Debug)]
 pub struct DiceCounts {
     counts: HashMap<i32, i32>
@@ -24,6 +31,13 @@ impl DiceCounts {
         }
         else {
             self.counts.insert(key, value);
+        }
+    }
+
+    pub fn add(&mut self, dice: Vec<i32>) {
+        for die in dice {
+            let entry = self.counts.entry(die).or_insert(0);
+            *entry += 1;
         }
     }
 
@@ -116,6 +130,45 @@ impl DiceCounts {
         }
     }
 }
+
+
+/*
+struct DiceCombinations {
+    
+    counts: HashMap<i32, HashMap<DiceCounts, i32>>,
+}   
+
+impl DiceCombinations {
+
+    pub fn new(max_dice: i32, num_die_faces: i32) -> DiceCombinations {
+        let mut combinations = DiceCombinations {
+            counts: HashMap::new()
+        };
+
+        combinations.build(max_dice, num_die_faces);
+        combinations
+    }
+
+    pub fn build(&mut self, max_dice: i32, num_die_faces: i32) {
+
+        for n in 0..=max_dice {
+        
+            let mut dice_it = (0..n).map(|i| 1..=num_die_faces).multi_cartesian_product();
+            
+            for dice_permutation in dice_it {
+                let dice_counts = DiceCounts::new();
+                dice_counts.add(dice_permutation.into_iter().collect());
+                
+                let combination_count = self.counts.entry(n)
+                    .or_insert(HashMap::new())
+                    .entry(dice_counts)
+                    .or_insert(0);
+                *combination_count += 1;
+            }
+        }
+    }
+}*/
+
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord, Debug)]
 pub enum UpperCategory {
@@ -241,11 +294,14 @@ impl PartialGameState {
     }
 }
 
+
+
 #[derive(Debug)]
 pub struct LocalRoundState {
     dice: DiceCounts,
     rolls_left: i32,
 }
+
 
 #[cfg(test)]
 mod tests {
