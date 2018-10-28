@@ -4,25 +4,39 @@ extern crate itertools;
 
 use itertools::Itertools;
 use std::collections::HashMap;
+
 use std::cmp::max;
 use std::cmp::min;
 
 const MAX_DICE: i32 = 5;
 const DICE_SIDES: usize = 6;
-
+const UPPER_BONUS: f32 = 35.0;
+const YAHTZEE_BONUS: f32 = 100.0;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-struct DiceCounts {
+pub struct DiceCounts {
     counts: [i32; DICE_SIDES]
 }
 
 impl DiceCounts {
 
-    fn new(counts: [i32; DICE_SIDES]) -> DiceCounts {
+    pub fn new(counts: [i32; DICE_SIDES]) -> DiceCounts {
         DiceCounts {
             counts
         }
     }
+
+    fn from_vec(vec_counts: Vec<i32>) -> DiceCounts {
+        let mut counts = [0; DICE_SIDES];
+        //let mut vec_counts_clone = vec_counts.clone();
+        for (index, count) in vec_counts.iter().enumerate() {
+            counts[index] = *count;
+        }
+
+        DiceCounts::new(counts)
+
+    }
+    
     fn from_dice(dice: Vec<i32>) -> DiceCounts {
         let mut counts = [0; 6];
         for die in dice {
@@ -57,23 +71,32 @@ impl DiceCounts {
                 current_length += 1;
             }
             else {
-                current_length = 1;
+                current_length = 0;
             }
+//            println!("{:?} {:?} {:?} {:?}", self.counts, die_count, current_length, largest_length);
             largest_length = max(current_length, largest_length);
         }
         largest_length
     }
     
+
+    fn possible_keepers(&self) -> Vec<DiceCounts> {
+        self.counts.iter()
+            .map(|i| 0..=*i)
+            .multi_cartesian_product()
+            .map(|i| DiceCounts::from_vec(i))
+            .collect()
+    }
     
 }
 
-struct DiceCombinations {
+pub struct DiceCombinations {
     lookup: HashMap<i32, HashMap<DiceCounts, i32>>
 }
 
 impl DiceCombinations {
 
-    fn new() -> DiceCombinations {
+    pub fn new() -> DiceCombinations {
         let mut lookup = HashMap::new();
 
         
@@ -142,6 +165,7 @@ impl Entry {
             Entry::L(e) => *e as usize,
         }
     }
+    // TODO: Free choice Joker rule!
     fn score(self, dice: DiceCounts) -> i32 {
         use Entry::*;
         use Lower::*;
@@ -173,19 +197,23 @@ impl Entry {
                 if counts.contains(&&3) && counts.contains(&&2) {
                     return 25;
                 }
+                // TODO: This is non-standard!
+                if counts.contains(&&5) {
+                    return 25;
+                }
                 return 0;
             }
             
             L(SmallStraight) => {
                 if dice.largest_sequence_length() >= 4 {
-                    return 35;
+                    return 30;
                 }
                 return 0;
             }
             
             L(LargeStraight) => {
                 if dice.largest_sequence_length() >= 5 {
-                    return 45;
+                    return 40;
                 }
                 return 0;
             }
@@ -203,8 +231,8 @@ impl Entry {
 
 }
 
-#[derive(PartialEq, Eq, Hash, Copy, Clone)]
-struct State {
+#[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
+pub struct State {
     entries: [bool; 14],
     upper_score: i32,
     rolls_left: i32,
@@ -213,7 +241,7 @@ struct State {
 
 impl State {
 
-    fn new(entries: [bool; 14], upper_score: i32, rolls_left: i32, dice: DiceCounts) -> State {
+    pub fn new(entries: [bool; 14], upper_score: i32, rolls_left: i32, dice: DiceCounts) -> State {
         State {
             entries,
             upper_score,
@@ -302,37 +330,75 @@ impl State {
             dice
         }
     }
+
 }
 
-#[derive(PartialEq, Eq, Hash, Copy, Clone)]
+#[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
 enum GameState {
     Full(State),
     Keepers(State),
 }
 
-struct ExpectedValues {
-    ev: HashMap<State, f32>,
+pub struct ExpectedValues {
+    pub ev: HashMap<State, f32>,
 }
 
 
-fn widget(
+pub fn widget(
     state: State,
-    cache: &ExpectedValues,
+    cache: &mut ExpectedValues,
     dice_combinations: &DiceCombinations) -> f32 {
+
+    let entries = state.entries;
+    let upper_score = state.upper_score;
 
     let mut local_cache = HashMap::new();
     let dice_it = dice_combinations.num_dice(&MAX_DICE).unwrap();
     for dice in dice_it.keys() {
         let mut best_value: f32 = 0.0;
         for entry in state.valid_entries() {
-            let entry_score = entry.score(*dice) as f32 + cache.ev.get(&state.child(entry, *dice)).unwrap();
-            best_value = best_value.max(entry_score);
+            let child = state.child(entry, *dice);
+
+            let child_score = match child.game_over() {
+                true => 0_f32,
+                false => {
+                    if !cache.ev.contains_key(&child) {
+                        let result = widget(child, cache,  dice_combinations);
+                        cache.ev.insert(child, result);
+                    }
+                    *cache.ev.get(&child).unwrap()
+                }
+            };
+
+            // PLUS will have to add upper score and yahtzee score.
+            let dice_score = entry.score(*dice) as f32;
+            let upper_bonus = match (child.upper_score, state.upper_score) {
+                (63, 63) => 0.0,
+                (63, _) => UPPER_BONUS,
+                (_, _) => 0.0,
+            };
+
+            let yahtzee_bonus = match (dice.is_yahtzee(), state.entries[13]) {
+                (true, true) => YAHTZEE_BONUS,
+                _ => 0.0,
+            };
+            let score = child_score + dice_score + upper_bonus + yahtzee_bonus;
+            best_value = best_value.max(score);
         }
-        let new_state = state.make_roll(*dice);
+
+        let new_state = State {
+            entries,
+            upper_score,
+            rolls_left: 0,
+            dice: *dice
+        };
+        //println!("mistake here? value {:?} {:?}", best_value, new_state);
         local_cache.insert(GameState::Full(new_state), best_value);
     }
 
-    
+
+
+
     for rolls_left in 1..=3 {
         for num_dice in 0..=MAX_DICE {
             if rolls_left == 3 && num_dice != 0 {
@@ -341,8 +407,6 @@ fn widget(
             
             let dice_it = dice_combinations.num_dice(&num_dice).unwrap();
             for dice in dice_it.keys() {
-                let entries = state.entries;
-                let upper_score = state.upper_score;
                 let new_state = State {
                     entries,
                     upper_score,
@@ -353,20 +417,59 @@ fn widget(
                 let mut value = 0.0;
                 let dice_it2 = dice_combinations.num_dice(&(MAX_DICE as i32 - num_dice)).unwrap();
                 for (dice2, num) in dice_it2 {
-                    let new_state2 = new_state.make_roll(*dice);
+                    let new_state2 = new_state.make_roll(*dice2);
                     let score = local_cache.get(&GameState::Full(new_state2)).unwrap();
                     value += (*num as f32) * score;
+                    //println!("adding new value for keeper from: {:?}, value: {:?}", new_state2, score);                    
                 }
                 // divide value exponentially let value = value / (DICE_SIDES^ max_dice)
+                value = value / dice_combinations.num_dice(&(MAX_DICE as i32 - num_dice)).unwrap().values().sum::<i32>() as f32;
                 local_cache.insert(GameState::Keepers(new_state), value);
+                //println!("keeprs: {:?}, value: {:?}", new_state, value);
               }
         }
 
-        // for dice in n=5
+        if rolls_left == 3 {
+            continue
+        }
+
+        
+        let dice_it = dice_combinations.num_dice(&5).unwrap();
+        for dice in dice_it.keys() {
+            let mut best_value: f32 = 0.0;
+
+            for keepers in dice.possible_keepers() {
+                let new_state = State {
+                    entries,
+                    upper_score,
+                    rolls_left,
+                    dice: keepers
+                };
+
+                let score = local_cache.get(&GameState::Keepers(new_state)).unwrap();
+                //println!("a keeper for later is {:?} with {:?}", new_state, score);
+                best_value = best_value.max(*score);                
+            }
+
+            let new_state = State {
+                entries,
+                upper_score,
+                rolls_left,
+                dice: *dice
+            };
+            
+            local_cache.insert(GameState::Full(new_state), best_value);
+            //println!("full: {:?}, value: {:?}", new_state, best_value);            
+        }
     }
-    local_cache.insert(GameState::Keepers(state), 5.0);
-    5.0
-    
+
+    for (key, value) in local_cache.iter() {
+        //println!("{:?}", key);
+        //println!("{:?}", value);        
+    }
+    //println!("set: {:?} {:?}", state, local_cache.get(&GameState::Keepers(state)).unwrap());
+    *local_cache.get(&GameState::Keepers(state)).unwrap()
+
 }
 
 
@@ -473,18 +576,23 @@ mod tests {
 
     #[test]
     fn score_small_straight_test() {
+        let entry = Entry::L(Lower::SmallStraight);
+
         let counts = [1, 1, 5, 0, 0, 0];
         let dice = DiceCounts::new(counts);
-
-        let entry = Entry::L(Lower::SmallStraight);
         let score = entry.score(dice);
         assert_eq!(score, 0);
 
         let counts = [1, 1, 5, 1, 0, 0];
         let dice = DiceCounts::new(counts);
-
         let score = entry.score(dice);
-        assert_eq!(score, 35);
+        assert_eq!(score, 30);
+
+        let counts = [0, 2, 1, 1, 0, 1];
+        let dice = DiceCounts::new(counts);
+        let score = entry.score(dice);        
+        assert_eq!(score, 0);
+            
     }
 
     #[test]
@@ -500,7 +608,7 @@ mod tests {
         let dice = DiceCounts::new(counts);
 
         let score = entry.score(dice);
-        assert_eq!(score, 45);
+        assert_eq!(score, 40);
     }
 
     #[test]
@@ -601,5 +709,26 @@ mod tests {
         assert!(!state.game_over());
 
     }
+
+    //#[test]
+    fn widget_test() {
+        let mut entries =             [false;14];
+        //entries[0] = false;
+        let state = State::new(
+            entries,
+            0,
+            3,
+            DiceCounts::new([0;6]));
+
+        let mut cache = ExpectedValues { ev: HashMap::new() };
+        let dc = DiceCombinations::new();
+
+
+        let ev = widget(state, &mut cache, &dc);
+        println!("{:?}", ev);
+        assert_eq!(ev, 1.0);
+        
+    }
+    
 }
 
