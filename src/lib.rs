@@ -67,11 +67,8 @@ impl Advisor {
         }
     }
 
-
-
     fn set_expected_values(&mut self) {
         let start_state = State::default();
-
         //self.calculate(start_state);
         
     }
@@ -159,40 +156,28 @@ mod tests {
 
     #[test]
     fn test_roll_probabilities_empty_roll() {
-        let mut advisor = Advisor::new();
-        advisor.set_roll_probabilities();
-
         let empty_roll = DiceCombination::new();
-        let result = advisor.roll_probabilities.get(0 as usize).unwrap();
+        let actual = DiceCombination::probabilities(0, 6);
 
-        assert!(result.contains_key(&empty_roll));
+        assert!(actual.contains_key(&empty_roll));
 
         let expected_prob = 1.0;
-        assert_eq!(result.get(&empty_roll).unwrap(), &expected_prob);
-    }
-
-    #[test]
-    fn test_roll_probabilities_length() {
-        let mut advisor = Advisor::new();
-        advisor.set_roll_probabilities();
-        
-        let number_dice = advisor.roll_probabilities.len();
-
-        // 5 dice rolled by default, plus a 0 dice roll
-        assert_eq!(number_dice, 6);
+        assert_eq!(actual.get(&empty_roll).unwrap(), &expected_prob);
     }
 
     #[test]
     fn test_roll_probabilities_correct() {
-        let mut advisor = Advisor::new();
-        advisor.set_roll_probabilities();
-        
-        let total_keys = advisor.roll_probabilities.get(5 as usize).unwrap().len();
-        assert_eq!(total_keys, 252);
+        let probabilities = DiceCombination::probabilities(5, 6);
+
+        let actual_dice_combinations = probabilities.len();
+        let expected_dice_combinations = 252;
+        assert_eq!(actual_dice_combinations, expected_dice_combinations);
 
         
-        let total_prob: f64 = advisor.roll_probabilities.get(5 as usize).unwrap().values().into_iter().sum();
-        assert!((total_prob - 1.0).abs() < 0.000001);
+        let total_prob: f64 = probabilities.values().into_iter().sum();
+        let abs_difference = (total_prob - 1.0).abs();
+        let tolerance = 0.0000001;
+        assert!(abs_difference < tolerance);
     }
 }
 
