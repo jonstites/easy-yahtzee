@@ -63,9 +63,14 @@ impl ActionScores {
         };
         let mut starting_state = State::default();
         starting_state.entries_taken = [true; 13];
-        starting_state.entries_taken[1] = false;
+        starting_state.entries_taken[8] = false;                
+        starting_state.entries_taken[9] = false;        
+        starting_state.entries_taken[10] = false;
         starting_state.entries_taken[11] = false;
+        starting_state.entries_taken[12] = false;
+
         action_scores.set_scores(starting_state);
+        println!("{:?}", action_scores.state_values.get(&starting_state));
         action_scores
             
     }
@@ -90,7 +95,7 @@ impl ActionScores {
         let score = self.calculate_score(state);
         self.state_values.insert(state, score);
 
-        println!("{:?} {:?}", score, state);
+        //println!("{:?} {:?}", score, state);
                  
     }
 
@@ -99,17 +104,80 @@ impl ActionScores {
             return 0.0;
         }
 
+        let mut roll_values = HashMap::new();
         for roll in self.possible_rolls.clone() {
             let score = Entry::iterator()
                 .filter(|&e| parent_state.is_valid(*e))                
                 .map(|&e| parent_state.score(e, roll) as f64 + self.state_values.get(&parent_state.child(e, roll)).unwrap())
                 .fold(0./0., f64::max); // Find the largest non-NaN in vector, or NaN otherwise
-            return score;
-            /*for entry in Entry::iterator().filter(|&e| parent_state.is_valid(*e)) {
-                return 1.0;
-            }*/
+
+            roll_values.insert(roll, score);
+            //println!("last roll {:?} {:?}", roll, score);
         }
-        2.0
+
+        let mut keeper_values = HashMap::new();
+        let mut new_roll_values = HashMap::new();
+        
+        for roll in self.possible_rolls.clone() {
+            let mut best_keeper_value: f64 = 0.0;
+            for keeper in roll.possible_keepers() {
+                if !keeper_values.contains_key(&keeper) {
+                    let dice_to_roll: i32 = DICE_TO_ROLL - (keeper.dice.iter().sum::<i32>());
+                    let mut expected_value = 0.0;
+                    //println!("{:?} {:?} {:?}", roll, keeper, dice_to_roll);
+                    for (keeper_roll, keeper_roll_probability) in self.rolls[dice_to_roll as usize].iter() {
+                        let new_dice = keeper.add(keeper_roll);
+                        //println!("{:?} {:?} {:?} {:?}", keeper, keeper_roll, dice_to_roll, new_dice);                        
+                        let new_dice_expected_value = roll_values.get(&new_dice).unwrap();
+                        expected_value += new_dice_expected_value * keeper_roll_probability;
+                    }
+                    keeper_values.insert(keeper, expected_value);
+                    //println!("keeper value {:?} {:?}", expected_value, keeper);
+                }
+                best_keeper_value = best_keeper_value.max(*keeper_values.get(&keeper).unwrap());
+
+            }
+            new_roll_values.insert(roll, best_keeper_value);
+            //println!("roll the second {:?} {:?}", roll, best_keeper_value);
+        }
+
+        roll_values = new_roll_values;
+
+        let mut keeper_values = HashMap::new();
+        let mut new_roll_values = HashMap::new();
+        
+        for roll in self.possible_rolls.clone() {
+            let mut best_keeper_value: f64 = 0.0;
+            for keeper in roll.possible_keepers() {
+                if !keeper_values.contains_key(&keeper) {
+                    let dice_to_roll: i32 = DICE_TO_ROLL - (keeper.dice.iter().sum::<i32>());
+                    let mut expected_value = 0.0;
+                    //println!("{:?} {:?} {:?}", roll, keeper, dice_to_roll);
+                    for (keeper_roll, keeper_roll_probability) in self.rolls[dice_to_roll as usize].iter() {
+                        let new_dice = keeper.add(keeper_roll);
+                        //println!("{:?} {:?} {:?} {:?}", keeper, keeper_roll, dice_to_roll, new_dice);                        
+                        let new_dice_expected_value = roll_values.get(&new_dice).unwrap();
+                        expected_value += new_dice_expected_value * keeper_roll_probability;
+                    }
+                    keeper_values.insert(keeper, expected_value);
+                    //println!("keeper value {:?} {:?}", expected_value, keeper);
+                }
+                best_keeper_value = best_keeper_value.max(*keeper_values.get(&keeper).unwrap());
+                new_roll_values.insert(roll, best_keeper_value);
+            }
+        }
+        roll_values = new_roll_values;
+        
+        let mut expected_value = 0.0;
+        let keeper = DiceCombination::new();
+        for (keeper_roll, keeper_roll_probability) in self.rolls[5 as usize].iter() {
+            let new_dice = keeper.add(keeper_roll);
+            let new_dice_expected_value = roll_values.get(&new_dice).unwrap();
+            expected_value += new_dice_expected_value * keeper_roll_probability;
+            //println!("{:?} {:?} {:?} {:?}", new_dice, new_dice_expected_value, keeper_roll_probability, parent_state);
+        }
+        expected_value
+
     }
 
     fn get_entry_scores(
@@ -175,7 +243,7 @@ impl State {
         entries_taken[index] = true;     
 
         let upper_score_total = self.new_upper_score(entry, roll);
-        let positive_yahtzee = self.positive_yahtzee || ((entry == Yahtzee) && (self.positive_yahtzee));
+        let positive_yahtzee = self.positive_yahtzee || ((entry == Yahtzee) && (roll.is_yahtzee()));
         
         State {
             entries_taken,
@@ -216,7 +284,7 @@ impl State {
         };
 
         let dice_score = self.score_dice(entry, roll);
-
+        //println!("{:?} {:?} {:?} {:?} {:?}", upper_score_bonus, yahtzee_bonus, dice_score, entry, roll);
         let total_score = upper_score_bonus + yahtzee_bonus + dice_score;
         total_score
     }
@@ -226,11 +294,12 @@ impl State {
         // todo: support configuration for joker rule
         let index = State::index(entry);
         
-        let joker = (
-            roll.is_yahtzee() &&
-                self.positive_yahtzee &&
-                self.entries_taken[index]
-        );
+        let yahtzee_index = roll.dice.iter().position(|&x| x == 5);
+            
+        let joker = roll.is_yahtzee() &&
+                self.entries_taken[State::index(Yahtzee)] &&
+                self.entries_taken[yahtzee_index.unwrap()];
+
 
         match entry {
             Ones => 1 * roll.dice[index],
@@ -259,14 +328,42 @@ impl State {
             }
             FullHouse => {
                 let counts = roll.dice.iter().collect::<HashSet<_>>();
-                if counts.contains(&3) && counts.contains(&2) {
+                if joker || (counts.contains(&3) && counts.contains(&2)) {
                     return 25;
                 }
                 return 0;
             }
-            SmallStraight => 0,
-            LargeStraight => 0,
-            Yahtzee => 0,
+            SmallStraight => {
+                let runs = roll.dice.into_iter().group_by(|&die_count| die_count > &0);
+                let longest_run = runs.into_iter()
+                    .filter(|(is_positive, _)| *is_positive)
+                    .map(|(_, group)| group.collect::<Vec<_>>().len())
+                    .max().unwrap();
+
+                if joker || longest_run >= 4 {
+                    return 30;
+                }
+                return 0;
+            }
+            LargeStraight => {
+                let runs = roll.dice.iter().group_by(|&die_count| die_count > &0);
+                let longest_run = runs.into_iter()
+                    .filter(|(is_positive, _)| *is_positive)
+                    .map(|(_, group)| group.collect::<Vec<_>>().len())
+                    .max().unwrap();
+
+                if joker || longest_run >= 5 {
+                    return 40;
+                }
+                return 0;
+
+            }
+            Yahtzee => {
+                if roll.is_yahtzee() {
+                    return 50;
+                }
+                return 0;
+            },
             Chance => roll.dice.iter()
                 .enumerate()
                 .map(|(i, count)| count * (i as i32 + 1))
@@ -315,7 +412,7 @@ impl DiceCombination {
     fn from_permutation(permutation: Vec<i32>) -> DiceCombination {
         let mut combination = [0; DICE_SIDES as usize];
         for die in permutation {
-            let index: usize = (die - 1) as usize;
+            let index: usize = die as usize;
             let mut count = combination[index];
             combination[index] = count + 1;
         }
@@ -340,7 +437,7 @@ impl DiceCombination {
         let mut probabilities = HashMap::new();
 
         let permutation_it = (0..dice_number)
-            .map(|_| 1..=(DICE_SIDES as i32))
+            .map(|_| 0..(DICE_SIDES as i32))
             .multi_cartesian_product();
 
         for permutation in permutation_it {
@@ -358,6 +455,39 @@ impl DiceCombination {
     fn is_yahtzee(&self) -> bool {
         self.dice.iter().max().unwrap() >= &5
     }
+
+    fn possible_keepers(&self) -> Vec<DiceCombination> {
+        self.dice.iter()
+            .map(|i| 0..=*i)
+            .multi_cartesian_product()
+            .map(|new_counts| DiceCombination::from_vec(new_counts))
+            .collect()
+    }
+
+    fn add(&self, other: &DiceCombination) -> DiceCombination {
+        let mut new_dice = self.dice.clone();
+
+        for (index, count) in other.dice.iter().enumerate() {
+            new_dice[index] += count;
+        }
+
+        DiceCombination {
+            dice: new_dice,
+        }
+    }
+
+
+    fn from_vec(vec_counts: Vec<i32>) -> DiceCombination {
+        let mut counts = [0; DICE_SIDES as usize];
+
+        for (index, count) in vec_counts.iter().enumerate() {
+            counts[index] = *count;
+        }
+
+        DiceCombination {dice: counts }
+
+    }
+    
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
