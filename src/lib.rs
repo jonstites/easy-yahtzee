@@ -373,12 +373,13 @@ fn best_entry_score(
 }
 
 fn average_rolled_dice_score(
-    minimal_state: &State,
-    roll_probs: &Vec<HashMap<DiceCombination, f64>>,    
     full_state: &FullState,
-    full_state_values: &mut HashMap<Fs, f64>)
-    -> f64 {
-
+    minimal_state: &State,
+    minimal_state_values: &HashMap<State, f64>,
+    possible_rolls: &Vec<DiceCombination>,
+    roll_probs: &Vec<HashMap<DiceCombination, f64>>,
+    full_state_values: &mut HashMap<Fs, f64>
+) -> f64 {
 
     let keeper_fs = Fs::I(*full_state);
     let keeper = full_state.dice;
@@ -387,15 +388,37 @@ fn average_rolled_dice_score(
     for (keeper_roll, keeper_roll_probability) in roll_probs[dice_to_roll as usize].iter() {
         let new_dice = keeper.add(keeper_roll);
         let new_fs = Fs::C(FullState{dice: new_dice, rolls_remaining: full_state.rolls_remaining - 1});
-        let new_dice_expected_value = *full_state_values.entry(new_fs).or_insert(
-            best_keeper_score());
+        let new_dice_expected_value = full_state_calculation(
+            new_fs,
+            minimal_state,
+            minimal_state_values,
+            possible_rolls,
+            roll_probs,
+            full_state_values);
         expected_value += new_dice_expected_value * keeper_roll_probability;
     }
     expected_value
 }
 
-fn best_keeper_score() -> f64 {
-    0.0
+fn best_keeper_score(
+    full_state: &FullState,
+    minimal_state: &State,
+    minimal_state_values: &HashMap<State, f64>,
+    possible_rolls: &Vec<DiceCombination>,
+    roll_probs: &Vec<HashMap<DiceCombination, f64>>,
+    full_state_values: &mut HashMap<Fs, f64>
+) -> f64 {
+
+    full_state.dice.possible_keepers().iter()
+        .map(|&keeper| Fs::I(FullState{dice: keeper, rolls_remaining: full_state.rolls_remaining}))
+        .map(|new_fs| full_state_calculation(
+            new_fs,
+            minimal_state,
+            minimal_state_values,
+            possible_rolls,
+            roll_probs,
+            full_state_values))
+        .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
 }
 
 fn full_state_calculation(
@@ -820,8 +843,6 @@ mod tests {
         let tolerance = 0.0000001;
         assert!(abs_difference < tolerance);
     }
-
-
 }
 
 
