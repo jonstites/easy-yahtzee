@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_variables)]
+#![allow(dead_code, unused_variables, unused_parens, unused_imports)]
 
 
 extern crate itertools;
@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::slice::Iter;
 
+mod states;
+
 use self::Entry::*;
 
 const DICE_TO_ROLL: i32 = 5;
@@ -16,7 +18,9 @@ const DICE_SIDES: i32 = 6;
 
 struct Config {
     upper_section_bonus: i32,
-    yahtzee_bonus: i32,    
+    yahtzee_bonus: i32,
+    dice_to_roll: i32,
+    dice_sides: i32
 }
 
 impl Default for Config {
@@ -25,18 +29,13 @@ impl Default for Config {
         Config {
             upper_section_bonus: 35,
             yahtzee_bonus: 100,
+            dice_to_roll: 5,
+            dice_sides: 6
         }
     }
 }
 
-// maybe here define intermediate evs, create it first in
-// action scores new. that way there's NO mutable action score
-// functions...
-
-
 // also vector to box works just fine (?!), with hash too.
-
-
 pub struct ActionScores {
     state_values: HashMap<State, f64>,
     rolls: Vec<HashMap<DiceCombination, f64>>,
@@ -62,17 +61,10 @@ impl ActionScores {
             possible_rolls
         };
         let mut starting_state = State::default();
-        starting_state.entries_taken = [true; 13];
-        starting_state.entries_taken[8] = false;                
-        starting_state.entries_taken[9] = false;        
-        starting_state.entries_taken[10] = false;
-        starting_state.entries_taken[11] = false;
-        starting_state.entries_taken[12] = false;
 
         action_scores.set_scores(starting_state);
         println!("{:?}", action_scores.state_values.get(&starting_state));
-        action_scores
-            
+        action_scores            
     }
 
     pub fn num_states(&self) -> usize {
@@ -86,17 +78,12 @@ impl ActionScores {
         
         for entry in Entry::iterator().filter(|&e| state.is_valid(*e)) {
             for roll in self.possible_rolls.clone() {
-                //println!("current {:?} {:?} {:?}", state, *entry, roll);
-                //println!("Setting score for {:?}", state.child(*entry, roll));
                 self.set_scores(state.child(*entry, roll));
             }
         }
 
         let score = self.calculate_score(state);
         self.state_values.insert(state, score);
-
-        //println!("{:?} {:?}", score, state);
-                 
     }
 
     fn calculate_score(&self, parent_state: State) -> f64 {
@@ -109,7 +96,7 @@ impl ActionScores {
             let score = Entry::iterator()
                 .filter(|&e| parent_state.is_valid(*e))                
                 .map(|&e| parent_state.score(e, roll) as f64 + self.state_values.get(&parent_state.child(e, roll)).unwrap())
-                .fold(0./0., f64::max); // Find the largest non-NaN in vector, or NaN otherwise
+                .fold(std::f64::NAN, f64::max); // Find the largest non-NaN in vector, or NaN otherwise
 
             roll_values.insert(roll, score);
             //println!("last roll {:?} {:?}", roll, score);
@@ -177,42 +164,8 @@ impl ActionScores {
             //println!("{:?} {:?} {:?} {:?}", new_dice, new_dice_expected_value, keeper_roll_probability, parent_state);
         }
         expected_value
-
     }
 
-    fn get_entry_scores(
-        &self,
-        entries_taken: [bool; 13],
-        positive_yahtzee: bool,
-        upper_score_total: i32,
-        rolls_left: i32,
-        dice: DiceCombination
-    ) -> HashMap<Entry, f64> {
-        HashMap::new()
-    }
-
-
-    fn get_keepers_scores(
-        &self,
-        entries_taken: [bool; 13],
-        positive_yahtzee: bool,
-        upper_score_total: i32,
-        rolls_left: i32,
-        dice: DiceCombination        
-    ) -> HashMap<DiceCombination, f64> {
-        HashMap::new()
-    }
-
-    fn get_score(
-        &self,
-        entries_taken: [bool; 13],
-        positive_yahtzee: bool,
-        upper_score_total: i32,
-    ) -> f64 {
-        0.0
-    }
-    
-        
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
@@ -394,6 +347,78 @@ impl State {
         }
     }    
 }
+
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+struct FullState {
+    rolls_remaining: i32,
+    dice: DiceCombination
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+enum Fs {
+    I(FullState),
+    C(FullState)
+}
+
+fn best_entry_score(
+    minimal_state: &State,
+    minimal_state_values: &HashMap<State, f64>,
+    full_state: &FullState) -> f64 {
+
+    Entry::iterator()
+        .filter(|&e| minimal_state.is_valid(*e))                
+        .map(|&e| minimal_state.score(e, full_state.dice) as f64 + minimal_state_values.get(&minimal_state.child(e, full_state.dice)).unwrap())
+        .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
+        
+}
+
+fn average_rolled_dice_score(
+    minimal_state: &State,
+    roll_probs: &Vec<HashMap<DiceCombination, f64>>,    
+    full_state: &FullState,
+    full_state_values: &mut HashMap<Fs, f64>)
+    -> f64 {
+
+
+    let keeper_fs = Fs::I(*full_state);
+    let keeper = full_state.dice;
+    let dice_to_roll: i32 = DICE_TO_ROLL - (keeper.dice.iter().sum::<i32>());
+    let mut expected_value = 0.0;
+    for (keeper_roll, keeper_roll_probability) in roll_probs[dice_to_roll as usize].iter() {
+        let new_dice = keeper.add(keeper_roll);
+        let new_fs = Fs::C(FullState{dice: new_dice, rolls_remaining: full_state.rolls_remaining - 1});
+        let new_dice_expected_value = *full_state_values.entry(new_fs).or_insert(
+            best_keeper_score());
+        expected_value += new_dice_expected_value * keeper_roll_probability;
+    }
+    expected_value
+}
+
+fn best_keeper_score() -> f64 {
+    0.0
+}
+
+fn full_state_calculation(
+    full_state: Fs,
+    minimal_state: &State,
+    minimal_state_values: &HashMap<State, f64>,
+    possible_rolls: &Vec<DiceCombination>,
+    roll_probs: &Vec<HashMap<DiceCombination, f64>>,
+    full_state_values: &mut HashMap<Fs, f64>) -> f64 {
+
+    if minimal_state.is_terminal() {
+        return 0.0;
+    }
+
+    match full_state {
+        Fs::I(ref s)
+            if s.rolls_remaining == 0
+            => *full_state_values.entry(full_state).or_insert(best_entry_score(minimal_state, minimal_state_values, &s)),
+        Fs::I(_) => 2.0,
+        Fs::C(_) => 3.0,
+    }
+}
+    
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 struct DiceCombination {
@@ -764,7 +789,8 @@ enum Entry {
     Yahtzee,
     Chance
 }
-
+*/
+*/
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,15 +821,9 @@ mod tests {
         assert!(abs_difference < tolerance);
     }
 
-    #[test]
-    fn test_expected_values() {
-        let mut advisor = Advisor::new();
-        advisor.set_expected_values();
 
-        assert!(false);
-    }
 }
 
-*/
 
-*/ 
+
+
