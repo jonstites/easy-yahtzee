@@ -82,90 +82,21 @@ impl ActionScores {
             }
         }
 
-        let score = self.calculate_score(state);
+        let default_full_state = Fs::I(
+            FullState {
+                dice: DiceCombination::new(),
+                rolls_remaining: 3
+            });
+        let mut local_scores = HashMap::new();
+        let score = full_state_calculation(
+            default_full_state,
+            &state,
+            &self.state_values,
+            &self.possible_rolls,
+            &self.rolls,
+            &mut local_scores);
         self.state_values.insert(state, score);
     }
-
-    fn calculate_score(&self, parent_state: State) -> f64 {
-        if parent_state.is_terminal() {
-            return 0.0;
-        }
-
-        let mut roll_values = HashMap::new();
-        for roll in self.possible_rolls.clone() {
-            let score = Entry::iterator()
-                .filter(|&e| parent_state.is_valid(*e))                
-                .map(|&e| parent_state.score(e, roll) as f64 + self.state_values.get(&parent_state.child(e, roll)).unwrap())
-                .fold(std::f64::NAN, f64::max); // Find the largest non-NaN in vector, or NaN otherwise
-
-            roll_values.insert(roll, score);
-            //println!("last roll {:?} {:?}", roll, score);
-        }
-
-        let mut keeper_values = HashMap::new();
-        let mut new_roll_values = HashMap::new();
-        
-        for roll in self.possible_rolls.clone() {
-            let mut best_keeper_value: f64 = 0.0;
-            for keeper in roll.possible_keepers() {
-                if !keeper_values.contains_key(&keeper) {
-                    let dice_to_roll: i32 = DICE_TO_ROLL - (keeper.dice.iter().sum::<i32>());
-                    let mut expected_value = 0.0;
-                    //println!("{:?} {:?} {:?}", roll, keeper, dice_to_roll);
-                    for (keeper_roll, keeper_roll_probability) in self.rolls[dice_to_roll as usize].iter() {
-                        let new_dice = keeper.add(keeper_roll);
-                        //println!("{:?} {:?} {:?} {:?}", keeper, keeper_roll, dice_to_roll, new_dice);                        
-                        let new_dice_expected_value = roll_values.get(&new_dice).unwrap();
-                        expected_value += new_dice_expected_value * keeper_roll_probability;
-                    }
-                    keeper_values.insert(keeper, expected_value);
-                    //println!("keeper value {:?} {:?}", expected_value, keeper);
-                }
-                best_keeper_value = best_keeper_value.max(*keeper_values.get(&keeper).unwrap());
-
-            }
-            new_roll_values.insert(roll, best_keeper_value);
-            //println!("roll the second {:?} {:?}", roll, best_keeper_value);
-        }
-
-        roll_values = new_roll_values;
-
-        let mut keeper_values = HashMap::new();
-        let mut new_roll_values = HashMap::new();
-        
-        for roll in self.possible_rolls.clone() {
-            let mut best_keeper_value: f64 = 0.0;
-            for keeper in roll.possible_keepers() {
-                if !keeper_values.contains_key(&keeper) {
-                    let dice_to_roll: i32 = DICE_TO_ROLL - (keeper.dice.iter().sum::<i32>());
-                    let mut expected_value = 0.0;
-                    //println!("{:?} {:?} {:?}", roll, keeper, dice_to_roll);
-                    for (keeper_roll, keeper_roll_probability) in self.rolls[dice_to_roll as usize].iter() {
-                        let new_dice = keeper.add(keeper_roll);
-                        //println!("{:?} {:?} {:?} {:?}", keeper, keeper_roll, dice_to_roll, new_dice);                        
-                        let new_dice_expected_value = roll_values.get(&new_dice).unwrap();
-                        expected_value += new_dice_expected_value * keeper_roll_probability;
-                    }
-                    keeper_values.insert(keeper, expected_value);
-                    //println!("keeper value {:?} {:?}", expected_value, keeper);
-                }
-                best_keeper_value = best_keeper_value.max(*keeper_values.get(&keeper).unwrap());
-                new_roll_values.insert(roll, best_keeper_value);
-            }
-        }
-        roll_values = new_roll_values;
-        
-        let mut expected_value = 0.0;
-        let keeper = DiceCombination::new();
-        for (keeper_roll, keeper_roll_probability) in self.rolls[5 as usize].iter() {
-            let new_dice = keeper.add(keeper_roll);
-            let new_dice_expected_value = roll_values.get(&new_dice).unwrap();
-            expected_value += new_dice_expected_value * keeper_roll_probability;
-            //println!("{:?} {:?} {:?} {:?}", new_dice, new_dice_expected_value, keeper_roll_probability, parent_state);
-        }
-        expected_value
-    }
-
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
