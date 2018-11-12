@@ -61,10 +61,11 @@ impl ActionScores {
             possible_rolls
         };
         let mut starting_state = State::default();
-        //starting_state.entries_taken = [true; 13];
-        //starting_state.entries_taken[0] = false;
-        //starting_state.entries_taken[1] = false;        
-
+        starting_state.entries_taken = [true; 13];
+        for i in 0..6 {
+            starting_state.entries_taken[i] = false;
+        }
+        
         action_scores.set_scores(starting_state);
         println!("{:?}", action_scores.state_values.get(&starting_state));
         action_scores            
@@ -350,7 +351,7 @@ impl<'a> FullStateCalculator<'a> {
         }
 
         match full_state {
-            Fs::I(ref s)
+            Fs::C(ref s)
                 if s.rolls_remaining == 0
                 => {
                     if !self.full_state_values.contains_key(&full_state) {
