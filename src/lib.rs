@@ -1,5 +1,5 @@
 #![allow(dead_code, unused_variables, unused_parens, unused_imports)]
-
+#![feature(nll)]
 
 extern crate itertools;
 
@@ -61,6 +61,9 @@ impl ActionScores {
             possible_rolls
         };
         let mut starting_state = State::default();
+        //starting_state.entries_taken = [true; 13];
+        //starting_state.entries_taken[0] = false;
+        //starting_state.entries_taken[1] = false;        
 
         action_scores.set_scores(starting_state);
         println!("{:?}", action_scores.state_values.get(&starting_state));
@@ -87,14 +90,14 @@ impl ActionScores {
                 dice: DiceCombination::new(),
                 rolls_remaining: 3
             });
-        let mut local_scores = HashMap::new();
-        let score = full_state_calculation(
-            default_full_state,
-            &state,
-            &self.state_values,
-            &self.possible_rolls,
-            &self.rolls,
-            &mut local_scores);
+
+        let score =  FullStateCalculator {
+            minimal_state: &state,
+            minimal_state_values: &self.state_values,
+            possible_rolls: &self.possible_rolls,
+            roll_probs: &self.rolls,
+            full_state_values: HashMap::new()
+        }.full_state_calculation(default_full_state);
         self.state_values.insert(state, score);
     }
 }
@@ -291,85 +294,86 @@ enum Fs {
     C(FullState)
 }
 
-fn best_entry_score(
-    minimal_state: &State,
-    minimal_state_values: &HashMap<State, f64>,
-    full_state: &FullState) -> f64 {
+struct FullStateCalculator<'a> {
+    minimal_state: &'a State,
+    minimal_state_values: &'a HashMap<State, f64>,
+    possible_rolls: &'a Vec<DiceCombination>,
+    roll_probs: &'a Vec<HashMap<DiceCombination, f64>>,
+    full_state_values: HashMap<Fs, f64>
+}
 
-    Entry::iterator()
-        .filter(|&e| minimal_state.is_valid(*e))                
-        .map(|&e| minimal_state.score(e, full_state.dice) as f64 + minimal_state_values.get(&minimal_state.child(e, full_state.dice)).unwrap())
-        .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
+impl<'a> FullStateCalculator<'a> {
+    fn best_entry_score(&self, full_state: &FullState) -> f64 {
+
+        Entry::iterator()
+            .filter(|&e| self.minimal_state.is_valid(*e))                
+            .map(|&e| self.minimal_state.score(e, full_state.dice) as f64 + self.minimal_state_values.get(&self.minimal_state.child(e, full_state.dice)).unwrap())
+            .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
         
 }
 
-fn average_rolled_dice_score(
-    full_state: &FullState,
-    minimal_state: &State,
-    minimal_state_values: &HashMap<State, f64>,
-    possible_rolls: &Vec<DiceCombination>,
-    roll_probs: &Vec<HashMap<DiceCombination, f64>>,
-    full_state_values: &mut HashMap<Fs, f64>
-) -> f64 {
+    fn average_rolled_dice_score(
+        &mut self,
+        full_state: &FullState,
+    ) -> f64 {
 
-    let keeper_fs = Fs::I(*full_state);
-    let keeper = full_state.dice;
-    let dice_to_roll: i32 = DICE_TO_ROLL - (keeper.dice.iter().sum::<i32>());
-    let mut expected_value = 0.0;
-    for (keeper_roll, keeper_roll_probability) in roll_probs[dice_to_roll as usize].iter() {
-        let new_dice = keeper.add(keeper_roll);
-        let new_fs = Fs::C(FullState{dice: new_dice, rolls_remaining: full_state.rolls_remaining - 1});
-        let new_dice_expected_value = full_state_calculation(
-            new_fs,
-            minimal_state,
-            minimal_state_values,
-            possible_rolls,
-            roll_probs,
-            full_state_values);
-        expected_value += new_dice_expected_value * keeper_roll_probability;
-    }
-    expected_value
-}
-
-fn best_keeper_score(
-    full_state: &FullState,
-    minimal_state: &State,
-    minimal_state_values: &HashMap<State, f64>,
-    possible_rolls: &Vec<DiceCombination>,
-    roll_probs: &Vec<HashMap<DiceCombination, f64>>,
-    full_state_values: &mut HashMap<Fs, f64>
-) -> f64 {
-
-    full_state.dice.possible_keepers().iter()
-        .map(|&keeper| Fs::I(FullState{dice: keeper, rolls_remaining: full_state.rolls_remaining}))
-        .map(|new_fs| full_state_calculation(
-            new_fs,
-            minimal_state,
-            minimal_state_values,
-            possible_rolls,
-            roll_probs,
-            full_state_values))
-        .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
-}
-
-fn full_state_calculation(
-    full_state: Fs,
-    minimal_state: &State,
-    minimal_state_values: &HashMap<State, f64>,
-    possible_rolls: &Vec<DiceCombination>,
-    roll_probs: &Vec<HashMap<DiceCombination, f64>>,
-    full_state_values: &mut HashMap<Fs, f64>) -> f64 {
-
-    if minimal_state.is_terminal() {
-        return 0.0;
+        let keeper_fs = Fs::I(*full_state);
+        let keeper = full_state.dice;
+        let dice_to_roll: i32 = DICE_TO_ROLL - (keeper.dice.iter().sum::<i32>());
+        let mut expected_value = 0.0;
+        for (keeper_roll, keeper_roll_probability) in self.roll_probs[dice_to_roll as usize].iter() {
+            let new_dice = keeper.add(keeper_roll);
+            let new_fs = Fs::C(FullState{dice: new_dice, rolls_remaining: full_state.rolls_remaining - 1});
+            let new_dice_expected_value = self.full_state_calculation(new_fs);
+            expected_value += new_dice_expected_value * keeper_roll_probability;
+        }
+        expected_value
     }
 
-    match full_state {
-        Fs::I(ref s)
-            if s.rolls_remaining == 0
-            => *full_state_values.entry(full_state).or_insert(best_entry_score(minimal_state, minimal_state_values, &s)),
-        Fs::I(_) => 2.0,
-        Fs::C(_) => 3.0,
+    fn best_keeper_score(
+        &mut self,
+        full_state: &FullState,
+    ) -> f64 {
+
+        full_state.dice.possible_keepers().iter()
+            .map(|&keeper| Fs::I(FullState{dice: keeper, rolls_remaining: full_state.rolls_remaining}))
+            .map(|new_fs| self.full_state_calculation(new_fs))            
+            .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
+    }
+
+    fn full_state_calculation(
+        &mut self,
+        full_state: Fs) -> f64 {
+
+        if self.minimal_state.is_terminal() {
+            return 0.0;
+        }
+
+        match full_state {
+            Fs::I(ref s)
+                if s.rolls_remaining == 0
+                => {
+                    if !self.full_state_values.contains_key(&full_state) {
+                        let score = self.best_entry_score(s);
+                        self.full_state_values.insert(full_state, score);
+                    }
+                    return *self.full_state_values.get(&full_state).unwrap();
+                },
+            Fs::I(ref s) => {
+                if !self.full_state_values.contains_key(&full_state) {
+                    let score = self.average_rolled_dice_score(s);
+                    self.full_state_values.insert(full_state, score);
+                }
+                return *self.full_state_values.get(&full_state).unwrap();
+            },
+            Fs::C(ref s) => {
+                if !self.full_state_values.contains_key(&full_state) {
+                    let score = self.best_keeper_score(s);
+                    self.full_state_values.insert(full_state, score);
+                }
+                return *self.full_state_values.get(&full_state).unwrap();
+            },            
+        }
     }
 }
     
@@ -392,7 +396,7 @@ impl DiceCombination {
         let mut combination = [0; DICE_SIDES as usize];
         for die in permutation {
             let index: usize = die as usize;
-            let mut count = combination[index];
+            let count = combination[index];
             combination[index] = count + 1;
         }
         
