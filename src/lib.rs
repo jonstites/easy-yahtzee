@@ -20,24 +20,75 @@ use self::Entry::*;
 const DICE_TO_ROLL: i32 = 5;
 const DICE_SIDES: i32 = 6;
 
+#[derive(Debug, PartialEq)]
+pub enum YahtzeeError {
+    BadConfig
+}
 
-struct Config {
+#[derive(Debug)]
+pub struct ConfigBuilder {
     upper_section_bonus: i32,
     yahtzee_bonus: i32,
     dice_to_roll: i32,
     dice_sides: i32
 }
 
-impl Default for Config {
+impl ConfigBuilder {
 
-    fn default() -> Config {
-        Config {
+    fn default() -> ConfigBuilder {
+        ConfigBuilder {
             upper_section_bonus: 35,
             yahtzee_bonus: 100,
             dice_to_roll: 5,
             dice_sides: 6
         }
+
     }
+    
+    pub fn new() -> ConfigBuilder {
+        ConfigBuilder::default()
+    }
+
+    pub fn upper_section_bonus(&mut self, bonus: i32) -> &mut Self {
+        self.upper_section_bonus = bonus;
+        self
+    }
+
+    pub fn yahtzee_bonus(&mut self, bonus: i32) -> &mut Self {
+        self.yahtzee_bonus = bonus;
+        self
+    }
+
+    pub fn dice_to_roll(&mut self, number: i32) -> &mut Self {
+        self.dice_to_roll = number;
+        self
+    }
+
+    pub fn dice_sides(&mut self, number: i32) -> &mut Self {
+        self.dice_sides = number;
+        self
+    }
+    
+    pub fn build(&self) -> Result<Config, YahtzeeError> {
+        if self.dice_to_roll < 0 || self.dice_sides < 1 {
+            Err(YahtzeeError::BadConfig)
+        } else {
+            Ok(Config {
+                upper_section_bonus: self.upper_section_bonus,
+                yahtzee_bonus: self.yahtzee_bonus,
+                dice_to_roll: self.dice_to_roll,
+                dice_sides: self.dice_sides
+            })
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Config {
+    upper_section_bonus: i32,
+    yahtzee_bonus: i32,
+    dice_to_roll: i32,
+    dice_sides: i32
 }
 
 // also vector to box works just fine (?!), with hash too.
@@ -48,7 +99,7 @@ pub struct ActionScores {
 }
 
 impl ActionScores {
-    #[flame("action_scores")]
+
     pub fn new() -> ActionScores {
         let mut rolls = Vec::new();
         for dice_number in 0..=DICE_TO_ROLL {
@@ -166,6 +217,8 @@ impl ActionScores {
         self.state_values.insert(state, score);
     }
 }
+
+
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 pub struct State {
@@ -565,6 +618,68 @@ impl Entry {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_config_builder_upper_section_bonus_ok() {
+        let bonus = 45;
+        let config = ConfigBuilder::new()
+            .upper_section_bonus(bonus)
+            .build();
+
+        assert_eq!(config.unwrap().upper_section_bonus, bonus);
+    }
+
+    #[test]
+    fn test_config_builder_yahtzee_bonus_ok() {
+        let bonus = 45;
+        let config = ConfigBuilder::new()
+            .yahtzee_bonus(bonus)
+            .build();
+
+        assert_eq!(config.unwrap().yahtzee_bonus, bonus);
+    }
+
+    #[test]
+    fn test_config_builder_dice_to_roll_ok() {
+        let dice_to_roll = 11;
+        let config = ConfigBuilder::new()
+            .dice_to_roll(dice_to_roll)
+            .build();
+
+        assert_eq!(config.unwrap().dice_to_roll, dice_to_roll);
+    }
+
+    #[test]
+    fn test_config_builder_dice_to_roll_err() {
+        let dice_to_roll = -4;
+        let config = ConfigBuilder::new()
+            .dice_to_roll(dice_to_roll)
+            .build();
+
+        assert_eq!(config.expect_err(""), YahtzeeError::BadConfig);
+    }
+
+    #[test]
+    fn test_config_builder_dice_sides_ok() {
+        let dice_sides = 11;
+        let config = ConfigBuilder::new()
+            .dice_sides(dice_sides)
+            .build();
+
+        assert_eq!(config.unwrap().dice_sides, dice_sides);
+    }
+
+    #[test]
+    fn test_config_builder_dice_sides_err() {
+        let dice_sides = 0;
+        let config = ConfigBuilder::new()
+            .dice_sides(dice_sides)
+            .build();
+
+        assert_eq!(config.expect_err(""), YahtzeeError::BadConfig);
+    }
+
+    
+    
     #[test]
     fn test_roll_probabilities_empty_roll() {
         let empty_roll = DiceCombination::new();
