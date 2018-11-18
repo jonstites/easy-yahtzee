@@ -97,16 +97,16 @@ impl ActionScores {
     pub fn value_of_keepers(
         &self,        
         keepers: Vec<i32>,
-        rolls_left: i32,
+        rolls_remaining: i32,
         state: State
     ) -> f64 {
-        /*let default_full_state = Fs::I(
+        let default_full_state = Fs::I(
             FullState {
                 dice: DiceCombination::new(),
                 rolls_remaining: 3
             });
 
-        let fs =  FullStateCalculator {
+        let mut fs =  FullStateCalculator {
             minimal_state: &state,
             minimal_state_values: &self.state_values,
             possible_rolls: &self.possible_rolls,
@@ -116,15 +116,12 @@ impl ActionScores {
 
         fs.full_state_calculation(default_full_state);
 
-        let lookup_fs = Fs::C(
+        let lookup_fs = Fs::I(
             FullState {
-                dice: DiceCombination::from_vec(dice),
-                rolls_remaining: 0
+                dice: DiceCombination::from_vec(keepers),
+                rolls_remaining: rolls_remaining,
             });
-        fs.full_state_values.get(
-         */
-        1.5
-
+        *fs.full_state_values.get(&lookup_fs).unwrap()
     }
     
     #[flame]
@@ -629,8 +626,8 @@ mod tests {
             starting_state.entries_taken[i] = true;
         }
         action_scores.init_from_state(starting_state);
-        let actual_value = action_scores.value_of_entry(Entry::Twos, starting_state, vec!(0, 4, 0, 0, 0, 1));
-        let expected_value = 63.581619_f64;
+        let actual_value = action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, starting_state);
+        let expected_value = 72.42314_f64;
         let abs_difference = (actual_value - expected_value).abs();
         let tolerance = 0.00001;
         println!("{}", actual_value);
