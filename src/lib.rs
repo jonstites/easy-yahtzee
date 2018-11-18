@@ -67,19 +67,17 @@ impl ActionScores {
         }
     }
 
-    pub fn run(&mut self, starting_state: State)  {
-        /*let mut starting_state = State::default();
-        starting_state.entries_taken = [true; 13];
-        for i in 0..2 {
-            starting_state.entries_taken[i] = false;
-        }*/
-        
-        //self.set_scores(starting_state);
+    pub fn init(&mut self) {
+        let starting_state = State::default();
+        self.init_from_state(starting_state);
+    }
+    
+    pub fn init_from_state(&mut self, starting_state: State)  -> f64 {
         let mut states = self.children(starting_state);
         while let Some(state) = states.pop() {
             self.set_score(state);
         }
-        println!("{:?}", self.state_values.get(&starting_state));
+        *self.state_values.get(&starting_state).unwrap()
     }
 
     pub fn num_states(&self) -> usize {
@@ -127,36 +125,6 @@ impl ActionScores {
         }.full_state_calculation(default_full_state);
         self.state_values.insert(state, score);
     }
-    
-    #[flame("as")]
-    pub fn set_scores(&mut self, state: State) {
-
-        if self.state_values.contains_key(&state) {
-            return;
-        }
-        
-        for entry in Entry::iterator().filter(|&e| state.is_valid(&e)) {
-            for roll in self.possible_rolls.clone() {
-                self.set_scores(state.child(*entry, roll));
-            }
-        }
-
-        let default_full_state = Fs::I(
-            FullState {
-                dice: DiceCombination::new(),
-                rolls_remaining: 3
-            });
-
-        let score =  FullStateCalculator {
-            minimal_state: &state,
-            minimal_state_values: &self.state_values,
-            possible_rolls: &self.possible_rolls,
-            roll_probs: &self.rolls,
-            full_state_values: HashMap::new()
-        }.full_state_calculation(default_full_state);
-        self.state_values.insert(state, score);
-    }
-
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
@@ -589,6 +557,25 @@ mod tests {
         let children = action_scores.children(starting_state);
 
         assert_eq!(1344, children.len());
+    }
+
+    #[test]
+    fn test_state_value() {
+        let mut action_scores = ActionScores::new();
+        let mut starting_state = State::default();
+        for i in 1..10 {
+            starting_state.entries_taken[i] = true;
+        }
+        /*for i in 7..=9 {
+            starting_state.entries_taken[i] = true;
+        }*/
+        let actual_value = action_scores.init_from_state(starting_state);
+        let expected_value = 55.581619_f64;
+        let abs_difference = (actual_value - expected_value).abs();
+        let tolerance = 0.00001;
+        println!("{}", actual_value);
+        assert!(abs_difference < tolerance);
+
     }
     
 }

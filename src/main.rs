@@ -20,16 +20,8 @@ fn main() {
 
     //println!("{:?}", states);
     let start = PreciseTime::now();
-    action_scores.run(state);//optizee::State::default());
+    action_scores.init_from_state(state);//optizee::State::default());
     println!("number of states: {:?}", action_scores.num_states());
     let end = PreciseTime::now();
     println!("{} seconds for iterative action scores.", start.to(end));
-
-    let mut action_scores = optizee::ActionScores::new();
-    let start = PreciseTime::now();
-    action_scores.set_scores(state);//optizee::State::default());
-    println!("number of states: {:?}", action_scores.num_states());
-    let end = PreciseTime::now();
-    println!("{} seconds for recursive action scores.", start.to(end));
-
 }
