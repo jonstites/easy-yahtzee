@@ -72,16 +72,59 @@ impl ActionScores {
         self.init_from_state(starting_state);
     }
     
-    pub fn init_from_state(&mut self, starting_state: State)  -> f64 {
+    pub fn init_from_state(&mut self, starting_state: State) {
         let mut states = self.children(starting_state);
         while let Some(state) = states.pop() {
             self.set_score(state);
         }
-        *self.state_values.get(&starting_state).unwrap()
     }
 
-    pub fn num_states(&self) -> usize {
-        self.state_values.keys().len()
+    pub fn value_of_state(&self, state: State) -> f64 {
+        *self.state_values.get(&state).unwrap()
+    }
+
+    pub fn value_of_entry(
+        &self,        
+        entry: Entry,
+        state: State,
+        dice: Vec<i32>,
+    ) -> f64 {
+        let dice = DiceCombination::from_vec(dice);
+        let child = state.child(entry, dice);
+        *self.state_values.get(&child).unwrap() + state.score(entry, dice) as f64
+    }
+
+    pub fn value_of_keepers(
+        &self,        
+        keepers: Vec<i32>,
+        rolls_left: i32,
+        state: State
+    ) -> f64 {
+        /*let default_full_state = Fs::I(
+            FullState {
+                dice: DiceCombination::new(),
+                rolls_remaining: 3
+            });
+
+        let fs =  FullStateCalculator {
+            minimal_state: &state,
+            minimal_state_values: &self.state_values,
+            possible_rolls: &self.possible_rolls,
+            roll_probs: &self.rolls,
+            full_state_values: HashMap::new()
+        };
+
+        fs.full_state_calculation(default_full_state);
+
+        let lookup_fs = Fs::C(
+            FullState {
+                dice: DiceCombination::from_vec(dice),
+                rolls_remaining: 0
+            });
+        fs.full_state_values.get(
+         */
+        1.5
+
     }
     
     #[flame]
@@ -309,6 +352,8 @@ struct FullStateCalculator<'a> {
 }
 
 impl<'a> FullStateCalculator<'a> {
+    
+    
     #[flame]
     fn best_entry_score(&self, full_state: &FullState) -> f64 {
 
@@ -316,8 +361,9 @@ impl<'a> FullStateCalculator<'a> {
             .filter(|&e| self.minimal_state.is_valid(&e))                
             .map(|&e| self.minimal_state.score(e, full_state.dice) as f64 + self.minimal_state_values.get(&self.minimal_state.child(e, full_state.dice)).unwrap())
             .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
-        
-}
+    }
+
+    
     #[flame]
     fn average_rolled_dice_score(
         &mut self,
@@ -479,7 +525,7 @@ impl DiceCombination {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
-enum Entry {
+pub enum Entry {
     Ones,
     Twos,
     Threes,
@@ -566,11 +612,25 @@ mod tests {
         for i in 1..10 {
             starting_state.entries_taken[i] = true;
         }
-        /*for i in 7..=9 {
-            starting_state.entries_taken[i] = true;
-        }*/
-        let actual_value = action_scores.init_from_state(starting_state);
+        action_scores.init_from_state(starting_state);
+        let actual_value = action_scores.value_of_state(starting_state);
         let expected_value = 55.581619_f64;
+        let abs_difference = (actual_value - expected_value).abs();
+        let tolerance = 0.00001;
+        println!("{}", actual_value);
+        assert!(abs_difference < tolerance);
+    }
+
+    #[test]
+    fn test_entry_value() {
+        let mut action_scores = ActionScores::new();
+        let mut starting_state = State::default();
+        for i in 2..10 {
+            starting_state.entries_taken[i] = true;
+        }
+        action_scores.init_from_state(starting_state);
+        let actual_value = action_scores.value_of_entry(Entry::Twos, starting_state, vec!(0, 4, 0, 0, 0, 1));
+        let expected_value = 63.581619_f64;
         let abs_difference = (actual_value - expected_value).abs();
         let tolerance = 0.00001;
         println!("{}", actual_value);

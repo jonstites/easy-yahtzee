@@ -21,7 +21,7 @@ fn main() {
     //println!("{:?}", states);
     let start = PreciseTime::now();
     action_scores.init_from_state(state);//optizee::State::default());
-    println!("number of states: {:?}", action_scores.num_states());
+    //println!("number of states: {:?}", action_scores.num_states());
     let end = PreciseTime::now();
     println!("{} seconds for iterative action scores.", start.to(end));
 }
