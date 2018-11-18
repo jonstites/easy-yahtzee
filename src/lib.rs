@@ -22,7 +22,8 @@ const DICE_SIDES: i32 = 6;
 
 #[derive(Debug, PartialEq)]
 pub enum YahtzeeError {
-    BadConfig
+    BadConfig,
+    InternalError
 }
 
 #[derive(Debug)]
@@ -42,7 +43,6 @@ impl ConfigBuilder {
             dice_to_roll: 5,
             dice_sides: 6
         }
-
     }
     
     pub fn new() -> ConfigBuilder {
@@ -219,12 +219,56 @@ impl ActionScores {
 }
 
 
+#[derive(Debug)]
+struct StateBuilder {
+    config: Config,
+    rolls: Vec<HashMap<DiceCombination, f64>>,
+    possible_rolls: HashSet<DiceCombination>
+}
+
+impl StateBuilder {
+
+    // precondition: dice_to_roll must be non-negative
+    // precondition: dice_sides must be positive
+    // This is guaranteed by checks in ConfigBuilder
+    // TODO: Remove the hard-coded number of dice in DiceCombination
+    // This will require using a Box<i32> rather than array
+    fn new(config: Config) -> StateBuilder {
+        
+        assert!(config.dice_to_roll >= 0);
+        assert!(config.dice_sides > 0);
+
+        let mut rolls = Vec::new();
+        for dice_number in 0..=config.dice_to_roll {
+            let probabilities = DiceCombination::probabilities(dice_number);
+            rolls.push(probabilities);
+        }
+
+        let possible_rolls = rolls
+            .last()
+            .unwrap()
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        
+        StateBuilder {
+            config,
+            rolls,
+            possible_rolls
+        }
+    }
+
+    fn build() -> State {
+        State::default()
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 pub struct State {
     pub entries_taken: [bool; 13],
     positive_yahtzee: bool,
-    upper_score_total: i32,    
+    upper_score_total: i32,
+    //config: &Config
 }
 
 impl State {
