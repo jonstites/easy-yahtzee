@@ -118,14 +118,13 @@ impl ActionScores {
     pub fn init_from_state(&mut self, starting_state: State) {
         let mut states = self.state_builder.children(starting_state);
         while let Some(state) = states.pop() {
-            self.set_score(state);
+            let score = self.get_score(state);
+            self.state_values.insert(state, score);
         }
     }
 
     pub fn value_of_state(&self, state: State) -> Result<f64, YahtzeeError> {
-        self.state_values.get(&state)
-            .map(|x| *x)
-            .ok_or(YahtzeeError::MissingState)
+        Ok(self.get_score(state))//.ok_or(YahtzeeError::MissingState)
     }
 
     pub fn value_of_entry(
@@ -174,7 +173,7 @@ impl ActionScores {
         fs.full_state_values.get(&lookup_fs).map(|x| *x).ok_or(YahtzeeError::MissingState)        
     }
 
-    pub fn set_score(&mut self, state: State) {
+    pub fn get_score(&self, state: State) -> f64 {
         let default_full_state = Fs::I(
             FullState {
                 dice: DiceCombination::new(),
@@ -189,7 +188,7 @@ impl ActionScores {
             full_state_values: HashMap::new(),
             state_builder: &self.state_builder,
         }.full_state_calculation(default_full_state);
-        self.state_values.insert(state, score);
+        score
     }
 }
 
