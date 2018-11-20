@@ -123,7 +123,9 @@ impl ActionScores {
     }
 
     pub fn value_of_state(&self, state: State) -> Result<f64, YahtzeeError> {
-        self.state_values.get(&state).map(|x| *x).ok_or(YahtzeeError::MissingState)
+        self.state_values.get(&state)
+            .map(|x| *x)
+            .ok_or(YahtzeeError::MissingState)
     }
 
     pub fn value_of_entry(
@@ -135,7 +137,9 @@ impl ActionScores {
         let dice = DiceCombination::from_vec(dice);
         let child = self.state_builder.child(state, entry, dice);
         let score = state.score(entry, dice) as f64;
-        self.state_values.get(&child).map(|x| *x + score).ok_or(YahtzeeError::MissingState)
+        self.state_values.get(&child)
+            .map(|x| *x + score)
+            .ok_or(YahtzeeError::MissingState)
     }
 
     pub fn value_of_keepers(
@@ -159,6 +163,7 @@ impl ActionScores {
             state_builder: &self.state_builder,
         };
 
+        // Handle Error  here
         fs.full_state_calculation(default_full_state);
 
         let lookup_fs = Fs::I(
@@ -764,10 +769,22 @@ mod tests {
         let expected_value = 55.581619_f64;
         let abs_difference = (actual_value - expected_value).abs();
         let tolerance = 0.00001;
-        println!("{}", actual_value);
         assert!(abs_difference < tolerance);
     }
 
+    #[test]
+    fn test_state_value_bad() {
+        let mut action_scores = ActionScores::new(ConfigBuilder::default());
+        let mut starting_state = State::default();
+        for i in 1..10 {
+            starting_state.entries_taken[i] = true;
+        }
+        action_scores.init_from_state(starting_state);
+        let result = action_scores.value_of_state(State::default());
+        assert_eq!(result.expect_err(""), YahtzeeError::MissingState);
+    }
+
+    
     #[test]
     fn test_entry_value() {
         let mut action_scores = ActionScores::new(ConfigBuilder::default());
@@ -780,9 +797,20 @@ mod tests {
         let expected_value = 72.42314_f64;
         let abs_difference = (actual_value - expected_value).abs();
         let tolerance = 0.00001;
-        println!("{}", actual_value);
         assert!(abs_difference < tolerance);
+    }
 
+
+    #[test]
+    fn test_entry_value_bad() {
+        let mut action_scores = ActionScores::new(ConfigBuilder::default());
+        let mut starting_state = State::default();
+        for i in 2..10 {
+            starting_state.entries_taken[i] = true;
+        }
+        action_scores.init_from_state(starting_state);
+        let result = action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, State::default());
+        assert_eq!(result.expect_err(""), YahtzeeError::MissingState);
     }
     
 }
