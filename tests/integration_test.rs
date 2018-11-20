@@ -10,7 +10,7 @@ fn test_state_value() {
         starting_state.entries_taken[i] = true;
     }
     action_scores.init_from_state(starting_state);
-    let actual_value = action_scores.value_of_state(starting_state);
+    let actual_value = action_scores.value_of_state(starting_state).unwrap();
     let expected_value = 55.581619_f64;
     let abs_difference = (actual_value - expected_value).abs();
     let tolerance = 0.00001;
@@ -26,7 +26,7 @@ fn test_entry_value() {
         starting_state.entries_taken[i] = true;
     }
     action_scores.init_from_state(starting_state);
-    let actual_value = action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, starting_state);
+    let actual_value = action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, starting_state).unwrap();
     let expected_value = 72.42314_f64;
     let abs_difference = (actual_value - expected_value).abs();
     let tolerance = 0.00001;

@@ -23,7 +23,8 @@ const DICE_SIDES: i32 = 6;
 #[derive(Debug, PartialEq)]
 pub enum YahtzeeError {
     BadConfig,
-    InternalError
+    InternalError,
+    MissingState
 }
 
 #[derive(Debug)]
@@ -121,8 +122,8 @@ impl ActionScores {
         }
     }
 
-    pub fn value_of_state(&self, state: State) -> f64 {
-        *self.state_values.get(&state).unwrap()
+    pub fn value_of_state(&self, state: State) -> Result<f64, YahtzeeError> {
+        self.state_values.get(&state).map(|x| *x).ok_or(YahtzeeError::MissingState)
     }
 
     pub fn value_of_entry(
@@ -130,10 +131,11 @@ impl ActionScores {
         entry: Entry,
         state: State,
         dice: Vec<i32>,
-    ) -> f64 {
+    ) -> Result<f64, YahtzeeError> {
         let dice = DiceCombination::from_vec(dice);
         let child = self.state_builder.child(state, entry, dice);
-        *self.state_values.get(&child).unwrap() + state.score(entry, dice) as f64
+        let score = state.score(entry, dice) as f64;
+        self.state_values.get(&child).map(|x| *x + score).ok_or(YahtzeeError::MissingState)
     }
 
     pub fn value_of_keepers(
@@ -141,7 +143,7 @@ impl ActionScores {
         keepers: Vec<i32>,
         rolls_remaining: i32,
         state: State
-    ) -> f64 {
+    ) -> Result<f64, YahtzeeError> {
         let default_full_state = Fs::I(
             FullState {
                 dice: DiceCombination::new(),
@@ -164,7 +166,7 @@ impl ActionScores {
                 dice: DiceCombination::from_vec(keepers),
                 rolls_remaining: rolls_remaining,
             });
-        *fs.full_state_values.get(&lookup_fs).unwrap()
+        fs.full_state_values.get(&lookup_fs).map(|x| *x).ok_or(YahtzeeError::MissingState)        
     }
 
     pub fn set_score(&mut self, state: State) {
@@ -758,7 +760,7 @@ mod tests {
             starting_state.entries_taken[i] = true;
         }
         action_scores.init_from_state(starting_state);
-        let actual_value = action_scores.value_of_state(starting_state);
+        let actual_value = action_scores.value_of_state(starting_state).unwrap();
         let expected_value = 55.581619_f64;
         let abs_difference = (actual_value - expected_value).abs();
         let tolerance = 0.00001;
@@ -774,7 +776,7 @@ mod tests {
             starting_state.entries_taken[i] = true;
         }
         action_scores.init_from_state(starting_state);
-        let actual_value = action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, starting_state);
+        let actual_value = action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, starting_state).unwrap();
         let expected_value = 72.42314_f64;
         let abs_difference = (actual_value - expected_value).abs();
         let tolerance = 0.00001;
