@@ -4,24 +4,17 @@ extern crate flame;
 extern crate time;
 
 use time::PreciseTime;
+use optizee::{ActionScores, Config, ConfigBuilder};
 
 fn main() {
-    let mut action_scores = optizee::ActionScores::new();
+    let mut action_scores = ActionScores::new(ConfigBuilder::default());
     let mut state = optizee::State::default();
     for i in 0..4 {
         state.entries_taken[i] = true;
     };
 
     let start = PreciseTime::now();
-    let states = action_scores.children(state);
-    println!("number of states: {:?}", states.len());
-    let end = PreciseTime::now();
-    println!("{} seconds for children.", start.to(end));
-
-    //println!("{:?}", states);
-    let start = PreciseTime::now();
-    action_scores.init_from_state(state);//optizee::State::default());
-    //println!("number of states: {:?}", action_scores.num_states());
+    action_scores.init_from_state(state);
     let end = PreciseTime::now();
     println!("{} seconds for iterative action scores.", start.to(end));
 }

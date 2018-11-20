@@ -1,10 +1,10 @@
 extern crate optizee;
 
-use optizee::{ActionScores, State};
+use optizee::{ActionScores, State, ConfigBuilder};
 
 #[test]
 fn test_state_value() {
-    let mut action_scores = ActionScores::new();
+    let mut action_scores = ActionScores::new(ConfigBuilder::default());
     let mut starting_state = State::default();
     for i in 1..10 {
         starting_state.entries_taken[i] = true;
@@ -20,7 +20,7 @@ fn test_state_value() {
 
 #[test]
 fn test_entry_value() {
-    let mut action_scores = ActionScores::new();
+    let mut action_scores = ActionScores::new(ConfigBuilder::default());
     let mut starting_state = State::default();
     for i in 2..10 {
         starting_state.entries_taken[i] = true;
