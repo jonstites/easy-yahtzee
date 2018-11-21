@@ -1,17 +1,16 @@
 #![allow(dead_code, unused_variables, unused_parens, unused_imports)]
 #![feature(nll)]
-#![feature(proc_macro_hygiene)]
-#[macro_use] extern crate flamer;
+#![feature(try_trait)]
+
 
 extern crate itertools;
-
-extern crate flame;
 
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::slice::Iter;
+use std::result;
 
 mod states;
 
@@ -20,11 +19,19 @@ use self::Entry::*;
 const DICE_TO_ROLL: i32 = 5;
 const DICE_SIDES: i32 = 6;
 
+type Result<T> = result::Result<T, YahtzeeError>;
+
 #[derive(Debug, PartialEq)]
 pub enum YahtzeeError {
     BadConfig,
     InternalError,
-    MissingState
+    MissingState(std::option::NoneError)
+}
+
+impl From<std::option::NoneError> for YahtzeeError {
+    fn from(err: std::option::NoneError) -> YahtzeeError {
+        YahtzeeError::MissingState(err)
+    }
 }
 
 #[derive(Debug)]
@@ -70,7 +77,7 @@ impl ConfigBuilder {
         self
     }
     
-    pub fn build(&self) -> Result<Config, YahtzeeError> {
+    pub fn build(&self) -> Result<Config> {
         if self.dice_to_roll < 0 || self.dice_sides < 1 {
             Err(YahtzeeError::BadConfig)
         } else {
@@ -118,13 +125,13 @@ impl ActionScores {
     pub fn init_from_state(&mut self, starting_state: State) {
         let mut states = self.state_builder.children(starting_state);
         while let Some(state) = states.pop() {
-            let score = self.get_score(state);
+            let score = self.get_score(state).unwrap();
             self.state_values.insert(state, score);
         }
     }
 
-    pub fn value_of_state(&self, state: State) -> Result<f64, YahtzeeError> {
-        Ok(self.get_score(state))//.ok_or(YahtzeeError::MissingState)
+    pub fn value_of_state(&self, state: State) -> Result<f64> {
+        self.get_score(state)
     }
 
     pub fn value_of_entry(
@@ -132,13 +139,12 @@ impl ActionScores {
         entry: Entry,
         state: State,
         dice: Vec<i32>,
-    ) -> Result<f64, YahtzeeError> {
+    ) -> Result<f64> {
         let dice = DiceCombination::from_vec(dice);
         let child = self.state_builder.child(state, entry, dice);
         let score = state.score(entry, dice) as f64;
-        self.state_values.get(&child)
-            .map(|x| *x + score)
-            .ok_or(YahtzeeError::MissingState)
+        let child_score = *self.state_values.get(&child)?;
+        Ok(score + child_score)
     }
 
     pub fn value_of_keepers(
@@ -146,7 +152,7 @@ impl ActionScores {
         keepers: Vec<i32>,
         rolls_remaining: i32,
         state: State
-    ) -> Result<f64, YahtzeeError> {
+    ) -> Result<f64> {
         let default_full_state = Fs::I(
             FullState {
                 dice: DiceCombination::new(),
@@ -163,21 +169,21 @@ impl ActionScores {
         };
 
         // Handle Error  here
-        fs.full_state_calculation(default_full_state);
+        fs.full_state_calculation(default_full_state)?;
 
         let lookup_fs = Fs::I(
             FullState {
                 dice: DiceCombination::from_vec(keepers),
                 rolls_remaining: rolls_remaining,
             });
-        fs.full_state_values.get(&lookup_fs).map(|x| *x).ok_or(YahtzeeError::MissingState)        
+        Ok(*fs.full_state_values.get(&lookup_fs)?)
     }
 
-    pub fn get_score(&self, state: State) -> f64 {
+    fn get_score(&self, state: State) -> Result<f64> {
         let default_full_state = Fs::I(
             FullState {
                 dice: DiceCombination::new(),
-                rolls_remaining: 3
+                rolls_remaining: 3 
             });
 
         let score =  FullStateCalculator {
@@ -443,21 +449,26 @@ struct FullStateCalculator<'a> {
 impl<'a> FullStateCalculator<'a> {
     
     
-    #[flame]
-    fn best_entry_score(&self, full_state: &FullState) -> f64 {
+    fn best_entry_score(&self, full_state: &FullState) -> Result<f64> {
 
-        Entry::iterator()
+        let output = Entry::iterator()
             .filter(|&e| self.minimal_state.is_valid(&e))                
-            .map(|&e| self.minimal_state.score(e, full_state.dice) as f64 + self.minimal_state_values.get(&self.state_builder.child(*self.minimal_state, e, full_state.dice)).unwrap())
-            .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
+            .map(|&e| -> Result<_> {
+                let score = self.minimal_state.score(e, full_state.dice) as f64;
+                let child = self.state_builder.child(*self.minimal_state, e, full_state.dice);
+                let child_score = self.minimal_state_values.get(&child)?;
+                Ok(score + child_score)
+            }).collect::<Result<Vec<f64>>>()?;
+
+        let best = output.into_iter().fold(std::f64::NAN, f64::max); // Find the largest non-NaN in vector, or NaN otherwise
+        Ok(best)
     }
 
-    
-    #[flame]
+
     fn average_rolled_dice_score(
         &mut self,
         full_state: &FullState,
-    ) -> f64 {
+    ) -> Result<f64> {
 
         let keeper_fs = Fs::I(*full_state);
         let keeper = full_state.dice;
@@ -466,27 +477,30 @@ impl<'a> FullStateCalculator<'a> {
         for (keeper_roll, keeper_roll_probability) in self.roll_probs[dice_to_roll as usize].iter() {
             let new_dice = keeper.add(keeper_roll);
             let new_fs = Fs::C(FullState{dice: new_dice, rolls_remaining: full_state.rolls_remaining - 1});
-            let new_dice_expected_value = self.full_state_calculation(new_fs);
+            let new_dice_expected_value = self.full_state_calculation(new_fs)?;
             expected_value += new_dice_expected_value * keeper_roll_probability;
         }
-        expected_value
+        Ok(expected_value)
     }
-    #[flame]
+
     fn best_keeper_score(
         &mut self,
         full_state: &FullState,
-    ) -> f64 {
+    ) -> Result<f64> {
 
-        full_state.dice.possible_keepers().iter()
+        let output = full_state.dice.possible_keepers().iter()
             .map(|&keeper| Fs::I(FullState{dice: keeper, rolls_remaining: full_state.rolls_remaining}))
-            .map(|new_fs| self.full_state_calculation(new_fs))            
-            .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
+            .map(|new_fs| -> Result<_> {
+                let score = self.full_state_calculation(new_fs)?;
+                Ok(score)
+            }).collect::<Result<Vec<f64>>>()?;
+        Ok(output.into_iter().fold(std::f64::NAN, f64::max)) // Find the largest non-NaN in vector, or NaN otherwise
     }
-    //#[flame]
-    fn full_state_calculation(&mut self, full_state: Fs) -> f64 {
+
+    fn full_state_calculation(&mut self, full_state: Fs) -> Result<f64> {
 
         if self.minimal_state.is_terminal() {
-            return 0.0;
+            return Ok(0.0);
         }
 
         match full_state {
@@ -494,24 +508,24 @@ impl<'a> FullStateCalculator<'a> {
                 if s.rolls_remaining == 0
                 => {
                     if !self.full_state_values.contains_key(&full_state) {
-                        let score = self.best_entry_score(s);
+                        let score = self.best_entry_score(s)?;
                         self.full_state_values.insert(full_state, score);
                     }
-                    return *self.full_state_values.get(&full_state).unwrap();
+                    return Ok(*self.full_state_values.get(&full_state).unwrap());
                 },
             Fs::I(ref s) => {
                 if !self.full_state_values.contains_key(&full_state) {
-                    let score = self.average_rolled_dice_score(s);
+                    let score = self.average_rolled_dice_score(s)?;
                     self.full_state_values.insert(full_state, score);
                 }
-                return *self.full_state_values.get(&full_state).unwrap();
+                return Ok(*self.full_state_values.get(&full_state).unwrap());
             },
             Fs::C(ref s) => {
                 if !self.full_state_values.contains_key(&full_state) {
-                    let score = self.best_keeper_score(s);
+                    let score = self.best_keeper_score(s)?;
                     self.full_state_values.insert(full_state, score);
                 }
-                return *self.full_state_values.get(&full_state).unwrap();
+                return Ok(*self.full_state_values.get(&full_state)?);
             },            
         }
     }
@@ -780,7 +794,10 @@ mod tests {
         }
         action_scores.init_from_state(starting_state);
         let result = action_scores.value_of_state(State::default());
-        assert_eq!(result.expect_err(""), YahtzeeError::MissingState);
+        match result {
+            Err(YahtzeeError::MissingState(_)) => {},
+            _ => assert!(false),
+        }
     }
 
     
@@ -809,7 +826,10 @@ mod tests {
         }
         action_scores.init_from_state(starting_state);
         let result = action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, State::default());
-        assert_eq!(result.expect_err(""), YahtzeeError::MissingState);
+        match result {
+            Err(YahtzeeError::MissingState(_)) => {},
+            _ => assert!(false),
+        }
     }
     
 }
