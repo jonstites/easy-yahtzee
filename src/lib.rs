@@ -1,12 +1,12 @@
 #![allow(dead_code, unused_variables, unused_parens, unused_imports)]
 #![feature(nll)]
-#![feature(proc_macro_hygiene)]
-#[macro_use] extern crate flamer;
+#![feature(try_trait)]
+#![feature(test)]
 
 extern crate itertools;
+extern crate test;
 
-extern crate flame;
-
+use test::Bencher;
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -444,7 +444,6 @@ struct FullStateCalculator<'a> {
 impl<'a> FullStateCalculator<'a> {
     
     
-    #[flame]
     fn best_entry_score(&self, full_state: &FullState) -> f64 {
 
         Entry::iterator()
@@ -454,7 +453,6 @@ impl<'a> FullStateCalculator<'a> {
     }
 
     
-    #[flame]
     fn average_rolled_dice_score(
         &mut self,
         full_state: &FullState,
@@ -472,7 +470,7 @@ impl<'a> FullStateCalculator<'a> {
         }
         expected_value
     }
-    #[flame]
+
     fn best_keeper_score(
         &mut self,
         full_state: &FullState,
@@ -483,7 +481,7 @@ impl<'a> FullStateCalculator<'a> {
             .map(|new_fs| self.full_state_calculation(new_fs))            
             .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
     }
-    //#[flame]
+
     fn full_state_calculation(&mut self, full_state: Fs) -> f64 {
 
         if self.minimal_state.is_terminal() {
@@ -717,9 +715,7 @@ mod tests {
 
         assert_eq!(config.expect_err(""), YahtzeeError::BadConfig);
     }
-
-    
-    
+        
     #[test]
     fn test_roll_probabilities_empty_roll() {
         let empty_roll = DiceCombination::new();
@@ -757,6 +753,23 @@ mod tests {
         assert_eq!(1344, children.len());
     }
 
+    #[bench]
+    fn bench_full_state(b: &mut Bencher) {
+        let mut action_scores = ActionScores::new(ConfigBuilder::default());
+        let mut starting_state = State::default();
+        
+        for i in 1..13 {
+            starting_state.entries_taken[i] = true;
+        }
+        
+        action_scores.init_from_state(starting_state);
+
+        b.iter(|| {
+            action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, starting_state)
+        })
+    }
+
+    
     #[test]
     fn test_state_value() {
         let mut action_scores = ActionScores::new(ConfigBuilder::default());
