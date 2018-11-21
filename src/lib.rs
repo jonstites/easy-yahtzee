@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::slice::Iter;
 use std::result;
 
-mod states;
+
 
 use self::Entry::*;
 
