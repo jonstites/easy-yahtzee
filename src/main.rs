@@ -4,10 +4,10 @@ extern crate flame;
 extern crate time;
 
 use time::PreciseTime;
-use optizee::{ActionScores, Config, ConfigBuilder};
+use optizee::{ActionScores, Config};
 
 fn main() {
-    let mut action_scores = ActionScores::new(ConfigBuilder::default());
+    let mut action_scores = ActionScores::new(Config::new());
     let mut state = optizee::State::default();
     for i in 0..4 {
         state.entries_taken[i] = true;

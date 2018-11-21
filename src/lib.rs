@@ -38,68 +38,67 @@ impl From<std::option::NoneError> for YahtzeeError {
 
 #[derive(Debug)]
 pub struct ConfigBuilder {
-    upper_section_bonus: i32,
-    yahtzee_bonus: i32,
-    dice_to_roll: i32,
-    dice_sides: i32
+    config: Config,
 }
 
 impl ConfigBuilder {
 
-    pub fn default() -> Config {
-        ConfigBuilder::new().build().unwrap()
-    }
-    
     pub fn new() -> ConfigBuilder {
+        let config = Config::new();
         ConfigBuilder {
-            upper_section_bonus: 35,
-            yahtzee_bonus: 100,
-            dice_to_roll: 5,
-            dice_sides: 6
+            config
         }
     }
 
     pub fn upper_section_bonus(&mut self, bonus: i32) -> &mut Self {
-        self.upper_section_bonus = bonus;
+        self.config.upper_section_bonus = bonus;
         self
     }
 
     pub fn yahtzee_bonus(&mut self, bonus: i32) -> &mut Self {
-        self.yahtzee_bonus = bonus;
+        self.config.yahtzee_bonus = bonus;
         self
     }
 
     pub fn dice_to_roll(&mut self, number: i32) -> &mut Self {
-        self.dice_to_roll = number;
+        self.config.dice_to_roll = number;
         self
     }
 
     pub fn dice_sides(&mut self, number: i32) -> &mut Self {
-        self.dice_sides = number;
+        self.config.dice_sides = number;
         self
     }
     
-    pub fn build(&self) -> Result<Config> {
-        if self.dice_to_roll < 0 || self.dice_sides < 1 {
+    pub fn build(&mut self) -> Result<Config> {
+        if self.config.dice_to_roll < 0 || self.config.dice_sides < 1 {
             Err(YahtzeeError::BadConfig)
         } else {
-            Ok(Config {
-                upper_section_bonus: self.upper_section_bonus,
-                yahtzee_bonus: self.yahtzee_bonus,
-                dice_to_roll: self.dice_to_roll,
-                dice_sides: self.dice_sides
-            })
+            Ok(self.config.clone())
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct Config {
     upper_section_bonus: i32,
     yahtzee_bonus: i32,
     dice_to_roll: i32,
     dice_sides: i32
 }
+
+impl Config {
+
+    pub fn new() -> Config {
+        Config {
+            upper_section_bonus: 35,
+            yahtzee_bonus: 100,
+            dice_to_roll: 5,
+            dice_sides: 6
+        }
+    }
+}
+
 
 // also vector to box works just fine (?!), with hash too.
 pub struct ActionScores {
@@ -760,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_correct_children() {
-        let state_builder =StateBuilder::new(ConfigBuilder::default());
+        let state_builder =StateBuilder::new(Config::new());
         let mut starting_state = State::default();
         for i in 0..5 {
             starting_state.entries_taken[i] = true;
@@ -772,7 +771,7 @@ mod tests {
 
     #[bench]
     fn bench_full_state(b: &mut Bencher) {
-        let mut action_scores = ActionScores::new(ConfigBuilder::default());
+        let mut action_scores = ActionScores::new(Config::new());
         let mut starting_state = State::default();
         
         for i in 1..13 {
@@ -789,7 +788,7 @@ mod tests {
     
     #[test]
     fn test_state_value() {
-        let mut action_scores = ActionScores::new(ConfigBuilder::default());
+        let mut action_scores = ActionScores::new(Config::new());
         let mut starting_state = State::default();
         for i in 1..10 {
             starting_state.entries_taken[i] = true;
@@ -804,7 +803,7 @@ mod tests {
 
     #[test]
     fn test_state_value_bad() {
-        let mut action_scores = ActionScores::new(ConfigBuilder::default());
+        let mut action_scores = ActionScores::new(Config::new());
         let mut starting_state = State::default();
         for i in 1..10 {
             starting_state.entries_taken[i] = true;
@@ -820,7 +819,7 @@ mod tests {
     
     #[test]
     fn test_entry_value() {
-        let mut action_scores = ActionScores::new(ConfigBuilder::default());
+        let mut action_scores = ActionScores::new(Config::new());
         let mut starting_state = State::default();
         for i in 2..10 {
             starting_state.entries_taken[i] = true;
@@ -836,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_entry_value_bad() {
-        let mut action_scores = ActionScores::new(ConfigBuilder::default());
+        let mut action_scores = ActionScores::new(Config::new());
         let mut starting_state = State::default();
         for i in 2..10 {
             starting_state.entries_taken[i] = true;
