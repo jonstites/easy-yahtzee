@@ -499,10 +499,36 @@ fn max_entry_score(
 }
 
 fn max_keeper_score(
+    dice: &DiceCombination,
+    rolls_remaining: i32,
+    full_state_values: &HashMap<OtherFullState, f64>
+) -> f64 {
+    dice.possible_keepers().iter()
+        .map(|&keeper| OtherFullState::Keepers(*dice, rolls_remaining))
+        .map(|keeper| *full_state_values.get(&keeper).unwrap_or(&0.0))//.expect("Some internal error calculating score..."))
+        .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
+}
 
-) -> Result<f64> {
+fn average_rolled_dice_score(
+    dice: &DiceCombination,
+    rolls_remaining: i32,
+    roll_probs: &Vec<HashMap<DiceCombination, f64>>,
+    full_state_values: &HashMap<OtherFullState, f64>,
+    ) -> f64 {
 
+    let dice_to_roll = DICE_TO_ROLL - dice.total_dice();
+    let resulting_rolls = &roll_probs[dice_to_roll as usize];
 
+    let score = resulting_rolls.iter()
+        .map(|(keeper_roll, probability)| -> f64 {
+            let combined_dice = dice.add(keeper_roll);
+            let next_state = OtherFullState::Dice(combined_dice, rolls_remaining - 1);
+            let next_state_value = full_state_values.get(&next_state).unwrap_or(&0.0);
+            probability * next_state_value
+        })
+        .sum();
+    println!("score: {:?}", score);
+    score
 }
 
 struct FullStateCalculator<'a> {
@@ -716,9 +742,11 @@ impl DiceCombination {
         }
 
         DiceCombination {dice: counts }
-
     }
-    
+
+    fn total_dice(self) -> i32 {
+        self.dice.iter().sum::<i32>()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
@@ -999,6 +1027,30 @@ mod tests {
                 &DiceCombination::from_vec(vec!(0, 3, 2, 0, 0, 0)),
                 &action_scores.state_builder,
                 &action_scores.state_values)
+        })
+    }
+
+    #[bench]
+    fn bench_max_keeper_score(b: &mut Bencher) {
+        b.iter(|| {
+            max_keeper_score(
+                &DiceCombination::from_vec(vec!(0, 3, 2, 0, 0, 0)),
+                2,
+                &HashMap::new()
+            )
+        })
+    }
+
+    #[bench]
+    fn bench_average_rolled_dice_score(b: &mut Bencher) {
+        let state_builder = StateBuilder::new(Config::new());
+
+        b.iter(|| {
+            average_rolled_dice_score(
+                &DiceCombination::from_vec(vec!(0, 0, 0, 0, 0, 0)),
+                2,
+                &state_builder.rolls,
+                &HashMap::new())
         })
     }
 }
