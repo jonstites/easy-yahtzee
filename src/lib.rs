@@ -36,6 +36,26 @@ impl From<std::option::NoneError> for YahtzeeError {
     }
 }
 
+#[derive(Debug, Copy, Clone)]
+pub struct Config {
+    upper_section_bonus: i32,
+    yahtzee_bonus: i32,
+    dice_to_roll: i32,
+    dice_sides: i32
+}
+
+impl Config {
+
+    pub fn new() -> Config {
+        Config {
+            upper_section_bonus: 35,
+            yahtzee_bonus: 100,
+            dice_to_roll: 5,
+            dice_sides: 6
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ConfigBuilder {
     config: Config,
@@ -75,26 +95,6 @@ impl ConfigBuilder {
             Err(YahtzeeError::BadConfig)
         } else {
             Ok(self.config.clone())
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct Config {
-    upper_section_bonus: i32,
-    yahtzee_bonus: i32,
-    dice_to_roll: i32,
-    dice_sides: i32
-}
-
-impl Config {
-
-    pub fn new() -> Config {
-        Config {
-            upper_section_bonus: 35,
-            yahtzee_bonus: 100,
-            dice_to_roll: 5,
-            dice_sides: 6
         }
     }
 }
@@ -438,6 +438,73 @@ enum Fs {
     C(FullState)
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+enum OtherFullState {
+    Dice(DiceCombination, i32),
+    Keepers(DiceCombination, i32),
+    E(DiceCombination),
+}
+
+fn full_state_children(
+    state: &State,
+    possible_rolls: &HashSet<DiceCombination>,
+    roll_probs: &Vec<HashMap<DiceCombination, f64>>,    
+) -> Vec<OtherFullState> {
+    let mut children = Vec::new();
+
+    if state.is_terminal() {
+        return children;
+    }
+
+    // Entries
+    possible_rolls.iter()
+        .foreach(|&roll| children.push(OtherFullState::E(roll)));
+
+    // Keepers
+    roll_probs.iter()
+        .flat_map(|all_rolls| all_rolls.keys())
+        .cartesian_product(1..=2)
+        .map(|(&keeper, rolls_remaining)| OtherFullState::Keepers(keeper, rolls_remaining))
+        .foreach(|full_state| children.push(full_state));
+
+    // Dice        
+    possible_rolls.iter()
+        .cartesian_product(1..=2)
+        .map(|(&dice, rolls_remaining)| OtherFullState::Dice(dice, rolls_remaining))
+        .foreach(|full_state| children.push(full_state));
+
+    let initial = OtherFullState::Keepers(DiceCombination::new(), 3);
+    children.push(initial);
+    println!("{:?}", children);
+    children
+}
+
+fn max_entry_score(
+    state: &State,
+    dice: &DiceCombination,
+    state_builder: &StateBuilder,
+    minimal_state_values: &HashMap<State, f64>
+) -> Result<f64> {
+    let output = Entry::iterator()
+        .filter(|&e| state.is_valid(&e))                
+        .map(|&e| -> Result<_> {
+            let score = state.score(e, *dice) as f64;
+            let child = state_builder.child(*state, e, *dice);
+            let child_score = minimal_state_values.get(&child)?;
+            Ok(score + child_score)
+        }).collect::<Result<Vec<f64>>>()?;
+
+    let best = output.into_iter().fold(std::f64::NAN, f64::max); // Find the largest non-NaN in vector, or NaN otherwise
+    Ok(best)
+}
+
+fn max_keeper_score(
+
+) -> Result<f64> {
+
+
+}
+
 struct FullStateCalculator<'a> {
     minimal_state: &'a State,
     minimal_state_values: &'a HashMap<State, f64>,
@@ -498,12 +565,38 @@ impl<'a> FullStateCalculator<'a> {
         Ok(output.into_iter().fold(std::f64::NAN, f64::max)) // Find the largest non-NaN in vector, or NaN otherwise
     }
 
-    fn full_state_calculation(&mut self, full_state: Fs) -> Result<f64> {
-
+    fn full_state_calculation_iterative(
+        &mut self) -> Result<f64> {
         if self.minimal_state.is_terminal() {
             return Ok(0.0);
         }
 
+        // insert best entries
+        /*let valid_entries = Entry::iterator().filter(|&e| self.minimal_state.is_valid(&e));
+
+        for roll in self.possible_rolls.iter() {
+            let full_state = FullState{rolls_remaining: 0, dice: *roll};
+            let mut best_score = 0.0_f64;
+            for entry in valid_entries.clone() {
+                let entry = *entry;
+                let score = self.minimal_state.score(entry, full_state.dice) as f64;
+                let child = self.state_builder.child(*self.minimal_state, entry, full_state.dice);
+                let child_score = self.minimal_state_values.get(&child)?;
+                let total_score = score + child_score;
+                best_score = best_score.max(total_score);
+            }
+
+            self.full_state_values.insert(Fs::C(full_state), best_score);
+        };*/
+
+        Ok(5.0)
+    }
+    
+    fn full_state_calculation(&mut self, full_state: Fs) -> Result<f64> {
+        if self.minimal_state.is_terminal() {
+            return Ok(0.0);
+        }
+        
         match full_state {
             Fs::C(ref s)
                 if s.rolls_remaining == 0
@@ -781,7 +874,7 @@ mod tests {
         action_scores.init_from_state(starting_state);
 
         b.iter(|| {
-            action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, starting_state)
+            action_scores.value_of_keepers(vec!(0, 0, 3, 1, 0, 0), 2, starting_state)
         })
     }
 
@@ -847,9 +940,66 @@ mod tests {
             _ => assert!(false),
         }
     }
-    
+
+    #[test]
+    fn test_full_state_children() {
+
+        let state = State::default();
+        let state_builder = StateBuilder::new(Config::new());
+
+        let children = full_state_children(
+            &state,
+            &state_builder.possible_rolls,
+            &state_builder.rolls);
+
+        assert_eq!(children.len(), 1681);
+
+    }
+
+    #[bench]
+    fn bench_full_state_children(b: &mut Bencher) {
+        let state = State::default();
+        let state_builder = StateBuilder::new(Config::new());
+
+        b.iter(|| {
+            full_state_children(
+                &state,
+                &state_builder.possible_rolls,
+                &state_builder.rolls)
+        })
+    }
+
+    #[bench]
+    fn bench_full_state_children_clone(b: &mut Bencher) {
+        let state = State::default();
+        let state_builder = StateBuilder::new(Config::new());
+        let children = full_state_children(
+                &state,
+                &state_builder.possible_rolls,
+                &state_builder.rolls);
+
+        b.iter(|| {
+            test::black_box(children.clone())
+        })
+    }
+
+
+    #[bench]
+    fn bench_max_entry_score(b: &mut Bencher) {
+        let mut action_scores = ActionScores::new(Config::new());
+        let mut starting_state = State::default();
+        for i in 1..10 {
+            starting_state.entries_taken[i] = true;
+        }
+        action_scores.init_from_state(starting_state);
+
+        b.iter(|| {
+            max_entry_score(
+                &starting_state,
+                &DiceCombination::from_vec(vec!(0, 3, 2, 0, 0, 0)),
+                &action_scores.state_builder,
+                &action_scores.state_values)
+        })
+    }
 }
-
-
-
 
