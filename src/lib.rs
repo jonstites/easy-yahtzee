@@ -442,7 +442,6 @@ enum Fs {
 enum OtherFullState {
     Dice(DiceCombination, i32),
     Keepers(DiceCombination, i32),
-    E(DiceCombination),
 }
 
 fn full_state_children(
@@ -458,7 +457,7 @@ fn full_state_children(
 
     // Entries
     possible_rolls.iter()
-        .foreach(|&roll| children.push(OtherFullState::E(roll)));
+        .foreach(|&roll| children.push(OtherFullState::Dice(roll, 0)));
 
     // Keepers
     roll_probs.iter()
@@ -477,6 +476,47 @@ fn full_state_children(
     children.push(initial);
     println!("{:?}", children);
     children
+}
+
+fn full_state_score(
+    state: &State,
+    children: &Vec<OtherFullState>,
+    state_builder: &StateBuilder,
+    minimal_state_values: &HashMap<State, f64>,
+    roll_probs: &Vec<HashMap<DiceCombination, f64>>,    
+) -> f64 {
+
+    let mut full_state_values = HashMap::new();
+    
+    children.iter().foreach(
+        |&full_state| {
+            let score = match full_state {
+                OtherFullState::Dice(dice, 0) => 
+                    max_entry_score(
+                        state,
+                        &dice,
+                        state_builder,
+                        minimal_state_values).expect("whoopsie"),
+                
+                OtherFullState::Dice(dice, rolls_remaining) =>
+                    max_keeper_score(
+                        &dice,
+                        rolls_remaining,
+                        &full_state_values),
+                
+                OtherFullState::Keepers(dice, rolls_remaining) =>
+                    average_rolled_dice_score(
+                        &dice,
+                        rolls_remaining,
+                        roll_probs,
+                        &full_state_values),
+            };
+
+            full_state_values.insert(full_state, score);
+        });
+
+    let initial = OtherFullState::Keepers(DiceCombination::new(), 3);
+    *full_state_values.get(&initial).expect("weird!")
 }
 
 fn max_entry_score(
@@ -527,7 +567,6 @@ fn average_rolled_dice_score(
             probability * next_state_value
         })
         .sum();
-    println!("score: {:?}", score);
     score
 }
 
@@ -1051,6 +1090,30 @@ mod tests {
                 2,
                 &state_builder.rolls,
                 &HashMap::new())
+        })
+    }
+
+    #[bench]
+    fn bench_full_score_calculation(b: &mut Bencher) {
+        let mut action_scores = ActionScores::new(Config::new());
+        let mut starting_state = State::default();
+        for i in 1..10 {
+            starting_state.entries_taken[i] = true;
+        }
+        action_scores.init_from_state(starting_state);
+
+        let children = full_state_children(
+            &starting_state,
+            &action_scores.state_builder.possible_rolls,
+            &action_scores.state_builder.rolls);
+        
+        b.iter(|| {
+            full_state_score(
+                &starting_state,
+                &children,
+                &action_scores.state_builder,
+                &action_scores.state_values,
+                &action_scores.state_builder.rolls)
         })
     }
 }
