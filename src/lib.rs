@@ -103,7 +103,8 @@ impl ConfigBuilder {
 // also vector to box works just fine (?!), with hash too.
 pub struct ActionScores {
     state_values: HashMap<State, f64>,
-    state_builder: StateBuilder
+    state_builder: StateBuilder,
+    full_state_children: Vec<OtherFullState>
 }
 
 impl ActionScores {
@@ -111,10 +112,15 @@ impl ActionScores {
     pub fn new(config: Config) -> ActionScores {
         let state_values = HashMap::new();
         let state_builder = StateBuilder::new(config);
-        
+        let full_state_children = full_state_children(
+            &State::default(),
+            &state_builder.possible_rolls,
+            &state_builder.rolls);
+            
         ActionScores {
             state_values,
             state_builder,
+            full_state_children
         }
     }
 
@@ -181,7 +187,7 @@ impl ActionScores {
     }
 
     fn get_score(&self, state: State) -> Result<f64> {
-        let default_full_state = Fs::I(
+        /*let default_full_state = Fs::I(
             FullState {
                 dice: DiceCombination::new(),
                 rolls_remaining: 3 
@@ -194,8 +200,14 @@ impl ActionScores {
             roll_probs: &self.state_builder.rolls,
             full_state_values: HashMap::new(),
             state_builder: &self.state_builder,
-        }.full_state_calculation(default_full_state);
-        score
+    }.full_state_calculation(default_full_state);*/
+        let score = full_state_score(
+            &state,
+            &self.full_state_children,
+            &self.state_builder,
+            &self.state_values,
+            &self.state_builder.rolls);
+        Ok(score)
     }
 }
 
@@ -474,7 +486,7 @@ fn full_state_children(
 
     let initial = OtherFullState::Keepers(DiceCombination::new(), 3);
     children.push(initial);
-    println!("{:?}", children);
+    //println!("{:?}", children);
     children
 }
 
