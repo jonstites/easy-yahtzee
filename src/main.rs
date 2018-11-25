@@ -9,9 +9,9 @@ use optizee::{ActionScores, Config};
 fn main() {
     let mut action_scores = ActionScores::new(Config::new());
     let mut state = optizee::State::default();
-    /*for i in 0..4 {
+    for i in 0..12 {
         state.entries_taken[i] = true;
-    };*/
+    };
 
     let start = PreciseTime::now();
     action_scores.init_from_state(state);

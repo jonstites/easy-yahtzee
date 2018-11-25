@@ -113,7 +113,6 @@ impl ActionScores {
         let state_values = HashMap::new();
         let state_builder = StateBuilder::new(config);
         let full_state_children = full_state_children(
-            &State::default(),
             &state_builder.possible_rolls,
             &state_builder.rolls);
             
@@ -130,11 +129,15 @@ impl ActionScores {
     }
     
     pub fn init_from_state(&mut self, starting_state: State) {
-        let mut states = self.state_builder.children(starting_state);
-        while let Some(state) = states.pop() {
-            let score = self.get_score(state).unwrap();
+        println!("starting");
+        
+        let states = self.state_builder.children(starting_state);
+        //println!("{:?}", starting_state);
+        for &state in states.iter() {
+            let score = self.get_score(state).expect("fail in new place here");
             self.state_values.insert(state, score);
         }
+        //println!("{:?}", self.state_values);
     }
 
     pub fn value_of_state(&self, state: State) -> Result<f64> {
@@ -200,13 +203,15 @@ impl ActionScores {
             roll_probs: &self.state_builder.rolls,
             full_state_values: HashMap::new(),
             state_builder: &self.state_builder,
-    }.full_state_calculation(default_full_state);*/
+        }.full_state_calculation(default_full_state);
+        score*/
         let score = full_state_score(
             &state,
             &self.full_state_children,
             &self.state_builder,
             &self.state_values,
             &self.state_builder.rolls);
+        //println!("score: {:?}", score);*/
         Ok(score)
     }
 }
@@ -271,6 +276,7 @@ impl StateBuilder {
                 }
             }
         }
+        states.reverse();
         states
     }
 
@@ -457,32 +463,27 @@ enum OtherFullState {
 }
 
 fn full_state_children(
-    state: &State,
     possible_rolls: &HashSet<DiceCombination>,
     roll_probs: &Vec<HashMap<DiceCombination, f64>>,    
 ) -> Vec<OtherFullState> {
     let mut children = Vec::new();
 
-    if state.is_terminal() {
-        return children;
-    }
-
     // Entries
     possible_rolls.iter()
         .foreach(|&roll| children.push(OtherFullState::Dice(roll, 0)));
 
-    // Keepers
-    roll_probs.iter()
-        .flat_map(|all_rolls| all_rolls.keys())
-        .cartesian_product(1..=2)
-        .map(|(&keeper, rolls_remaining)| OtherFullState::Keepers(keeper, rolls_remaining))
-        .foreach(|full_state| children.push(full_state));
+    for rolls_remaining in (1..=2) {
+        // Keepers
+        roll_probs.iter()
+            .flat_map(|all_rolls| all_rolls.keys())
+            .map(|(&keeper)| OtherFullState::Keepers(keeper, rolls_remaining))
+            .foreach(|full_state| children.push(full_state));
 
     // Dice        
-    possible_rolls.iter()
-        .cartesian_product(1..=2)
-        .map(|(&dice, rolls_remaining)| OtherFullState::Dice(dice, rolls_remaining))
-        .foreach(|full_state| children.push(full_state));
+        possible_rolls.iter()
+            .map(|(&dice)| OtherFullState::Dice(dice, rolls_remaining))
+            .foreach(|full_state| children.push(full_state));
+    };
 
     let initial = OtherFullState::Keepers(DiceCombination::new(), 3);
     children.push(initial);
@@ -497,7 +498,9 @@ fn full_state_score(
     minimal_state_values: &HashMap<State, f64>,
     roll_probs: &Vec<HashMap<DiceCombination, f64>>,    
 ) -> f64 {
-
+    if state.is_terminal() {
+        return 0_f64;
+    }
     let mut full_state_values = HashMap::new();
     
     children.iter().foreach(
@@ -523,11 +526,12 @@ fn full_state_score(
                         roll_probs,
                         &full_state_values),
             };
-
+            //println!("{:?} {:?}", full_state, score);
             full_state_values.insert(full_state, score);
         });
 
     let initial = OtherFullState::Keepers(DiceCombination::new(), 3);
+    //println!("full state score: {:}",     *full_state_values.get(&initial).expect("weird!"));
     *full_state_values.get(&initial).expect("weird!")
 }
 
@@ -547,6 +551,7 @@ fn max_entry_score(
         }).collect::<Result<Vec<f64>>>()?;
 
     let best = output.into_iter().fold(std::f64::NAN, f64::max); // Find the largest non-NaN in vector, or NaN otherwise
+    //println!("best entry of {:?} with {:?}", state, dice);
     Ok(best)
 }
 
@@ -555,9 +560,10 @@ fn max_keeper_score(
     rolls_remaining: i32,
     full_state_values: &HashMap<OtherFullState, f64>
 ) -> f64 {
+
     dice.possible_keepers().iter()
-        .map(|&keeper| OtherFullState::Keepers(*dice, rolls_remaining))
-        .map(|keeper| *full_state_values.get(&keeper).unwrap_or(&0.0))//.expect("Some internal error calculating score..."))
+        .map(|&keeper_dice| OtherFullState::Keepers(keeper_dice, rolls_remaining))
+        .map(|keeper| *full_state_values.get(&keeper).expect("Some internal error calculating score..."))
         .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
 }
 
@@ -575,10 +581,11 @@ fn average_rolled_dice_score(
         .map(|(keeper_roll, probability)| -> f64 {
             let combined_dice = dice.add(keeper_roll);
             let next_state = OtherFullState::Dice(combined_dice, rolls_remaining - 1);
-            let next_state_value = full_state_values.get(&next_state).unwrap_or(&0.0);
+            let next_state_value = full_state_values.get(&next_state).expect("Some internal error with averages");
             probability * next_state_value
         })
         .sum();
+    //println!("average roll value of {:?} with {:?}", dice, rolls_remaining);    
     score
 }
 
@@ -968,6 +975,7 @@ mod tests {
         action_scores.init_from_state(starting_state);
         let actual_value = action_scores.value_of_state(starting_state).unwrap();
         let expected_value = 55.581619_f64;
+        println!("Actual: {:+} Expected: {:?}", actual_value, expected_value);
         let abs_difference = (actual_value - expected_value).abs();
         let tolerance = 0.00001;
         assert!(abs_difference < tolerance);
@@ -998,6 +1006,7 @@ mod tests {
         }
         action_scores.init_from_state(starting_state);
         let actual_value = action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, starting_state).unwrap();
+        println!("{:?}", actual_value);
         let expected_value = 72.42314_f64;
         let abs_difference = (actual_value - expected_value).abs();
         let tolerance = 0.00001;
@@ -1023,11 +1032,9 @@ mod tests {
     #[test]
     fn test_full_state_children() {
 
-        let state = State::default();
         let state_builder = StateBuilder::new(Config::new());
 
         let children = full_state_children(
-            &state,
             &state_builder.possible_rolls,
             &state_builder.rolls);
 
@@ -1042,7 +1049,6 @@ mod tests {
 
         b.iter(|| {
             full_state_children(
-                &state,
                 &state_builder.possible_rolls,
                 &state_builder.rolls)
         })
@@ -1053,7 +1059,6 @@ mod tests {
         let state = State::default();
         let state_builder = StateBuilder::new(Config::new());
         let children = full_state_children(
-                &state,
                 &state_builder.possible_rolls,
                 &state_builder.rolls);
 
@@ -1115,7 +1120,6 @@ mod tests {
         action_scores.init_from_state(starting_state);
 
         let children = full_state_children(
-            &starting_state,
             &action_scores.state_builder.possible_rolls,
             &action_scores.state_builder.rolls);
         
