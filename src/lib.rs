@@ -4,7 +4,9 @@
 
 extern crate itertools;
 extern crate test;
+extern crate time;
 
+use time::PreciseTime;
 use test::Bencher;
 use itertools::Itertools;
 use std::collections::HashMap;
@@ -81,8 +83,11 @@ impl ScoreData {
     }
     
     fn init_from_state(&mut self, starting_state: State) {
+        let start = PreciseTime::now();
         let children = starting_state.children(&self.distinct_rolls);
-        println!("{:?}", children.len());
+        let end = PreciseTime::now();        
+
+        println!("{} seconds for children.", start.to(end));
         for &state in children.iter() {
             let score = full_state_score(
                 &state,

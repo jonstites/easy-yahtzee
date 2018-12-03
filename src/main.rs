@@ -9,5 +9,5 @@ fn main() {
     let start = PreciseTime::now();
     let action_scores = ScoreData::new();
     let end = PreciseTime::now();
-    println!("{} seconds for iterative action scores.", start.to(end));
+    println!("{} seconds for entire thing.", start.to(end));
 }
