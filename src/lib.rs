@@ -40,11 +40,12 @@ pub struct ScoreData {
     roll_probabilities: Box<[HashMap<DiceCombination, f64>]>,
     distinct_rolls: HashSet<DiceCombination>,
     widget_states: Box<[WidgetState]>,
+    child_edges: Box<[Vec<(usize, f64)>]>,
 }
 
 impl ScoreData {
 
-    pub fn new() -> ScoreData {
+    pub fn from_state(start: State) -> ScoreData {
         let expected_values = HashMap::new();
         let roll_probabilities = DiceCombination::probabilities_up_to(DICE_TO_ROLL);
         let distinct_rolls = roll_probabilities
@@ -56,20 +57,22 @@ impl ScoreData {
 
         
         let widget_states = full_state_children(&distinct_rolls, &roll_probabilities);
-
+        let child_edges = full_state_edges(&widget_states, &distinct_rolls, &roll_probabilities);
+        
         let mut data = ScoreData {
             expected_values,
             roll_probabilities,
             distinct_rolls,
             widget_states,
+            child_edges,
         };
 
-        let mut start = State::default();
-        for i in 8..=12  {
-            start.entries_taken[i] = true;
-        }
         data.init_from_state(start);
         data
+    }
+    
+    pub fn new() -> ScoreData {
+        ScoreData::from_state(State::default())
     }
 
     fn init(&mut self) {
@@ -79,15 +82,18 @@ impl ScoreData {
     
     fn init_from_state(&mut self, starting_state: State) {
         let children = starting_state.children(&self.distinct_rolls);
+        println!("{:?}", children.len());
         for &state in children.iter() {
             let score = full_state_score(
                 &state,
                 &self.widget_states,
+                &self.child_edges,
                 &self.expected_values,
                 &self.roll_probabilities);
 
             self.expected_values.insert(state, score);
         }
+        println!("{:?}", self.expected_values.get(&starting_state).unwrap());
     }
 }
 
@@ -278,10 +284,50 @@ impl State {
     
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 enum WidgetState {
     Dice(DiceCombination, i32),
     Keepers(DiceCombination, i32),
+}
+
+fn full_state_edges(
+    children: &Box<[WidgetState]>,
+    possible_rolls: &HashSet<DiceCombination>,
+    roll_probs: &Box<[HashMap<DiceCombination, f64>]>,
+) -> Box<[Vec<(usize, f64,)>]> {
+
+    let mut index_lookups: HashMap<WidgetState, usize> = HashMap::new();
+    for (index, child,) in children.iter().enumerate() {
+        index_lookups.insert(*child, index);
+    }
+    let mut total_edges = Vec::new();
+    for child in children.iter() {
+        let edges = match child {
+            &WidgetState::Dice(dice, 0) => Vec::new(),
+                
+            &WidgetState::Dice(dice, rolls_remaining) =>
+                dice.possible_keepers().iter()
+                .map(|&keeper_dice| WidgetState::Keepers(keeper_dice, rolls_remaining))
+                .map(|keeper| (*index_lookups.get(&keeper).unwrap(), 1.0))
+                .collect(),
+
+                
+            &WidgetState::Keepers(dice, rolls_remaining) => {
+                let dice_to_roll = DICE_TO_ROLL - dice.total_dice();
+                let resulting_rolls = &roll_probs[dice_to_roll as usize];
+                let mut tmp_edges = Vec::new();
+                for (keeper_roll, &probability) in resulting_rolls.iter() {
+                    let combined_dice = dice.add(keeper_roll);
+                    let next_state = WidgetState::Dice(combined_dice, rolls_remaining - 1);
+                    let index = index_lookups.get(&next_state).unwrap();
+                    tmp_edges.push((*index, probability,));
+                }
+                tmp_edges
+            }
+        };
+        total_edges.push(edges);
+    }
+    total_edges.into_boxed_slice()
 }
 
 fn full_state_children(
@@ -314,17 +360,19 @@ fn full_state_children(
 
 fn full_state_score(
     state: &State,
-    children: &Box<[WidgetState]>,
+    widget_states: &Box<[WidgetState]>,
+    child_edges: &Box<[Vec<(usize, f64)>]>,
     minimal_state_values: &HashMap<State, f64>,
-    roll_probs: &Box<[HashMap<DiceCombination, f64>]>,
+    roll_probs: &Box<[HashMap<DiceCombination, f64>]>,    
 ) -> f64 {
     if state.is_terminal() {
         return 0_f64;
     }
-    let mut full_state_values = HashMap::new();
+
+    let mut full_state_values = [0_f64; 1681];
     
-    children.iter().foreach(
-        |full_state| {
+    widget_states.iter().enumerate().foreach(
+        |(index, full_state,)| {
             let score = match full_state {
                 &WidgetState::Dice(dice, 0) => 
                     max_entry_score(
@@ -332,24 +380,20 @@ fn full_state_score(
                         &dice,
                         minimal_state_values).expect("whoopsie"),
                 
-                &WidgetState::Dice(dice, rolls_remaining) =>
+                &WidgetState::Dice(dice, _rolls_remaining) =>
                     max_keeper_score(
-                        &dice,
-                        rolls_remaining,
+                        &child_edges[index],
                         &full_state_values),
                 
-                &WidgetState::Keepers(dice, rolls_remaining) =>
+                &WidgetState::Keepers(dice, _rolls_remaining) =>
                     average_rolled_dice_score(
-                        &dice,
-                        rolls_remaining,
-                        roll_probs,
+                        &child_edges[index],
                         &full_state_values),
             };
-            full_state_values.insert(full_state, score);
+            full_state_values[index] = score;
         });
 
-    let initial = WidgetState::Keepers(DiceCombination::new(), 3);
-    *full_state_values.get(&initial).expect("weird!")
+    full_state_values[1680]
 }
 
 fn max_entry_score(
@@ -372,37 +416,22 @@ fn max_entry_score(
 }
 
 fn max_keeper_score(
-    dice: &DiceCombination,
-    rolls_remaining: i32,
-    full_state_values: &HashMap<WidgetState, f64>
+    edges: &Vec<(usize, f64)>,
+    full_state_values: &[f64; 1681]
 ) -> f64 {
-
-    dice.possible_keepers().iter()
-        .map(|&keeper_dice| WidgetState::Keepers(keeper_dice, rolls_remaining))
-        .map(|keeper| *full_state_values.get(&keeper).expect("Some internal error calculating score..."))
+    edges.iter()
+        .map(|(child_index, _probability,)| full_state_values[*child_index])
         .fold(std::f64::NAN, f64::max) // Find the largest non-NaN in vector, or NaN otherwise
 }
-
+        
 fn average_rolled_dice_score(
-    dice: &DiceCombination,
-    rolls_remaining: i32,
-    roll_probs: &Box<[HashMap<DiceCombination, f64>]>,
-    full_state_values: &HashMap<WidgetState, f64>,
-    ) -> f64 {
+    edges: &Vec<(usize, f64)>,
+    full_state_values: &[f64; 1681]
+) -> f64 {
 
-    let dice_to_roll = DICE_TO_ROLL - dice.total_dice();
-    let resulting_rolls = &roll_probs[dice_to_roll as usize];
-
-    let score = resulting_rolls.iter()
-        .map(|(keeper_roll, probability)| -> f64 {
-            let combined_dice = dice.add(keeper_roll);
-            let next_state = WidgetState::Dice(combined_dice, rolls_remaining - 1);
-            let next_state_value = full_state_values.get(&next_state).expect("Some internal error with averages");
-            probability * next_state_value
-        })
-        .sum();
-    //println!("average roll value of {:?} with {:?}", dice, rolls_remaining);    
-    score
+    edges.iter()
+        .map(|(child_index, probability)| full_state_values[*child_index] * probability)
+        .sum()
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
@@ -669,23 +698,24 @@ mod tests {
         })
     }
 
-    
+    */
     #[test]
     fn test_state_value() {
-        let mut action_scores = ActionScores::new(Config::new());
+
         let mut starting_state = State::default();
         for i in 1..10 {
             starting_state.entries_taken[i] = true;
         }
-        action_scores.init_from_state(starting_state);
-        let actual_value = action_scores.value_of_state(starting_state).unwrap();
+        let mut action_scores = ScoreData::from_state(starting_state);
+
+        let actual_value = action_scores.expected_values.get(&starting_state).unwrap();
         let expected_value = 55.581619_f64;
         println!("Actual: {:+} Expected: {:?}", actual_value, expected_value);
         let abs_difference = (actual_value - expected_value).abs();
         let tolerance = 0.00001;
         assert!(abs_difference < tolerance);
     }
-
+    /*
     #[test]
     fn test_state_value_bad() {
         let mut action_scores = ActionScores::new(Config::new());

@@ -1,4 +1,4 @@
-extern crate optizee;
+/*extern crate optizee;
 
 use optizee::{ActionScores, State, Config};
 
@@ -33,3 +33,4 @@ fn test_entry_value() {
     println!("{}", actual_value);
     assert!(abs_difference < tolerance);
 }
+*/
