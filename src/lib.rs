@@ -1,6 +1,8 @@
 
 use std::convert::From;
 use std::fmt;
+use std::collections::VecDeque;
+
 
 #[macro_use]
 extern crate itertools;
@@ -51,7 +53,7 @@ lazy_static! {
             idx += 1;
 
             for j in 1..5 {
-                if dice[j] != dice[j - 1] {
+                if dice[j] != dice[j-1] {
                     continue 'outer;
                 }
             }
@@ -69,7 +71,7 @@ struct State(usize);
 impl Default for State {
 
     fn default() -> State {
-        State(53_usize)
+        State(63_usize)
     }
 }
 
@@ -87,13 +89,13 @@ impl State {
 
         for i in 0..13 {
             // if this action hasn't been taken yet            
-            if ((self.0 >> (i + 7)) & 1) != 1 {
+            if ((self.0 >> (19 - i)) & 1) != 1 {
 
                 for j in 0..252 {                    
                     let mut child = *self;
 
                     // set action
-                    child.0 |= 1 << (i + 7);
+                    child.0 |= 1 << (19 - i);
 
                     // set upper score
                     let upper_score = (child.0 & 0b11_1111).saturating_sub(UPPER_SCORES[i][j]);
@@ -102,7 +104,7 @@ impl State {
                     
                     // set yahtzee eligibility
                     if i == 11 && YAHTZEE[j] {
-                        child.0 |= 1 << 7;
+                        child.0 |= 1 << 6;
                     }
                     children_values[i][j] = Some(child);
                 }
@@ -130,23 +132,32 @@ pub fn valid_states() -> Box<[bool]> {
     let mut valid_markers = vec![false;  NUM_STATES];
 
     valid_markers[0] = true;
-    let mut queue = vec!(State(0b11111 << 7));
+    let mut stack = VecDeque::new();
+    stack.push_front(State::default());//vec!(State::default());//State(0b11111 << 7));
+
+    for i in 0..YAHTZEE.len() {
+        println!("{:?}", YAHTZEE[i]);
+    }
+
     for i in 0..UPPER_SCORES.len() {
         for j in 0..UPPER_SCORES[i].len() {
             println!("{:?} {:?} {:?}", i, j, UPPER_SCORES[i][j]);
         }
     }
-    while let Some(elem) = queue.pop() {        
+
+
+    while let Some(elem) = stack.pop_back() {        
 
         for child in elem.children().iter().flat_map(|array| array.iter()).filter_map(|child| *child) {
 
             let idx: usize = child.into();
             if !valid_markers[idx] {
-                //println!("{} {}", elem, child);
+                println!("{} {}", elem, child);
                 valid_markers[idx] = true;
-                queue.push(child);
+                stack.push_front(child);
             }
         }
+
     }
     valid_markers.into_boxed_slice()
 }
