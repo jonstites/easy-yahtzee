@@ -4,6 +4,8 @@
 
 Pointer? Optizee? Yahtzee Help? Sir Rolls A Lot?
 
+Topics: dynamic programming, graphs, linear algebra, benchmarking, Rust, safe concurrency, web assembly...
+
 ## Yahtzee
 
 Yahtzee is a dice-based game that contains elements of both luck and strategy.
@@ -198,6 +200,10 @@ The expected value of a particular state is, if you play optimally, the sum of t
 
 Let's work this out on a 2-dice example. I'll show both the math-version and the code-version... hopefully...
 
+Graph of 2-dice levels, upper score only:
+
+Working backwards, dynamic programming...
+
 
 ## Internals
 
@@ -212,6 +218,12 @@ Can bonuses be matrices too?
 
 
 
+## Biggest design uncertainties
+
+So the biggest uncertainty around the design is the web-browser version. Should this be entirely static plus webassembly, static plus calls to backend server, or something else? 
+
+Question: how big would a file of the expected values be? can this be shrunk down more? I would guess that best-practices put this on the sub-Megabyte range... if it ends up being larger, shouldn't I switch to something else? Such as, maybe, Cloudflare Cloud Workers?
+
 ## Tests
 
 ## Benchmarks
@@ -219,7 +231,9 @@ Can bonuses be matrices too?
 It will be important to benchmark:
 - time to generate valid states. is this even worth it? is this impossible to multithread?
 - time to perform one widget. show / calculate both the vector version, the matrix version, and ... the... all-matrix version with scoring and bonus too?
+- 2^20 states vs 2^14*53 states
 - time to score one entry
+
 
 Binary size
 

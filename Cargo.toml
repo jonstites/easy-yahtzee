@@ -4,3 +4,8 @@ version = "0.1.0"
 authors = ["Jonathan Stites <mail@jonstites.com>"]
 
 [dependencies]
+itertools = "0.8.0"
+lazy_static = "1.4.0"
+
+[profile.test]
+opt-level = 3
