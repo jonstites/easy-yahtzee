@@ -4,14 +4,27 @@ use std::fmt;
 use std::collections::VecDeque;
 
 extern crate nalgebra as na;
+extern crate typenum;
+use na::{U1, U2, U13, Dynamic, ArrayStorage, RowVectorN, Matrix, Matrix2x3};
+use typenum::{U252, U462};
+
 #[macro_use]
 extern crate itertools;
 use itertools::Itertools;
 
 #[macro_use]
 extern crate lazy_static;
-
+extern crate ndarray;
+use ndarray::Array3;
 const NUM_STATES: usize = 1048576;
+
+use nalgebra::*;
+
+// note: request doc changes for deprecated matrix array
+type Matrix252x13  = MatrixMN<f64, U252, U13>;
+type Matrix13x252  = MatrixMN<f64, U13, U252>;
+type Matrix252x462 = MatrixMN<f64, U252, U462>;
+type Matrix462x252 = MatrixMN<f64, U462, U252>;
 
 
 lazy_static! {
@@ -42,9 +55,29 @@ lazy_static! {
         scores
     };
 
-    static ref ACTIONS_TO_DICE: Box<[[f32; 252]; 462]> = {
-        let mut actions_to_dice = Box::new([[0_f32; 252]; 462]);
-        let mut totals = vec![0_f32; 462];
+    static ref SCORES_MATRIX: Matrix13x252 = {
+        let combinations = dice_combinations(5);
+        let scores = Matrix13x252::from_fn(|action, dice_idx| {
+            let dice = combinations[dice_idx];
+            let score = match action {
+                    idx if idx < 6 => (dice[action] * (action + 1)) as u8,
+                    6 if *dice.iter().max().unwrap() >= 3_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
+                    7 if *dice.iter().max().unwrap() >= 4_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
+                    8 if *dice.iter().max().unwrap() == 3_usize && *dice.iter().filter(|&&i| i != 3_usize).max().unwrap() == 2_usize => 25,
+                    9 if dice[..4] == [1, 1, 1, 1] || dice[1..5] == [1, 1, 1, 1] || dice[2..6] == [1, 1, 1, 1] => 35,
+                    10 if dice == [1, 1, 1, 1, 1, 0] || dice == [0, 1, 1, 1, 1, 1] => 45,
+                    11 if *dice.iter().max().unwrap() == 5_usize => 50,
+                    12 => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
+                    _ => 0_u8,
+                };
+            score as f64
+        });
+        scores
+    };
+
+    static ref ACTIONS_TO_DICE_MATRIX: Matrix462x252 = {
+        let mut actions_to_dice = Box::new([[0_f64; 252]; 462]);
+        let mut totals = vec![0_f64; 462];
         for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations(n)).enumerate() {
             let left_to_roll = 5_usize - action.iter().sum::<usize>();
             'outer:
@@ -54,8 +87,8 @@ lazy_static! {
                 }
 
                 let dice_idx = dice_combination_idx(dice_permutation);
-                actions_to_dice[action_idx][dice_idx] += 1_f32;
-                totals[action_idx] += 1_f32;
+                actions_to_dice[action_idx][dice_idx] += 1_f64;
+                totals[action_idx] += 1_f64;
                 //println!("{:?} {:?} ", dice_idx, actions_to_dice[action_idx][dice_idx] )
             }
         }
@@ -69,25 +102,25 @@ lazy_static! {
             }
         }
         
-        actions_to_dice
+        Matrix462x252::from_fn(|dice_action_idx, dice_idx| actions_to_dice[dice_action_idx][dice_idx])
     };
 
-    static ref DICE_TO_ACTIONS: Box<[[bool; 462]; 252]> = {
-        let mut dice_to_actions = Box::new([[true; 462]; 252]);
+    static ref DICE_TO_ACTIONS_MATRIX: Matrix462x252 = {
+        let mut dice_to_actions = Box::new([[1_f64; 462]; 252]);
 
         for (dice_idx, dice) in dice_combinations(5).into_iter().enumerate() {
             for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations(n)).enumerate() {
 
                 for idx in 0..=5 {
                     if action[idx] > dice[idx] {
-                        dice_to_actions[dice_idx][action_idx] = false;
+                        dice_to_actions[dice_idx][action_idx] = 0_f64;
                     }
                 }
             }
         }
 
-        dice_to_actions
-    };
+        Matrix462x252::from_fn(|action_idx, dice_idx| dice_to_actions[dice_idx][action_idx])
+    };    
 }
 
 fn dice_combination_idx(dice: [usize; 6]) -> usize {
@@ -251,132 +284,95 @@ fn valid_states() -> Box<[bool]> {
     valid_markers.into_boxed_slice()
 }
 
-pub fn widget(state: State, scores: &Vec<f32>) -> f32 {
+pub fn widget(state: State, scores: &Vec<f64>) -> f64 {
+    // base case
     if !(0..13).map(|i| state.is_valid_action(i)).any(|i| i) {
-        return 0_f32;
+        return 0_f64;
     }
 
-    let mut action_values = Box::new([[0_f32; 13]; 252]);
-
-    let debug = false;
-    for action_idx in 0..13 {
+    // values of each entry for each final dice roll
+    let entry_scores = Matrix13x252::from_fn(|action_idx, dice_idx| {
         if !state.is_valid_action(action_idx) {
-            continue;
+            return 0_f64;
         }
-        for dice_idx in 0..252 {
-            let child = state.child(action_idx, dice_idx);
-            let child_idx: usize = child.into();
-            let child_value = scores[child_idx];
+        let child = state.child(action_idx, dice_idx);
+        let child_idx: usize = child.into();
+        let child_value = scores[child_idx];
 
-            let normal_score = SCORES[action_idx][dice_idx].0 as f32;
-            let upper_bonus = if !state.upper_complete() && child.upper_complete() {
-                35_f32
-            } else {
-                0_f32
-            };
+        let normal_score = SCORES[action_idx][dice_idx].0 as f64;
+        let upper_bonus = if !state.upper_complete() && child.upper_complete() {
+            35_f64
+        } else {
+            0_f64
+        };
 
-            let yahtzee_bonus = if SCORES[action_idx][dice_idx].1.is_some() && ((state.0 & (1 << 6)) >> 6 == 1)  {
-                100_f32
-            } else {
-                0_f32
-            };
+        let yahtzee_bonus = if SCORES[action_idx][dice_idx].1.is_some() && ((state.0 & (1 << 6)) >> 6 == 1)  {
+            100_f64
+        } else {
+            0_f64
+        };
 
 
-            let joker_points = match action_idx {
-                8 => 25_f32,
-                9 => 35_f32,
-                10 => 45_f32,
-                _ => 0_f32,
-            };
+        let joker_points = match action_idx {
+            8 => 25_f64,
+            9 => 35_f64,
+            10 => 45_f64,
+            _ => 0_f64,
+        };
 
-            let joker_rule = match SCORES[action_idx][dice_idx].1 {
-                Some(idx) if !state.is_valid_action(idx) => joker_points,
-                _ => 0_f32,
-            };
-            
-            let score = child_value + normal_score + upper_bonus + yahtzee_bonus + joker_rule;
-            if debug {
-            println!("{} {} {} {} {} {} {}", state, child_value, normal_score, upper_bonus, yahtzee_bonus, action_idx, dice_idx);
-            }
-            action_values[dice_idx][action_idx] = score;
-        }
-    }
-
-    if debug {
-    for action_idx in 0..252 {
-        println!("{:?} {:?}", action_idx, action_values[action_idx].clone().into_iter().collect::<Vec<_>>());
-    }
-    }
-    let mut max_action_values = Box::new([0_f32; 252]);
-    for dice_idx in 0..252 {
-        let max = action_values[dice_idx].iter().max_by(|&lhs, &rhs| lhs.partial_cmp(rhs).unwrap()).unwrap();
-        max_action_values[dice_idx] = *max;
+        let joker_rule = match SCORES[action_idx][dice_idx].1 {
+            Some(idx) if !state.is_valid_action(idx) => joker_points,
+            _ => 0_f64,
+        };
+        
+        let score = child_value + normal_score + upper_bonus;// + yahtzee_bonus + joker_rule;
+        score
+    });
+    // value of each final dice roll
+    let max_action_values: VectorN<f64, U252> = entry_scores.compress_rows_tr(|col| col.max());
+    
+    let actions_to_dice: &Matrix462x252 = &ACTIONS_TO_DICE_MATRIX;
+    
+    // value of each final set of keepers chosen
+    let mut avg_action_values: VectorN<f64, U462> = actions_to_dice * max_action_values;
+    
+    // need to copy global into local for mutability
+    let mut dice_to_actions: Matrix462x252 = DICE_TO_ACTIONS_MATRIX.clone();
+    for mut col in dice_to_actions.column_iter_mut() {
+        col.component_mul_assign(&avg_action_values);
     }
 
-    if debug {
-    println!("{:?}", max_action_values.clone().into_iter().collect::<Vec<_>>());
+    let dice_values = dice_to_actions.compress_rows_tr(|col| col.max());
+
+    actions_to_dice.mul_to(&dice_values, &mut avg_action_values);
+
+    dice_to_actions.copy_from(&DICE_TO_ACTIONS_MATRIX);
+    for mut col in dice_to_actions.column_iter_mut() {
+        col.component_mul_assign(&avg_action_values);
     }
-    let mut avg_action_values = Box::new([0_f32; 462]);
-    for action_idx in 0..462 {
-        for dice_idx in 0..252 {
-            avg_action_values[action_idx] += ACTIONS_TO_DICE[action_idx][dice_idx] * max_action_values[dice_idx];
-            if debug {
-                println!("{:?} {:?} {:?} {:?} {:?}", action_idx, dice_idx, avg_action_values[action_idx],ACTIONS_TO_DICE[action_idx][dice_idx], max_action_values[dice_idx]);
-            }
-        }
+    let dice_values = dice_to_actions.compress_rows_tr(|col| col.max());
+
+    dice_values.tr_dot(&ACTIONS_TO_DICE_MATRIX.index((0, ..)))*/
+    //dice_to_actions.component_mul_assign(&avg_action_values);
+    // matrix of dice to value of allowed keepers, then max
+    /*for (idx, col) in DICE_TO_ACTIONS_MATRIX.column_iter().enumerate() {
+        dice_values[idx] = col.component_mul(&avg_action_values).compress_rows(|c| c.max())[(0, 0)];
     }
-    if debug {
-    println!("{:?}", avg_action_values.clone().into_iter().collect::<Vec<_>>());
+
+    actions_to_dice.mul_to(&dice_values, &mut avg_action_values);
+
+    for (idx, col) in DICE_TO_ACTIONS_MATRIX.column_iter().enumerate() {
+        dice_values[idx] = col.component_mul(&avg_action_values).compress_rows(|c| c.max())[(0, 0)];
     }
-    let mut dice_values = Box::new([0_f32; 252]);
-    for dice_idx in 0..252 {
-        for action_idx in 0..462 {
-            if DICE_TO_ACTIONS[dice_idx][action_idx] {
-                dice_values[dice_idx] = dice_values[dice_idx].max(avg_action_values[action_idx]);
-            }
-        }
-    }
-    if debug {
-    println!("{:?}", dice_values.clone().into_iter().collect::<Vec<_>>());
-    }
-    let mut avg_action_values2 = Box::new([0_f32; 462]);
-    for action_idx in 0..462 {
-        for dice_idx in 0..252 {
-            avg_action_values2[action_idx] += ACTIONS_TO_DICE[action_idx][dice_idx] * dice_values[dice_idx];
-        }
-    }
-    if debug {
-    println!("{:?}", avg_action_values2.clone().into_iter().collect::<Vec<_>>());
-    }
-    let mut dice_values2 = Box::new([0_f32; 252]);
-    for dice_idx in 0..252 {
-        for action_idx in 0..462 {
-            if DICE_TO_ACTIONS[dice_idx][action_idx] {
-                dice_values2[dice_idx] = dice_values2[dice_idx].max(avg_action_values2[action_idx]);
-            }
-        }
-    }
-    if debug {
-    println!("{:?}", dice_values2.clone().into_iter().collect::<Vec<_>>());
-    }
-    let mut score = 0_f32;
-    for dice_idx in 0..252 {
-        score += ACTIONS_TO_DICE[0][dice_idx] * dice_values2[dice_idx];
-    }
-    if debug {
-    println!("{}", score);
-    }
-    score
+
+    dice_values.tr_dot(&ACTIONS_TO_DICE_MATRIX.index((0, ..)))
+    */
+    //dice_values[0]
+    
 }
 
-pub fn scores() -> Vec<f32> {
-    for action in 0..13 {
-        println!("{:?}", SCORES[action].iter().collect::<Vec<_>>());
-    }
-
-    for i in 0..ACTIONS_TO_DICE.len() {
-        println!("{:?} {:?}", ACTIONS_TO_DICE[i].iter().collect::<Vec<_>>(), ACTIONS_TO_DICE[i].iter().sum::<f32>());
-    }
+pub fn scores() -> Vec<f64> {
+    
 
     println!("before valid states");
     let valid_states = valid_states();

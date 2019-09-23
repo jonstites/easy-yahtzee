@@ -4,7 +4,7 @@
 
 Pointer? Optizee? Yahtzee Help? Sir Rolls A Lot?
 
-Topics: dynamic programming, graphs, linear algebra, benchmarking, Rust, safe concurrency, web assembly...
+Topics: dynamic programming, graphs, combinatorics, probability, linear algebra, benchmarking, Rust, safe concurrency, web assembly...
 
 ## Yahtzee
 

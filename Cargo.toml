@@ -2,10 +2,24 @@
 name = "optizee"
 version = "0.1.0"
 authors = ["Jonathan Stites <mail@jonstites.com>"]
+edition = "2018"
 
 [dependencies]
-itertools = "0.8.0"
 lazy_static = "1.4.0"
+nalgebra = "0.18"
+typenum = "1.11.2"
+ndarray = "0.12.1"
+itertools = {version = "0.8.0"}
 
 [profile.test]
 opt-level = 3
+
+[features]
+"generate_constants" = []
+
+[[bin]]
+name = "generate_constants"
+path = "src/bin/generate_constants.rs"
+
+[profile.release]
+debug = true
