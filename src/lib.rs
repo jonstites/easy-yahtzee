@@ -15,11 +15,13 @@ use itertools::Itertools;
 #[macro_use]
 extern crate lazy_static;
 extern crate ndarray;
-use ndarray::Array3;
+use ndarray::{Array2, Zip};
 const NUM_STATES: usize = 1048576;
 
 use nalgebra::*;
-
+extern crate ndarray_parallel;
+use ndarray_parallel::prelude::*;
+use ndarray::*;
 // note: request doc changes for deprecated matrix array
 type Matrix252x13  = MatrixMN<f64, U252, U13>;
 type Matrix13x252  = MatrixMN<f64, U13, U252>;
@@ -105,6 +107,39 @@ lazy_static! {
         Matrix462x252::from_fn(|dice_action_idx, dice_idx| actions_to_dice[dice_action_idx][dice_idx])
     };
 
+    static ref ACTIONS_TO_DICE_ARRAY: Array2<f64> = {
+        let mut actions_to_dice = Box::new([[0_f64; 252]; 462]);
+        let mut totals = vec![0_f64; 462];
+        for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations(n)).enumerate() {
+            let left_to_roll = 5_usize - action.iter().sum::<usize>();
+            'outer:
+            for mut dice_permutation in dice_permutations(left_to_roll) {
+                for idx in 0..=5 {
+                    dice_permutation[idx] += action[idx];
+                }
+
+                let dice_idx = dice_combination_idx(dice_permutation);
+                actions_to_dice[action_idx][dice_idx] += 1_f64;
+                totals[action_idx] += 1_f64;
+                //println!("{:?} {:?} ", dice_idx, actions_to_dice[action_idx][dice_idx] )
+            }
+        }
+
+        let mut shape_vec = Vec::new();
+        for action_idx in 0..462 {
+            for dice_idx in 0..252 {
+                                //println!("{} {} {} ", action_idx, dice_idx, actions_to_dice[action_idx][dice_idx]);
+
+                actions_to_dice[action_idx][dice_idx] /= totals[action_idx];
+                shape_vec.push(actions_to_dice[action_idx][dice_idx]);
+                //println!("{} {} {} ", action_idx, dice_idx, actions_to_dice[action_idx][dice_idx]);
+            }
+        }
+        
+        Array2::from_shape_vec((462,252), shape_vec).expect("womp womp")
+    };
+
+
     static ref DICE_TO_ACTIONS_MATRIX: Matrix462x252 = {
         let mut dice_to_actions = Box::new([[1_f64; 462]; 252]);
 
@@ -120,6 +155,25 @@ lazy_static! {
         }
 
         Matrix462x252::from_fn(|action_idx, dice_idx| dice_to_actions[dice_idx][action_idx])
+    };    
+
+    static ref DICE_TO_ACTIONS_ARRAY: Array2<f64> = {
+        
+        let mut dice_to_actions_vec = vec![1_f64; 462*252];
+        for (dice_idx, dice) in dice_combinations(5).into_iter().enumerate() {
+            for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations(n)).enumerate() {
+
+                for idx in 0..=5 {
+                    if action[idx] > dice[idx] {
+                        dice_to_actions_vec[dice_idx*462 + action_idx] = 0_f64;
+                        
+                    }
+                }
+            }
+        }
+
+
+        Array2::from_shape_vec((252, 462), dice_to_actions_vec).unwrap()
     };    
 }
 
@@ -291,7 +345,7 @@ pub fn widget(state: State, scores: &Vec<f64>) -> f64 {
     }
 
     // values of each entry for each final dice roll
-    let entry_scores = Matrix13x252::from_fn(|action_idx, dice_idx| {
+    let entry_scores = Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
         if !state.is_valid_action(action_idx) {
             return 0_f64;
         }
@@ -329,46 +383,39 @@ pub fn widget(state: State, scores: &Vec<f64>) -> f64 {
         score
     });
     // value of each final dice roll
-    let max_action_values: VectorN<f64, U252> = entry_scores.compress_rows_tr(|col| col.max());
+    let max_action_values = entry_scores.fold_axis(Axis(0), 0_f64, |acc, value| acc.max(*value));
+
+    let actions_to_dice: &Array2<f64> = &ACTIONS_TO_DICE_ARRAY;
+    let mut avg_action_values: Array1<f64> = Array1::zeros(462);
     
-    let actions_to_dice: &Matrix462x252 = &ACTIONS_TO_DICE_MATRIX;
-    
-    // value of each final set of keepers chosen
-    let mut avg_action_values: VectorN<f64, U462> = actions_to_dice * max_action_values;
-    
-    // need to copy global into local for mutability
-    let mut dice_to_actions: Matrix462x252 = DICE_TO_ACTIONS_MATRIX.clone();
-    for mut col in dice_to_actions.column_iter_mut() {
-        col.component_mul_assign(&avg_action_values);
-    }
+    Zip::from(&mut avg_action_values)
+        .and(actions_to_dice.genrows())
+        .par_apply(|avg, act| {
+            *avg = (&act * &max_action_values).sum();
+        });
 
-    let dice_values = dice_to_actions.compress_rows_tr(|col| col.max());
+    let dice_to_actions: &Array2<f64> = &DICE_TO_ACTIONS_ARRAY;
+    let mut dice_values: Array1<f64> = Array1::zeros(252);
+    Zip::from(&mut dice_values)
+        .and(dice_to_actions.genrows())
+        .par_apply(|val, dice_to_action| {
+            *val = (&dice_to_action * &avg_action_values).fold(0_f64, |acc, elem| acc.max(*elem));
+        });
 
-    actions_to_dice.mul_to(&dice_values, &mut avg_action_values);
+    Zip::from(&mut avg_action_values)
+        .and(actions_to_dice.genrows())
+        .par_apply(|avg, act| {
+            *avg = (&act * &dice_values).sum();
+        });
 
-    dice_to_actions.copy_from(&DICE_TO_ACTIONS_MATRIX);
-    for mut col in dice_to_actions.column_iter_mut() {
-        col.component_mul_assign(&avg_action_values);
-    }
-    let dice_values = dice_to_actions.compress_rows_tr(|col| col.max());
+    Zip::from(&mut dice_values)
+        .and(dice_to_actions.genrows())
+        .par_apply(|val, dice_to_action| {
+            *val = (&dice_to_action * &avg_action_values).fold(0_f64, |acc, elem| acc.max(*elem));
+        });
 
-    dice_values.tr_dot(&ACTIONS_TO_DICE_MATRIX.index((0, ..)))*/
-    //dice_to_actions.component_mul_assign(&avg_action_values);
-    // matrix of dice to value of allowed keepers, then max
-    /*for (idx, col) in DICE_TO_ACTIONS_MATRIX.column_iter().enumerate() {
-        dice_values[idx] = col.component_mul(&avg_action_values).compress_rows(|c| c.max())[(0, 0)];
-    }
-
-    actions_to_dice.mul_to(&dice_values, &mut avg_action_values);
-
-    for (idx, col) in DICE_TO_ACTIONS_MATRIX.column_iter().enumerate() {
-        dice_values[idx] = col.component_mul(&avg_action_values).compress_rows(|c| c.max())[(0, 0)];
-    }
-
-    dice_values.tr_dot(&ACTIONS_TO_DICE_MATRIX.index((0, ..)))
-    */
-    //dice_values[0]
-    
+    let first_roll = actions_to_dice.index_axis(Axis(0), 0);
+    first_roll.dot(&dice_values)
 }
 
 pub fn scores() -> Vec<f64> {

@@ -9,6 +9,7 @@ lazy_static = "1.4.0"
 nalgebra = "0.18"
 typenum = "1.11.2"
 ndarray = "0.12.1"
+ndarray-parallel = "0.9.1"
 itertools = {version = "0.8.0"}
 
 [profile.test]
