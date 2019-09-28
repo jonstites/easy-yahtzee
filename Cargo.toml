@@ -8,9 +8,8 @@ edition = "2018"
 lazy_static = "1.4.0"
 ndarray-parallel = "0.9.1"
 itertools = {version = "0.8.0"}
-ndarray = { version = "0.13.0", features = ["blas"] }
-blas-src = { version = "0.2.0", default-features = false, features = ["openblas"] }
-openblas-src = { version = "0.6.0", default-features = false, features = ["cblas", "system"] }
+ndarray = {version = "0.13.0", features = ["rayon"]}
+rayon = "1.2.0"
 
 [profile.test]
 opt-level = 3

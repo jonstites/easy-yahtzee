@@ -3,18 +3,14 @@ use std::convert::From;
 use std::fmt;
 use std::collections::VecDeque;
 
-#[macro_use]
-extern crate itertools;
-use itertools::Itertools;
 
 #[macro_use]
 extern crate lazy_static;
 extern crate ndarray;
 use ndarray::{Array2, Zip};
 const NUM_STATES: usize = 1048576;
-extern crate ndarray_parallel;
-use ndarray_parallel::prelude::*;
 use ndarray::prelude::*;
+extern crate rayon;
 
 
 const NUM_DICE_FACES: usize = 6;
@@ -25,13 +21,15 @@ lazy_static! {
         let mut scores = Box::new([[(0, None); 252]; 13]);
         
         for (idx, dice) in dice_combinations2(5).into_iter().enumerate() {
+            println!("{:?} {:?}", idx, dice);
+            let small_straight = dice[..4].iter().all(|&x| x > 0) || dice[1..5].iter().all(|&x| x > 0) || dice[2..6].iter().all(|&x| x > 0) ;
             for action in 0..13 {
                 let score = match action {
                     idx if idx < 6 => (dice[action] * (action + 1)) as u8,
                     6 if *dice.iter().max().unwrap() >= 3_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
                     7 if *dice.iter().max().unwrap() >= 4_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
                     8 if *dice.iter().max().unwrap() == 3_usize && *dice.iter().filter(|&&i| i != 3_usize).max().unwrap() == 2_usize => 25,
-                    9 if dice[..4] == [1, 1, 1, 1] || dice[1..5] == [1, 1, 1, 1] || dice[2..6] == [1, 1, 1, 1] => 30,
+                    9 if small_straight => 30,
                     10 if dice == [1, 1, 1, 1, 1, 0] || dice == [0, 1, 1, 1, 1, 1] => 40,
                     11 if *dice.iter().max().unwrap() == 5_usize => 50,
                     12 => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
@@ -42,7 +40,7 @@ lazy_static! {
                 
 
                 scores[action][idx] = (score, is_yahtzee);
-                println!("{:?} {:?} {:?} {:?}", dice, action, score, is_yahtzee);
+                //println!("{:?} {:?} {:?} {:?} {:?}", idx, dice, action, score, is_yahtzee);
             }
         }
 
@@ -196,6 +194,37 @@ impl State {
 
     pub fn score_and_child(&self, action_idx: usize, dice_idx: usize) -> (f64, State) {
 
+        let child = self.child(action_idx, dice_idx);
+        let child_idx: usize = child.into();
+
+        let normal_score = SCORES[action_idx][dice_idx].0 as f64;
+        let upper_bonus = if !self.upper_complete() && child.upper_complete() {
+            35_f64
+        } else {
+            0_f64
+        };
+
+        let yahtzee_bonus = if SCORES[action_idx][dice_idx].1.is_some() && ((self.0 & (1 << 6)) >> 6 == 1)  {
+            100_f64
+        } else {
+            0_f64
+        };
+
+
+        let joker_points = match action_idx {
+            8 => 25_f64,
+            9 => 35_f64,
+            10 => 45_f64,
+            _ => 0_f64,
+        };
+
+        let joker_rule = match SCORES[action_idx][dice_idx].1 {
+            Some(idx) if !self.is_valid_action(idx) => joker_points,
+            _ => 0_f64,
+        };
+        
+        let score = normal_score + upper_bonus + yahtzee_bonus + joker_rule;
+        (score, child)
     }
 
     fn is_valid_action(&self, action_idx: usize) -> bool {
@@ -259,40 +288,12 @@ pub fn widget(state: State, scores: &Vec<f64>) -> f64 {
     // values of each entry for each final dice roll
     let entry_scores = Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
         if !state.is_valid_action(action_idx) {
-            return 0_f64;
+            0_f64
+        } else {
+            let (score, child) = state.score_and_child(action_idx, dice_idx);
+            let child_idx: usize = child.into();
+            score + scores[child_idx]
         }
-        let child = state.child(action_idx, dice_idx);
-        let child_idx: usize = child.into();
-        let child_value = scores[child_idx];
-
-        let normal_score = SCORES[action_idx][dice_idx].0 as f64;
-        let upper_bonus = if !state.upper_complete() && child.upper_complete() {
-            35_f64
-        } else {
-            0_f64
-        };
-
-        let yahtzee_bonus = if SCORES[action_idx][dice_idx].1.is_some() && ((state.0 & (1 << 6)) >> 6 == 1)  {
-            100_f64
-        } else {
-            0_f64
-        };
-
-
-        let joker_points = match action_idx {
-            8 => 25_f64,
-            9 => 35_f64,
-            10 => 45_f64,
-            _ => 0_f64,
-        };
-
-        let joker_rule = match SCORES[action_idx][dice_idx].1 {
-            Some(idx) if !state.is_valid_action(idx) => joker_points,
-            _ => 0_f64,
-        };
-        
-        let score = child_value + normal_score + upper_bonus;// + yahtzee_bonus + joker_rule;
-        score
     });
     // value of each final dice roll
     let max_action_values = entry_scores.fold_axis(Axis(0), 0_f64, |acc, value| acc.max(*value));
@@ -353,6 +354,35 @@ pub fn scores() -> Vec<f64> {
             }
         }
     }
+
+    /*
+    println!("before valid states");
+    let valid_states = valid_states();
+    println!("after valid states");
+    let mut scores = vec![0.0; NUM_STATES];
+
+   
+    // totally unnecessary until implementing multiprocessing
+    for level in (0..=14).rev() {
+        println!("level: {}", level);
+        let scores_ro = scores.clone();
+        let bands : Vec<(usize, &mut [f64])> = scores.chunks_mut(1).enumerate().collect();
+
+        bands
+            //.rev()  unnecessary when using levels
+            .into_par_iter()
+            .for_each(|(state_idx, value)| {
+
+            let state_level = (state_idx & 0b111111_1111111_0_000000).count_ones();            
+            if valid_states[state_idx] && state_level == level {
+                let state: State = state_idx.into();
+                // ones open only
+                //let state = State (0b011111_1111111_0_111111);
+                let score = widget(state, &scores_ro);
+                value[0] = score;                
+    }})};
+    scores
+    */
 
     scores
 }
