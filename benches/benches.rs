@@ -36,4 +36,12 @@ mod bench {
         });
     }
 
+
+    #[bench]
+    fn bench_dice_combinations2(b: &mut Bencher) {
+        b.iter(|| {
+            let n = test::black_box(5);
+            optizee::dice_combinations2(n);
+        })
+    }
 }

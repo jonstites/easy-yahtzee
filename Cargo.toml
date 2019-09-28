@@ -6,11 +6,11 @@ edition = "2018"
 
 [dependencies]
 lazy_static = "1.4.0"
-nalgebra = "0.18"
-typenum = "1.11.2"
-ndarray = "0.12.1"
 ndarray-parallel = "0.9.1"
 itertools = {version = "0.8.0"}
+ndarray = { version = "0.13.0", features = ["blas"] }
+blas-src = { version = "0.2.0", default-features = false, features = ["openblas"] }
+openblas-src = { version = "0.6.0", default-features = false, features = ["cblas", "system"] }
 
 [profile.test]
 opt-level = 3

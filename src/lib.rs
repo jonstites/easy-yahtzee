@@ -3,11 +3,6 @@ use std::convert::From;
 use std::fmt;
 use std::collections::VecDeque;
 
-extern crate nalgebra as na;
-extern crate typenum;
-use na::{U1, U2, U13, Dynamic, ArrayStorage, RowVectorN, Matrix, Matrix2x3};
-use typenum::{U252, U462};
-
 #[macro_use]
 extern crate itertools;
 use itertools::Itertools;
@@ -17,31 +12,27 @@ extern crate lazy_static;
 extern crate ndarray;
 use ndarray::{Array2, Zip};
 const NUM_STATES: usize = 1048576;
-
-use nalgebra::*;
 extern crate ndarray_parallel;
 use ndarray_parallel::prelude::*;
-use ndarray::*;
-// note: request doc changes for deprecated matrix array
-type Matrix252x13  = MatrixMN<f64, U252, U13>;
-type Matrix13x252  = MatrixMN<f64, U13, U252>;
-type Matrix252x462 = MatrixMN<f64, U252, U462>;
-type Matrix462x252 = MatrixMN<f64, U462, U252>;
+use ndarray::prelude::*;
 
+
+const NUM_DICE_FACES: usize = 6;
+const NUM_DICE: usize = 5;
 
 lazy_static! {
     static ref SCORES: Box<[[(u8, Option<usize>); 252]; 13]> = {
         let mut scores = Box::new([[(0, None); 252]; 13]);
         
-        for (idx, dice) in dice_combinations(5).into_iter().enumerate() {
+        for (idx, dice) in dice_combinations2(5).into_iter().enumerate() {
             for action in 0..13 {
                 let score = match action {
                     idx if idx < 6 => (dice[action] * (action + 1)) as u8,
                     6 if *dice.iter().max().unwrap() >= 3_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
                     7 if *dice.iter().max().unwrap() >= 4_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
                     8 if *dice.iter().max().unwrap() == 3_usize && *dice.iter().filter(|&&i| i != 3_usize).max().unwrap() == 2_usize => 25,
-                    9 if dice[..4] == [1, 1, 1, 1] || dice[1..5] == [1, 1, 1, 1] || dice[2..6] == [1, 1, 1, 1] => 35,
-                    10 if dice == [1, 1, 1, 1, 1, 0] || dice == [0, 1, 1, 1, 1, 1] => 45,
+                    9 if dice[..4] == [1, 1, 1, 1] || dice[1..5] == [1, 1, 1, 1] || dice[2..6] == [1, 1, 1, 1] => 30,
+                    10 if dice == [1, 1, 1, 1, 1, 0] || dice == [0, 1, 1, 1, 1, 1] => 40,
                     11 if *dice.iter().max().unwrap() == 5_usize => 50,
                     12 => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
                     _ => 0_u8,
@@ -51,117 +42,45 @@ lazy_static! {
                 
 
                 scores[action][idx] = (score, is_yahtzee);
+                println!("{:?} {:?} {:?} {:?}", dice, action, score, is_yahtzee);
             }
         }
 
         scores
-    };
-
-    static ref SCORES_MATRIX: Matrix13x252 = {
-        let combinations = dice_combinations(5);
-        let scores = Matrix13x252::from_fn(|action, dice_idx| {
-            let dice = combinations[dice_idx];
-            let score = match action {
-                    idx if idx < 6 => (dice[action] * (action + 1)) as u8,
-                    6 if *dice.iter().max().unwrap() >= 3_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
-                    7 if *dice.iter().max().unwrap() >= 4_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
-                    8 if *dice.iter().max().unwrap() == 3_usize && *dice.iter().filter(|&&i| i != 3_usize).max().unwrap() == 2_usize => 25,
-                    9 if dice[..4] == [1, 1, 1, 1] || dice[1..5] == [1, 1, 1, 1] || dice[2..6] == [1, 1, 1, 1] => 35,
-                    10 if dice == [1, 1, 1, 1, 1, 0] || dice == [0, 1, 1, 1, 1, 1] => 45,
-                    11 if *dice.iter().max().unwrap() == 5_usize => 50,
-                    12 => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>() as u8,
-                    _ => 0_u8,
-                };
-            score as f64
-        });
-        scores
-    };
-
-    static ref ACTIONS_TO_DICE_MATRIX: Matrix462x252 = {
-        let mut actions_to_dice = Box::new([[0_f64; 252]; 462]);
-        let mut totals = vec![0_f64; 462];
-        for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations(n)).enumerate() {
-            let left_to_roll = 5_usize - action.iter().sum::<usize>();
-            'outer:
-            for mut dice_permutation in dice_permutations(left_to_roll) {
-                for idx in 0..=5 {
-                    dice_permutation[idx] += action[idx];
-                }
-
-                let dice_idx = dice_combination_idx(dice_permutation);
-                actions_to_dice[action_idx][dice_idx] += 1_f64;
-                totals[action_idx] += 1_f64;
-                //println!("{:?} {:?} ", dice_idx, actions_to_dice[action_idx][dice_idx] )
-            }
-        }
-
-        for action_idx in 0..462 {
-            for dice_idx in 0..252 {
-                                //println!("{} {} {} ", action_idx, dice_idx, actions_to_dice[action_idx][dice_idx]);
-
-                actions_to_dice[action_idx][dice_idx] /= totals[action_idx];
-                //println!("{} {} {} ", action_idx, dice_idx, actions_to_dice[action_idx][dice_idx]);
-            }
-        }
-        
-        Matrix462x252::from_fn(|dice_action_idx, dice_idx| actions_to_dice[dice_action_idx][dice_idx])
     };
 
     static ref ACTIONS_TO_DICE_ARRAY: Array2<f64> = {
-        let mut actions_to_dice = Box::new([[0_f64; 252]; 462]);
-        let mut totals = vec![0_f64; 462];
-        for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations(n)).enumerate() {
+        let mut actions_to_dice = vec![0_f64; 252*462];
+        
+        for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations2(n)).enumerate() {
             let left_to_roll = 5_usize - action.iter().sum::<usize>();
-            'outer:
-            for mut dice_permutation in dice_permutations(left_to_roll) {
-                for idx in 0..=5 {
-                    dice_permutation[idx] += action[idx];
+            for mut roll in dice_combinations2(left_to_roll) {
+
+                let probability = dice_probability(&roll);
+
+                for idx in 0..NUM_DICE_FACES {
+                    roll[idx] += action[idx];
+
                 }
 
-                let dice_idx = dice_combination_idx(dice_permutation);
-                actions_to_dice[action_idx][dice_idx] += 1_f64;
-                totals[action_idx] += 1_f64;
-                //println!("{:?} {:?} ", dice_idx, actions_to_dice[action_idx][dice_idx] )
-            }
-        }
-
-        let mut shape_vec = Vec::new();
-        for action_idx in 0..462 {
-            for dice_idx in 0..252 {
-                                //println!("{} {} {} ", action_idx, dice_idx, actions_to_dice[action_idx][dice_idx]);
-
-                actions_to_dice[action_idx][dice_idx] /= totals[action_idx];
-                shape_vec.push(actions_to_dice[action_idx][dice_idx]);
-                //println!("{} {} {} ", action_idx, dice_idx, actions_to_dice[action_idx][dice_idx]);
-            }
-        }
-        
-        Array2::from_shape_vec((462,252), shape_vec).expect("womp womp")
-    };
-
-
-    static ref DICE_TO_ACTIONS_MATRIX: Matrix462x252 = {
-        let mut dice_to_actions = Box::new([[1_f64; 462]; 252]);
-
-        for (dice_idx, dice) in dice_combinations(5).into_iter().enumerate() {
-            for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations(n)).enumerate() {
-
-                for idx in 0..=5 {
-                    if action[idx] > dice[idx] {
-                        dice_to_actions[dice_idx][action_idx] = 0_f64;
+                for (idx, other) in dice_combinations2(5).into_iter().enumerate() {
+                    if other == roll {
+                        actions_to_dice[action_idx * 252 + idx] = probability;
                     }
                 }
+
             }
         }
-
-        Matrix462x252::from_fn(|action_idx, dice_idx| dice_to_actions[dice_idx][action_idx])
-    };    
+        let arr2 = Array2::from_shape_vec((462,252), actions_to_dice).unwrap();
+        
+        arr2
+    };
 
     static ref DICE_TO_ACTIONS_ARRAY: Array2<f64> = {
         
         let mut dice_to_actions_vec = vec![1_f64; 462*252];
-        for (dice_idx, dice) in dice_combinations(5).into_iter().enumerate() {
-            for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations(n)).enumerate() {
+        for (dice_idx, dice) in dice_combinations2(5).into_iter().enumerate() {
+            for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations2(n)).enumerate() {
 
                 for idx in 0..=5 {
                     if action[idx] > dice[idx] {
@@ -173,73 +92,62 @@ lazy_static! {
         }
 
 
-        Array2::from_shape_vec((252, 462), dice_to_actions_vec).unwrap()
+        let arr2 = Array2::from_shape_vec((252, 462), dice_to_actions_vec).unwrap();
+        arr2
     };    
 }
 
-fn dice_combination_idx(dice: [usize; 6]) -> usize {
-    for (dice_idx, combination) in dice_combinations(5).into_iter().enumerate() {
-        if combination == dice {
-            return dice_idx;
-        }
+pub fn dice_probability(dice: &[usize; 6]) -> f64 {
+    let total_dice: usize = dice.iter().sum();
+    let mut permutations_num = 1;
+    let mut remaining_dice = total_dice;
+    for count in dice.iter() {
+        permutations_num *= choose(remaining_dice, *count);
+        remaining_dice -= count;
     }
 
-    panic!("dice idx not found");
+    let total_permutations = (NUM_DICE_FACES as f64).powf(total_dice as f64);
+    (permutations_num as f64) / total_permutations
 }
 
-fn generate_dice(n: usize) -> Vec<Vec<usize>> {
-    let mut dice = Vec::new();
-    if n == 0 {
-        dice.push(Vec::new());
+fn choose(n:usize, k:usize) -> usize {
+    let mut answer = 1;
+    for num in (k+1)..=n {
+        answer *= num;
     }
 
-    for roll in (0..n).map(|_| 0..6).multi_cartesian_product() {
-        dice.push(roll);
+    for num in 1..=(n - k) {
+        answer /= num;
     }
-
-    dice
+    answer
 }
 
-fn dice_permutations(n: usize) -> Vec<[usize; 6]> {
-    if n == 0 {
-        return vec!([0; 6]);
-    }
+pub fn dice_combinations2(num_dice: usize) -> Vec<[usize; NUM_DICE_FACES]> {
+    let mut dice = [0; NUM_DICE_FACES];
+    dice[0] = num_dice;
+    let mut v = Vec::new();
+    v.push(dice);
 
-    let mut permutations = Vec::new();
-    for dice in generate_dice(n) {
-        let mut dice_array = [0; 6];
-        for die in dice.into_iter() {
-            dice_array[die] += 1;
+    while dice[NUM_DICE_FACES - 1] != num_dice {
+
+        let rightmost = NUM_DICE_FACES - 1 - dice.iter().rev().position(|&x| x > 0_usize).unwrap();
+
+        if rightmost + 1 < dice.len() {
+            dice[rightmost] -= 1;
+            dice[rightmost + 1] += 1;
+        } else {
+            // use simple while loop
+            let next_rightmost = NUM_DICE_FACES - 1 - (NUM_DICE_FACES - rightmost + dice[0..rightmost].iter().rev().position(|&x| x > 0_usize).unwrap());
+            let num_rightmost = dice[rightmost];
+            dice[next_rightmost + 1] += num_rightmost;
+            dice[rightmost] -= num_rightmost;
+            dice[next_rightmost] -= 1;
+            dice[next_rightmost + 1] += 1;
+
         }
-        permutations.push(dice_array);
+        v.push(dice);
     }
-    permutations
-}
-
-fn dice_combinations(n: usize) -> Vec<[usize; 6]> {
-
-    if n == 0 {
-        return vec!([0; 6]);
-    }
-
-    let mut combinations = Vec::new();
-
-    for dice in generate_dice(n) {
-
-        // canonical combination is sorted
-        let mut dice_sorted = dice.clone();
-        dice_sorted.sort();
-        if dice != dice_sorted {
-            continue;
-        }
-
-        let mut dice_array = [0; 6];
-        for die in dice.into_iter() {
-            dice_array[die] += 1;
-        }
-        combinations.push(dice_array);
-    }
-    combinations
+    v
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -284,6 +192,10 @@ impl State {
             child.0 |= 1 << 6;
         }
         child
+    }    
+
+    pub fn score_and_child(&self, action_idx: usize, dice_idx: usize) -> (f64, State) {
+
     }
 
     fn is_valid_action(&self, action_idx: usize) -> bool {
@@ -390,7 +302,7 @@ pub fn widget(state: State, scores: &Vec<f64>) -> f64 {
     
     Zip::from(&mut avg_action_values)
         .and(actions_to_dice.genrows())
-        .par_apply(|avg, act| {
+        .apply(|avg, act| {
             *avg = (&act * &max_action_values).sum();
         });
 
@@ -398,19 +310,19 @@ pub fn widget(state: State, scores: &Vec<f64>) -> f64 {
     let mut dice_values: Array1<f64> = Array1::zeros(252);
     Zip::from(&mut dice_values)
         .and(dice_to_actions.genrows())
-        .par_apply(|val, dice_to_action| {
+        .apply(|val, dice_to_action| {
             *val = (&dice_to_action * &avg_action_values).fold(0_f64, |acc, elem| acc.max(*elem));
         });
 
     Zip::from(&mut avg_action_values)
         .and(actions_to_dice.genrows())
-        .par_apply(|avg, act| {
+        .apply(|avg, act| {
             *avg = (&act * &dice_values).sum();
         });
 
     Zip::from(&mut dice_values)
         .and(dice_to_actions.genrows())
-        .par_apply(|val, dice_to_action| {
+        .apply(|val, dice_to_action| {
             *val = (&dice_to_action * &avg_action_values).fold(0_f64, |acc, elem| acc.max(*elem));
         });
 
@@ -425,18 +337,20 @@ pub fn scores() -> Vec<f64> {
     let valid_states = valid_states();
     println!("after valid states");
     let mut scores = vec![0.0; NUM_STATES];
-    for state_idx in (0..NUM_STATES).rev() {
 
-        if valid_states[state_idx] {
-            let state: State = state_idx.into();
-            // ones open only
-            //let state = State (0b011111_1111111_0_111111);
-            let score = widget(state, &scores);
-            scores[state_idx] = score;
-                    if state_idx % 10000 == 0 {
-            println!("{} {} {}", state, state_idx, score);
-            // return scores;
-        }
+   
+    // totally unnecessary until implementing multiprocessing
+    for level in (0..=14).rev() {
+        println!("level: {}", level);
+        for state_idx in (0..NUM_STATES).rev() {
+            let state_level = (state_idx & 0b111111_1111111_0_000000).count_ones();            
+            if valid_states[state_idx] && state_level == level {
+                let state: State = state_idx.into();
+                // ones open only
+                //let state = State (0b011111_1111111_0_111111);
+                let score = widget(state, &scores);
+                scores[state_idx] = score;                
+            }
         }
     }
 
