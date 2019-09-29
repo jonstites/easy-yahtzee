@@ -11,7 +11,7 @@ use ndarray::{Array2, Zip};
 const NUM_STATES: usize = 1048576;
 use ndarray::prelude::*;
 extern crate rayon;
-
+use rayon::prelude::*;
 
 const NUM_DICE_FACES: usize = 6;
 const NUM_DICE: usize = 5;
@@ -36,7 +36,7 @@ lazy_static! {
                     _ => 0_u8,
                 };
                 
-                let is_yahtzee = dice.iter().find(|&&i| i == 5_usize).map(|i| *i);
+                let is_yahtzee = dice.iter().position(|&count| count == 5_usize);
                 
 
                 scores[action][idx] = (score, is_yahtzee);
@@ -52,6 +52,7 @@ lazy_static! {
         
         for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations2(n)).enumerate() {
             let left_to_roll = 5_usize - action.iter().sum::<usize>();
+            println!("action: {:?} {:?}", action_idx, action);
             for mut roll in dice_combinations2(left_to_roll) {
 
                 let probability = dice_probability(&roll);
@@ -165,12 +166,17 @@ impl fmt::Display for State {
 
     fn fmt(&self, dest: &mut fmt::Formatter) -> fmt::Result {
         // display in binary
-        write!(dest, "{:#020b}", self.0)
+        write!(dest, "{:#08b}_{:#09b}_{:#01b}_{:#06b}", 
+            self.0 >> 14, 
+            (self.0 >> 7) & 0b1111111,
+            (self.0 >> 6) & 0b1,
+            self.0 & 0b111111)
     }
 
 }
 
-impl State {
+impl State {    
+
     pub fn child(&self, action_idx: usize, dice_idx: usize) -> State {
         let mut child = *self;
 
@@ -179,7 +185,7 @@ impl State {
 
         // set upper score
         if action_idx < 6 {
-            let upper_score = (child.0 & 0b11_1111).saturating_sub(SCORES[action_idx][dice_idx].0 as usize);
+            let upper_score = (child.0 & 0b111111).saturating_sub(SCORES[action_idx][dice_idx].0 as usize);
                 
             child.0 = (child.0 >> 6) << 6;
             child.0 |= upper_score;
@@ -195,35 +201,41 @@ impl State {
     pub fn score_and_child(&self, action_idx: usize, dice_idx: usize) -> (f64, State) {
 
         let child = self.child(action_idx, dice_idx);
-        let child_idx: usize = child.into();
 
-        let normal_score = SCORES[action_idx][dice_idx].0 as f64;
+        let mut normal_score = SCORES[action_idx][dice_idx].0 as f64;
         let upper_bonus = if !self.upper_complete() && child.upper_complete() {
             35_f64
         } else {
             0_f64
         };
 
-        let yahtzee_bonus = if SCORES[action_idx][dice_idx].1.is_some() && ((self.0 & (1 << 6)) >> 6 == 1)  {
+        let yahtzee_bonus = if SCORES[action_idx][dice_idx].1.is_some() && ((self.0 >> 6) & 1 == 1)   {
             100_f64
         } else {
             0_f64
         };
-
-
-        let joker_points = match action_idx {
-            8 => 25_f64,
-            9 => 35_f64,
-            10 => 45_f64,
-            _ => 0_f64,
-        };
-
-        let joker_rule = match SCORES[action_idx][dice_idx].1 {
-            Some(idx) if !self.is_valid_action(idx) => joker_points,
-            _ => 0_f64,
-        };
         
-        let score = normal_score + upper_bonus + yahtzee_bonus + joker_rule;
+
+        // joker rule
+        // yahtzee box filled
+        if self.0 & (1 << (19 - 11)) != 0 {
+            // dice is yahtzee
+            if let Some(yahtzee_idx) = SCORES[action_idx][dice_idx].1 {
+                // upper entry filled
+                if !self.is_valid_action(yahtzee_idx) {
+                    if action_idx == 8 {
+                        normal_score = 25_f64;
+                    } else if action_idx == 9 {
+                        normal_score = 30_f64;
+                    } else if action_idx == 10 {
+                        normal_score = 40_f64;
+                    }
+                }
+            }
+        }         
+
+        
+        let score = normal_score + upper_bonus + yahtzee_bonus;
         (score, child)
     }
 
@@ -297,33 +309,36 @@ pub fn widget(state: State, scores: &Vec<f64>) -> f64 {
     });
     // value of each final dice roll
     let max_action_values = entry_scores.fold_axis(Axis(0), 0_f64, |acc, value| acc.max(*value));
+    //println!("{:?}", max_action_values);
 
     let actions_to_dice: &Array2<f64> = &ACTIONS_TO_DICE_ARRAY;
     let mut avg_action_values: Array1<f64> = Array1::zeros(462);
     
     Zip::from(&mut avg_action_values)
         .and(actions_to_dice.genrows())
-        .apply(|avg, act| {
+        .par_apply(|avg, act| {
             *avg = (&act * &max_action_values).sum();
         });
+
+    //println!("{:?}", avg_action_values);
 
     let dice_to_actions: &Array2<f64> = &DICE_TO_ACTIONS_ARRAY;
     let mut dice_values: Array1<f64> = Array1::zeros(252);
     Zip::from(&mut dice_values)
         .and(dice_to_actions.genrows())
-        .apply(|val, dice_to_action| {
+        .par_apply(|val, dice_to_action| {
             *val = (&dice_to_action * &avg_action_values).fold(0_f64, |acc, elem| acc.max(*elem));
         });
 
     Zip::from(&mut avg_action_values)
         .and(actions_to_dice.genrows())
-        .apply(|avg, act| {
+        .par_apply(|avg, act| {
             *avg = (&act * &dice_values).sum();
         });
 
     Zip::from(&mut dice_values)
         .and(dice_to_actions.genrows())
-        .apply(|val, dice_to_action| {
+        .par_apply(|val, dice_to_action| {
             *val = (&dice_to_action * &avg_action_values).fold(0_f64, |acc, elem| acc.max(*elem));
         });
 
@@ -333,13 +348,13 @@ pub fn widget(state: State, scores: &Vec<f64>) -> f64 {
 
 pub fn scores() -> Vec<f64> {
     
-
+    /*
     println!("before valid states");
     let valid_states = valid_states();
     println!("after valid states");
     let mut scores = vec![0.0; NUM_STATES];
 
-   
+  
     // totally unnecessary until implementing multiprocessing
     for level in (0..=14).rev() {
         println!("level: {}", level);
@@ -347,15 +362,19 @@ pub fn scores() -> Vec<f64> {
             let state_level = (state_idx & 0b111111_1111111_0_000000).count_ones();            
             if valid_states[state_idx] && state_level == level {
                 let state: State = state_idx.into();
-                // ones open only
-                //let state = State (0b011111_1111111_0_111111);
+                // ones open only, yahtzee eligible
+                //let state = State (0b011111_1111111_1_111111);
                 let score = widget(state, &scores);
                 scores[state_idx] = score;                
+                //return scores; 
             }
         }
     }
+        scores
 
-    /*
+    */
+
+    
     println!("before valid states");
     let valid_states = valid_states();
     println!("after valid states");
@@ -376,15 +395,14 @@ pub fn scores() -> Vec<f64> {
             let state_level = (state_idx & 0b111111_1111111_0_000000).count_ones();            
             if valid_states[state_idx] && state_level == level {
                 let state: State = state_idx.into();
-                // ones open only
-                //let state = State (0b011111_1111111_0_111111);
+                // ones open only, yahzee bonus eligible
+                //let state = State (0b011111_1111111_1_111111);
                 let score = widget(state, &scores_ro);
                 value[0] = score;                
     }})};
     scores
-    */
+    
 
-    scores
 }
 
 #[cfg(test)]
