@@ -1,4 +1,3 @@
-
 use std::convert::From;
 use std::fmt;
 use std::collections::VecDeque;
@@ -7,14 +6,19 @@ use std::collections::VecDeque;
 #[macro_use]
 extern crate lazy_static;
 extern crate ndarray;
-use ndarray::{Array2, Zip};
-const NUM_STATES: usize = 1048576;
-use ndarray::prelude::*;
 extern crate rayon;
+
+use ndarray::prelude::*;
+use ndarray::Zip;
 use rayon::prelude::*;
 
+const NUM_STATES: usize = 1048576;
+const NUM_VALID_STATES: usize = 536448;
 const NUM_DICE_FACES: usize = 6;
 const NUM_DICE: usize = 5;
+const NUM_KEEPERS: usize = 462;
+const NUM_DICE_COMBINATIONS: usize = 252;
+const NUM_ENTRY_ACTIONS: usize = 13;
 
 lazy_static! {
     static ref SCORES: Box<[[(u8, Option<usize>); 252]; 13]> = {
@@ -413,13 +417,14 @@ mod tests {
     fn test_valid_states() {
         let states = valid_states();
         let num_valid = states.iter().filter(|x| **x).count();
-        assert_eq!(num_valid, 536448);
+        assert_eq!(num_valid, NUM_VALID_STATES);
     }
 
     #[test]
     fn test_expected_value() {
-        println!("abc");
-let default_idx: usize = State::default().into();
-        assert_eq!(scores()[default_idx], 254.5896);
+        let default_idx: usize = State::default().into();
+        let scores = scores();
+        let expected_value = scores[default_idx];
+        assert!((expected_value - 254.5896).abs() < 0.0001);
     }
 }
