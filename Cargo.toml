@@ -6,20 +6,13 @@ edition = "2018"
 
 [dependencies]
 lazy_static = "1.4.0"
-ndarray-parallel = "0.9.1"
-itertools = {version = "0.8.0"}
-ndarray = {version = "0.13.0", features = ["rayon"]}
+ndarray = "0.13.0"
 rayon = "1.2.0"
 
 [profile.test]
 opt-level = 3
 
-[features]
-"generate_constants" = []
 
-[[bin]]
-name = "generate_constants"
-path = "src/bin/generate_constants.rs"
 
 [profile.release]
 debug = true

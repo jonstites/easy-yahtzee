@@ -25,7 +25,6 @@ lazy_static! {
         let mut scores = Box::new([[(0, None); 252]; 13]);
         
         for (idx, dice) in dice_combinations2(5).into_iter().enumerate() {
-            println!("{:?} {:?}", idx, dice);
             let small_straight = dice[..4].iter().all(|&x| x > 0) || dice[1..5].iter().all(|&x| x > 0) || dice[2..6].iter().all(|&x| x > 0) ;
             for action in 0..13 {
                 let score = match action {
@@ -44,7 +43,6 @@ lazy_static! {
                 
 
                 scores[action][idx] = (score, is_yahtzee);
-                //println!("{:?} {:?} {:?} {:?} {:?}", idx, dice, action, score, is_yahtzee);
             }
         }
 
@@ -56,7 +54,6 @@ lazy_static! {
         
         for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations2(n)).enumerate() {
             let left_to_roll = 5_usize - action.iter().sum::<usize>();
-            println!("action: {:?} {:?}", action_idx, action);
             for mut roll in dice_combinations2(left_to_roll) {
 
                 let probability = dice_probability(&roll);
@@ -313,36 +310,34 @@ pub fn widget(state: State, scores: &Vec<f64>) -> f64 {
     });
     // value of each final dice roll
     let max_action_values = entry_scores.fold_axis(Axis(0), 0_f64, |acc, value| acc.max(*value));
-    //println!("{:?}", max_action_values);
 
     let actions_to_dice: &Array2<f64> = &ACTIONS_TO_DICE_ARRAY;
     let mut avg_action_values: Array1<f64> = Array1::zeros(462);
     
     Zip::from(&mut avg_action_values)
         .and(actions_to_dice.genrows())
-        .par_apply(|avg, act| {
+        .apply(|avg, act| {
             *avg = (&act * &max_action_values).sum();
         });
 
-    //println!("{:?}", avg_action_values);
 
     let dice_to_actions: &Array2<f64> = &DICE_TO_ACTIONS_ARRAY;
     let mut dice_values: Array1<f64> = Array1::zeros(252);
     Zip::from(&mut dice_values)
         .and(dice_to_actions.genrows())
-        .par_apply(|val, dice_to_action| {
+        .apply(|val, dice_to_action| {
             *val = (&dice_to_action * &avg_action_values).fold(0_f64, |acc, elem| acc.max(*elem));
         });
 
     Zip::from(&mut avg_action_values)
         .and(actions_to_dice.genrows())
-        .par_apply(|avg, act| {
+        .apply(|avg, act| {
             *avg = (&act * &dice_values).sum();
         });
 
     Zip::from(&mut dice_values)
         .and(dice_to_actions.genrows())
-        .par_apply(|val, dice_to_action| {
+        .apply(|val, dice_to_action| {
             *val = (&dice_to_action * &avg_action_values).fold(0_f64, |acc, elem| acc.max(*elem));
         });
 
@@ -352,36 +347,7 @@ pub fn widget(state: State, scores: &Vec<f64>) -> f64 {
 
 pub fn scores() -> Vec<f64> {
     
-    /*
-    println!("before valid states");
     let valid_states = valid_states();
-    println!("after valid states");
-    let mut scores = vec![0.0; NUM_STATES];
-
-  
-    // totally unnecessary until implementing multiprocessing
-    for level in (0..=14).rev() {
-        println!("level: {}", level);
-        for state_idx in (0..NUM_STATES).rev() {
-            let state_level = (state_idx & 0b111111_1111111_0_000000).count_ones();            
-            if valid_states[state_idx] && state_level == level {
-                let state: State = state_idx.into();
-                // ones open only, yahtzee eligible
-                //let state = State (0b011111_1111111_1_111111);
-                let score = widget(state, &scores);
-                scores[state_idx] = score;                
-                //return scores; 
-            }
-        }
-    }
-        scores
-
-    */
-
-    
-    println!("before valid states");
-    let valid_states = valid_states();
-    println!("after valid states");
     let mut scores = vec![0.0; NUM_STATES];
 
    
@@ -399,14 +365,10 @@ pub fn scores() -> Vec<f64> {
             let state_level = (state_idx & 0b111111_1111111_0_000000).count_ones();            
             if valid_states[state_idx] && state_level == level {
                 let state: State = state_idx.into();
-                // ones open only, yahzee bonus eligible
-                //let state = State (0b011111_1111111_1_111111);
                 let score = widget(state, &scores_ro);
                 value[0] = score;                
     }})};
-    scores
-    
-
+    scores    
 }
 
 #[cfg(test)]
