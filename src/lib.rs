@@ -1,6 +1,6 @@
 use std::convert::From;
 use std::fmt;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 
 #[macro_use]
@@ -11,20 +11,35 @@ extern crate rayon;
 use ndarray::prelude::*;
 use ndarray::Zip;
 use rayon::prelude::*;
+use serde::{Serialize, Deserialize};
 
+// 2^13 * 2 * 64
+// 13 Entries, 1 bit for Yahtzee bonus eligibility, and 64 for upper score
 const NUM_STATES: usize = 1048576;
+
+// Calculated empirically - many states can never be reached
 const NUM_VALID_STATES: usize = 536448;
+
+// d6
 const NUM_DICE_FACES: usize = 6;
+
+// 5 dice are used in yahtzee
 const NUM_DICE: usize = 5;
+
+// C(10, 5) + C(9, 4) + ... C(5, 0)
 const NUM_KEEPERS: usize = 462;
+
+// C(10, 5)
 const NUM_DICE_COMBINATIONS: usize = 252;
 const NUM_ENTRY_ACTIONS: usize = 13;
+
+type DiceCounts = [usize; 6];
 
 lazy_static! {
     static ref SCORES: Box<[[(u8, Option<usize>); 252]; 13]> = {
         let mut scores = Box::new([[(0, None); 252]; 13]);
         
-        for (idx, dice) in dice_combinations2(5).into_iter().enumerate() {
+        for (idx, dice) in dice_combinations(5).into_iter().enumerate() {
             let small_straight = dice[..4].iter().all(|&x| x > 0) || dice[1..5].iter().all(|&x| x > 0) || dice[2..6].iter().all(|&x| x > 0) ;
             for action in 0..13 {
                 let score = match action {
@@ -50,53 +65,72 @@ lazy_static! {
     };
 
     static ref ACTIONS_TO_DICE_ARRAY: Array2<f64> = {
-        let mut actions_to_dice = vec![0_f64; 252*462];
-        
-        for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations2(n)).enumerate() {
-            let left_to_roll = 5_usize - action.iter().sum::<usize>();
-            for mut roll in dice_combinations2(left_to_roll) {
-
-                let probability = dice_probability(&roll);
-
-                for idx in 0..NUM_DICE_FACES {
-                    roll[idx] += action[idx];
-
-                }
-
-                for (idx, other) in dice_combinations2(5).into_iter().enumerate() {
-                    if other == roll {
-                        actions_to_dice[action_idx * 252 + idx] = probability;
-                    }
-                }
-
-            }
-        }
-        let arr2 = Array2::from_shape_vec((462,252), actions_to_dice).unwrap();
-        
-        arr2
+        keepers_to_dice()
     };
 
     static ref DICE_TO_ACTIONS_ARRAY: Array2<f64> = {
-        
-        let mut dice_to_actions_vec = vec![1_f64; 462*252];
-        for (dice_idx, dice) in dice_combinations2(5).into_iter().enumerate() {
-            for (action_idx, action) in (0..=5).flat_map(|n| dice_combinations2(n)).enumerate() {
-
-                for idx in 0..=5 {
-                    if action[idx] > dice[idx] {
-                        dice_to_actions_vec[dice_idx*462 + action_idx] = 0_f64;
-                        
-                    }
-                }
-            }
-        }
-
-
-        let arr2 = Array2::from_shape_vec((252, 462), dice_to_actions_vec).unwrap();
-        arr2
+        dice_to_keepers()
     };    
 }
 
+// Matrix of 252x462 of allowed keepers from each dice roll
+fn dice_to_keepers() -> Array2<f64> {
+    let shape = (NUM_DICE_COMBINATIONS, NUM_KEEPERS);
+    let mut dice_to_keepers: Array2<f64> = Array2::ones(shape);
+
+    let dice: Vec<DiceCounts> = dice_combinations(NUM_DICE);
+    let keepers: Vec<DiceCounts> = (0..=5).flat_map(|n| dice_combinations(n)).collect();    
+
+    for (dice_idx, dice) in dice.iter().enumerate() {
+        for (keeper_idx, keeper) in keepers.iter().enumerate() {
+            for (die_count, keeper_die_count) in dice.iter().zip(keeper.iter()) {
+                // Invalid action - cannot legitimately have keeper 
+                // if count is greater than the dice roll
+                if keeper_die_count > die_count {
+                    dice_to_keepers[(dice_idx, keeper_idx)] = 0_f64;                    
+                }
+            }
+        }
+    }
+    dice_to_keepers
+}
+
+// Matrix of 462x252 of transition probabilities from Keepers to Dice
+fn keepers_to_dice() -> Array2<f64> {    
+
+    let dice_idx_lookup: HashMap<DiceCounts, usize> = dice_combinations(NUM_DICE)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, dice)| (dice, idx))
+        .collect();
+
+    let shape = (NUM_KEEPERS, NUM_DICE_COMBINATIONS);
+    let mut keepers_to_dice = Array2::zeros(shape);
+    
+    // all possible dice combinations, from 0 dice to 5 dice
+    let keepers = (0..=NUM_DICE).flat_map(|n| dice_combinations(n));
+
+    for (keeper_idx, keeper) in keepers.enumerate() {
+
+        let num_keeper_dice = keeper.iter().sum::<usize>();
+        let num_remaining_dice = 5_usize - num_keeper_dice;
+
+        for mut roll in dice_combinations(num_remaining_dice) {
+            let roll_probability = dice_probability(&roll);
+            // merge keeper with thrown roll
+            for die_idx in 0..keeper.len() {
+                roll[die_idx] += keeper[die_idx];
+            }
+            let dice_idx = dice_idx_lookup[&roll];
+            keepers_to_dice[(keeper_idx, dice_idx)] = roll_probability;
+        }
+    }
+    
+    keepers_to_dice
+}
+
+// Odds of rolling a particular dice combination
+// Can be computed from the values themselves - no need to consider permutations
 pub fn dice_probability(dice: &[usize; 6]) -> f64 {
     let total_dice: usize = dice.iter().sum();
     let mut permutations_num = 1;
@@ -110,6 +144,7 @@ pub fn dice_probability(dice: &[usize; 6]) -> f64 {
     (permutations_num as f64) / total_permutations
 }
 
+// C(n, k) - does not need to be any more efficient than this
 fn choose(n:usize, k:usize) -> usize {
     let mut answer = 1;
     for num in (k+1)..=n {
@@ -122,32 +157,55 @@ fn choose(n:usize, k:usize) -> usize {
     answer
 }
 
-pub fn dice_combinations2(num_dice: usize) -> Vec<[usize; NUM_DICE_FACES]> {
-    let mut dice = [0; NUM_DICE_FACES];
+// Generate all dice combinations for a given number of dice
+pub fn dice_combinations(num_dice: usize) -> Vec<DiceCounts> {
+    let mut dice: DiceCounts = [0; NUM_DICE_FACES];
     dice[0] = num_dice;
-    let mut v = Vec::new();
-    v.push(dice);
 
+    let mut dice_combinations = Vec::new();
+    dice_combinations.push(dice);
+
+    // Continue until the last dice combination in lexicographic order is created
     while dice[NUM_DICE_FACES - 1] != num_dice {
 
-        let rightmost = NUM_DICE_FACES - 1 - dice.iter().rev().position(|&x| x > 0_usize).unwrap();
+        // index of rightmost non-zero count
+        let mut rightmost = 0;
+        for (idx, count) in dice.iter().enumerate() {
+            if *count > 0 {
+                rightmost = idx;
+            }
+        }
 
+        // If possible, move one from to the right by one
         if rightmost + 1 < dice.len() {
             dice[rightmost] -= 1;
             dice[rightmost + 1] += 1;
-        } else {
-            // use simple while loop
-            let next_rightmost = NUM_DICE_FACES - 1 - (NUM_DICE_FACES - rightmost + dice[0..rightmost].iter().rev().position(|&x| x > 0_usize).unwrap());
-            let num_rightmost = dice[rightmost];
-            dice[next_rightmost + 1] += num_rightmost;
-            dice[rightmost] -= num_rightmost;
-            dice[next_rightmost] -= 1;
-            dice[next_rightmost + 1] += 1;
 
+        // Otherwise, go to the second rightmost count, move one of _it_ to the right by one.
+        // Then, also take the rightmost count and dump all of them one past the second rightmost.
+        } else {
+            let mut second_rightmost = 0;
+            for (idx, count) in dice.iter().enumerate() {
+                if *count > 0 && idx < rightmost {
+                    second_rightmost = idx;
+                }
+            }
+            // Save the current count at rightmost, in case this in the current target
+            // from second rightmost
+            let target = second_rightmost + 1;
+            let num_rightmost = dice[rightmost];
+
+            // Move one from second rightmost
+            dice[second_rightmost] -= 1;
+            dice[target] += 1;
+
+            // Move all from rightmost
+            dice[target] += num_rightmost;
+            dice[rightmost] -= num_rightmost;
         }
-        v.push(dice);
+        dice_combinations.push(dice);
     }
-    v
+    dice_combinations
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -262,7 +320,7 @@ impl From<State> for usize {
     }
 }
 
-fn valid_states() -> Box<[bool]> {
+pub fn valid_states() -> Box<[bool]> {
 
     let mut valid_markers = vec![false;  NUM_STATES];
     let default_idx: usize = State::default().into();
@@ -353,7 +411,6 @@ pub fn scores() -> Vec<f64> {
    
     // totally unnecessary until implementing multiprocessing
     for level in (0..=14).rev() {
-        println!("level: {}", level);
         let scores_ro = scores.clone();
         let bands : Vec<(usize, &mut [f64])> = scores.chunks_mut(1).enumerate().collect();
 
@@ -369,6 +426,49 @@ pub fn scores() -> Vec<f64> {
                 value[0] = score;                
     }})};
     scores    
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpectedValues {
+    entry_actions: Vec<Option<f64>>,
+    third_dice: Vec<f64>,
+    second_keepers: Vec<f64>,
+    second_dice: Vec<f64>,
+    first_keepers: Vec<f64>,
+    first_dice: Vec<f64>,
+    value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Scores {
+    pub state_scores: Array1<f64>,
+    keepers_to_dice: Array2<f64>,
+    dice_to_keepers: Array2<f64>,
+}
+
+impl Scores {
+
+    pub fn new() -> Self {
+        let keepers_to_dice = keepers_to_dice();
+        let dice_to_keepers = dice_to_keepers();
+        let state_scores = Array1::zeros(NUM_STATES);
+
+        Scores { 
+            state_scores,
+            keepers_to_dice,
+            dice_to_keepers,
+        }
+    }
+
+    pub fn values(_state: State) -> ExpectedValues {
+        ExpectedValues{entry_actions: Vec::new(), third_dice: Vec::new(),
+        second_keepers: Vec::new(),
+        second_dice: Vec::new(),
+        first_keepers: Vec::new(),
+        first_dice: Vec::new(),
+        value: 0_f64,
+        }
+    }
 }
 
 #[cfg(test)]

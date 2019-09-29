@@ -138,6 +138,8 @@ It is also going to need to be able to load the state scores from a file. It wil
 
 Proposed design:
 
+dependency graph
+
 ```rust
 use std::fs::File;
 use std::io::BufReader;
