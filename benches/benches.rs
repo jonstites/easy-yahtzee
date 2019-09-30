@@ -24,24 +24,13 @@ mod bench {
 
     #[bench]
     fn bench_widget(b: &mut Bencher) {
-        let scores = vec![1_f64; 1048576];
-        let f = test::black_box(optizee::widget(optizee::State::default(), &scores));        
+        let scores = test::black_box(optizee::Scores::new());
         b.iter(|| {
-            let _f = f;
             let n = test::black_box(100);
             for state in 0..n {
                 let state: optizee::State = state.into();
-                optizee::widget(state, &scores);
+                optizee::widget(state, &scores.state_scores);
             }
         });
-    }
-
-
-    #[bench]
-    fn bench_dice_combinations2(b: &mut Bencher) {
-        b.iter(|| {
-            let n = test::black_box(5);
-            optizee::dice_combinations2(n);
-        })
     }
 }

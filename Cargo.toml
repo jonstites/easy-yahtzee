@@ -5,7 +5,6 @@ authors = ["Jonathan Stites <mail@jonstites.com>"]
 edition = "2018"
 
 [dependencies]
-lazy_static = "1.4"
 ndarray = { version = "0.13.0", features = ["serde"]}
 rayon = "1.2"
 bincode = "1.2"
@@ -14,6 +13,3 @@ serde = { version = "1.0", features = ["derive"] }
 
 [profile.test]
 opt-level = 3
-
-[profile.release]
-debug = true

@@ -26,13 +26,14 @@ fn main() {
     use flate2::read::{GzDecoder};
     use flate2::write::{GzEncoder};
 
-    let read = false;
+    let read = true;
 
     if read {
         let f = std::fs::File::create("scores.yht").unwrap();
         let mut e = GzEncoder::new(f, Compression::default());
 
-        let scores = optizee::Scores::new();
+        let mut scores = optizee::Scores::new();
+        scores.build();
         let encoded: Vec<u8> = bincode::serialize(&scores).unwrap();
         e.write_all(&encoded).unwrap();
     }
@@ -48,6 +49,6 @@ fn main() {
         e.read_to_end(&mut decoded_bytes).unwrap();
         let scores: optizee::Scores = bincode::deserialize(&decoded_bytes[..]).unwrap();
         let idx: usize = optizee::State::default().into();
-        println!("expected value: {}", scores.entry_scores[idx]);
+        println!("expected value: {}", scores.state_scores[idx]);
     }
 }
