@@ -3,8 +3,10 @@ use std::io::prelude::*;
 use std::io;
 
 fn main() {
-    /*let scores = optizee::scores();
-    let valid = optizee::valid_states();
+    let mut scores = optizee::Scores::new();
+    scores.build();
+    println!("{:?}", scores);
+    /*let valid = optizee::valid_states();
 
     let block_size = 2.11058197_f64 - 2.10648148_f64 + 0.0001_f64;
     let mut scores2 = Vec::new();
@@ -17,11 +19,11 @@ fn main() {
             }
             scores2.push(block_num);
         }
-    }
+    }*/
     //let scores2 = scores.iter().map(|&f| (f as f32) as f64).collect::<Vec<f64>>();
     //println!("{}", scores.iter().zip(scores2.iter()).map(|(f1, f2)| (f1 - f2).abs()).max_by(|x, y| x.partial_cmp(y).unwrap()).unwrap());
-    */
-    extern crate flate2;
+    
+    /*extern crate flate2;
     use flate2::Compression;
     use flate2::read::{GzDecoder};
     use flate2::write::{GzEncoder};
@@ -50,5 +52,5 @@ fn main() {
         let scores: optizee::Scores = bincode::deserialize(&decoded_bytes[..]).unwrap();
         let idx: usize = optizee::State::default().into();
         println!("expected value: {}", scores.state_scores[idx]);
-    }
+    }*/
 }
