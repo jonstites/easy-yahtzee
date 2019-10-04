@@ -1,5 +1,4 @@
 use std::convert::From;
-use std::fmt;
 use std::collections::{HashMap, VecDeque};
 
 extern crate ndarray;
@@ -39,6 +38,22 @@ const NUM_KEEPERS: usize = 462;
 const NUM_DICE_COMBINATIONS: usize = 252;
 const NUM_ENTRY_ACTIONS: usize = 13;
 
+pub const ENTRY_ACTIONS: [EntryAction; 13] = [
+    EntryAction::ONE,
+    EntryAction::TWO,
+    EntryAction::THREE,
+    EntryAction::FOUR,
+    EntryAction::FIVE,
+    EntryAction::SIX,
+    EntryAction::THREE_OF_A_KIND,
+    EntryAction::FOUR_OF_A_KIND,
+    EntryAction::FULL_HOUSE,
+    EntryAction::SMALL_STRAIGHT,
+    EntryAction::LARGE_STRAIGHT,
+    EntryAction::YAHTZEE,
+    EntryAction::CHANCE,
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DiceCounts([usize; NUM_DICE_FACES]);
 
@@ -47,6 +62,7 @@ lazy_static! {
     // Global static variables. Initialize once, read-only from anywhere.
     static ref YAHTZEE_DICE: Vec<Option<EntryAction>> = math::yahtzee_dice();
     static ref DICE_IDX_LOOKUP: HashMap<DiceCounts, usize> = math::dice_idx_lookup();
+    static ref IDX_DICE_LOOKUP: HashMap<usize, DiceCounts> = math::idx_dice_lookup();
     static ref DICE_AND_ENTRY_SCORES: Array2<usize> = math::dice_and_entry_scores();
     static ref DICE_TO_ALLOWED_KEEPERS: Array2<f32> = math::dice_to_keepers();
     static ref KEEPERS_TO_DICE_PROBABILITIES: Array2<f32> = math::keepers_to_dice();
@@ -54,7 +70,7 @@ lazy_static! {
 
 mod math {
     use super::*;
-
+    use super::EntryAction;
     /// Generates all dice combinations for a given number of dice
     pub fn dice_combinations(num_dice: usize) -> Vec<DiceCounts> {
         let mut dice = [0; NUM_DICE_FACES];
@@ -113,7 +129,14 @@ mod math {
             .enumerate()
             .map(|(idx, dice)| (dice, idx))
             .collect()
-    }        
+    }
+
+    pub fn idx_dice_lookup() -> HashMap<usize, DiceCounts> {
+        dice_combinations(NUM_DICE)
+            .into_iter()
+            .enumerate()
+            .collect()
+    }
 
     /// Creates a vector specifying which DiceCounts are Yahtzees
     /// If it is a Yahtzee, specify the kind (ones, twos, etc)
@@ -132,6 +155,7 @@ mod math {
     }
 
     pub fn dice_and_entry_scores() -> Array2<usize> {
+
         let shape = (NUM_ENTRY_ACTIONS, NUM_DICE_COMBINATIONS);
         let mut scores = Array2::zeros(shape);
         
@@ -140,19 +164,24 @@ mod math {
         for (dice_idx, dice) in dice_combinations.into_iter().enumerate() {
             let dice = dice.0;
             let small_straight = dice[..4].iter().all(|&x| x > 0) || dice[1..5].iter().all(|&x| x > 0) || dice[2..6].iter().all(|&x| x > 0) ;
-            for action in 0..13 {
+            for (action_idx, &action) in ENTRY_ACTIONS.iter().enumerate() {
                 let score = match action {
-                    idx if idx < 6 => (dice[action] * (action + 1)),
-                    6 if *dice.iter().max().unwrap() >= 3_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>(),
-                    7 if *dice.iter().max().unwrap() >= 4_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>(),
-                    8 if *dice.iter().max().unwrap() == 3_usize && *dice.iter().filter(|&&i| i != 3_usize).max().unwrap() == 2_usize => 25,
-                    9 if small_straight => 30,
-                    10 if dice == [1, 1, 1, 1, 1, 0] || dice == [0, 1, 1, 1, 1, 1] => 40,
-                    11 if *dice.iter().max().unwrap() == 5_usize => 50,
-                    12 => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>(),
+                    EntryAction::ONE => 1 * dice[0],
+                    EntryAction::TWO => 2 * dice[1],
+                    EntryAction::THREE => 3 * dice[2],
+                    EntryAction::FOUR => 4 * dice[3],
+                    EntryAction::FIVE => 5 * dice[4],
+                    EntryAction::SIX => 6 * dice[5],
+                    EntryAction::THREE_OF_A_KIND if *dice.iter().max().unwrap() >= 3_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>(),
+                    EntryAction::FOUR_OF_A_KIND if *dice.iter().max().unwrap() >= 4_usize => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>(),
+                    EntryAction::FULL_HOUSE if *dice.iter().max().unwrap() == 3_usize && *dice.iter().filter(|&&i| i != 3_usize).max().unwrap() == 2_usize => 25,
+                    EntryAction::SMALL_STRAIGHT if small_straight => 30,
+                    EntryAction::LARGE_STRAIGHT if dice == [1, 1, 1, 1, 1, 0] || dice == [0, 1, 1, 1, 1, 1] => 40,
+                    EntryAction::YAHTZEE if *dice.iter().max().unwrap() == 5_usize => 50,
+                    EntryAction::CHANCE => dice.iter().enumerate().map(|(idx, count)| count * (idx + 1)).sum::<usize>(),
                     _ => 0,
                 };
-                scores[(action, dice_idx)] = score;
+                scores[(action_idx, dice_idx)] = score;
             }
         }
         scores
@@ -255,6 +284,8 @@ mod math {
 
         #[test]
         fn test_yahtzee_dice() {
+            
+
             let yahtzee_dice = yahtzee_dice();
 
             assert_eq!(yahtzee_dice.len(), NUM_DICE_COMBINATIONS);
@@ -262,12 +293,12 @@ mod math {
             assert_eq!(yahtzee_dice.iter().filter(|d| d.is_some()).count(), NUM_DICE_FACES);
 
             let expected = vec![
-                ([5, 0, 0, 0, 0, 0], 0),
-                ([0, 5, 0, 0, 0, 0], 1),
-                ([0, 0, 5, 0, 0, 0], 2),
-                ([0, 0, 0, 5, 0, 0], 3),
-                ([0, 0, 0, 0, 5, 0], 4),
-                ([0, 0, 0, 0, 0, 5], 5),
+                ([5, 0, 0, 0, 0, 0], EntryAction::ONE),
+                ([0, 5, 0, 0, 0, 0], EntryAction::TWO),
+                ([0, 0, 5, 0, 0, 0], EntryAction::THREE),
+                ([0, 0, 0, 5, 0, 0], EntryAction::FOUR),
+                ([0, 0, 0, 0, 5, 0], EntryAction::FIVE),
+                ([0, 0, 0, 0, 0, 5], EntryAction::SIX),
             ];
 
             for (dice, value) in expected.into_iter() {
@@ -282,7 +313,7 @@ mod math {
 
 
 bitflags! {
-    struct EntryAction: u16 {
+    pub struct EntryAction: u16 {
         const ONE             = 1;
         const TWO             = 1 << 1;
         const THREE           = 1 << 2;
@@ -299,6 +330,18 @@ bitflags! {
     }    
 }
 
+impl EntryAction {
+
+    pub fn as_idx(&self) -> usize {
+        let mut idx = 0;
+        let mut value = self.bits();
+        while value > 1 {
+            value = value >> 1;
+            idx += 1;
+        }
+        idx
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct State {
@@ -322,23 +365,32 @@ impl Default for State {
 impl From<usize> for State {
     fn from(value: usize) -> Self {
         let value = value.min(NUM_STATES - 1);
-        State(value)
+        State {
+            entries: EntryAction::from_bits((value >> 7) as u16).unwrap(),
+            yahtzee_bonus_eligible: (value >> 6) & 1 == 1,
+            upper_score_remaining: (value & 0b111111) as u8,
+        }
     }
 }
 
 impl From<State> for usize {
     fn from(value: State) -> Self {
-        value.0
+        let mut result = (value.entries.bits() as usize) << 7;
+        if value.yahtzee_bonus_eligible {
+            result |= 1 << 6;
+        }
+        result |= value.upper_score_remaining as usize;
+        result as usize
     }
 }
 
 impl State {    
 
-    pub fn child(&self, action_idx: EntryAction, dice_idx: usize) -> State {
+    pub fn child(&self, action: EntryAction, dice_idx: usize) -> State {
         let mut child = *self;
 
         // set action
-        child.entries |= action_idx;
+        child.entries |= action;
 
         // set upper score
         let upper_actions = EntryAction::ONE 
@@ -348,13 +400,13 @@ impl State {
             | EntryAction::FIVE 
             | EntryAction::SIX;
 
-        if upper_actions.contains(action_idx) {
-            let score = DICE_AND_ENTRY_SCORES[(action_idx.bits() as usize, dice_idx)];
+        if upper_actions.contains(action) {
+            let score = DICE_AND_ENTRY_SCORES[(action.as_idx(), dice_idx)];
             child.upper_score_remaining = child.upper_score_remaining.saturating_sub(score as u8);
         }
         
         // set yahtzee eligibility
-        if action_idx == EntryAction::YAHTZEE && YAHTZEE_DICE[dice_idx].is_some() {
+        if action == EntryAction::YAHTZEE && YAHTZEE_DICE[dice_idx].is_some() {
             child.yahtzee_bonus_eligible = true;
         }
         child
@@ -364,7 +416,7 @@ impl State {
 
         let child = self.child(action_idx, dice_idx);
 
-        let mut normal_score = DICE_AND_ENTRY_SCORES[(action_idx.bits() as usize, dice_idx)] as f32;
+        let mut normal_score = DICE_AND_ENTRY_SCORES[(action_idx.as_idx(), dice_idx)] as f32;
         let upper_bonus = if !self.upper_complete() && child.upper_complete() {
             35_f32
         } else {
@@ -464,14 +516,15 @@ impl Scores {
         }
     }
 
-    fn widget(&self, state: State) -> f32 {
+    pub fn widget(&self, state: State) -> f32 {
 
         // values of each entry for each final dice roll
         let entry_scores = Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
-            if !state.is_valid_action(action_idx) {
+            let action = EntryAction::from_bits(1 << action_idx).unwrap();
+            if !state.is_valid_action(action) {
                 0_f32
             } else {
-                let (score, child) = state.score_and_child(action_idx, dice_idx);
+                let (score, child) = state.score_and_child(action, dice_idx);
                 let child_idx: usize = child.into();
                 score + self.state_scores[child_idx]
             }
@@ -516,24 +569,22 @@ impl Scores {
         let default_idx: usize = State::default().into();
         valid_markers[default_idx] = true;
 
-        let mut stack = VecDeque::new();
+        let mut queue = VecDeque::new();
+        queue.push_front(State::default());
 
-        // wait, I changed this to a queue at some point?
-        stack.push_front(State::default());
+        while let Some(elem) = queue.pop_back() {        
 
-        while let Some(elem) = stack.pop_back() {        
+            for &action in ENTRY_ACTIONS.iter() {
 
-            for action_idx in 0..13 {
-
-                if elem.is_valid_action(action_idx) {
+                if elem.is_valid_action(action) {
 
                     for dice_idx in 0..252 {
 
-                        let child = elem.child(action_idx, dice_idx);
+                        let child = elem.child(action, dice_idx);
                         let idx: usize = child.into();
                         if !valid_markers[idx] {
                             valid_markers[idx] = true;
-                            stack.push_front(child);
+                            queue.push_front(child);
                         }
                     }
                 }

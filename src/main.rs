@@ -5,7 +5,12 @@ use std::io;
 fn main() {
     let mut scores = optizee::Scores::new();
     scores.build();
-    println!("{:?}", scores);
+    println!("{:?}", optizee::State::default());
+    let idx: optizee::State = 536448_usize.into();
+    println!("{:?}", idx);
+    let idx: optizee::State = 1048576_usize.into();
+        println!("{:?}", idx);
+
     /*let valid = optizee::valid_states();
 
     let block_size = 2.11058197_f64 - 2.10648148_f64 + 0.0001_f64;

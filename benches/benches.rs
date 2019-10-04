@@ -11,11 +11,11 @@ mod bench {
         b.iter(|| {
             let n = test::black_box(100);
 
-            for action_idx in 0..13 {
+            for &action in optizee::ENTRY_ACTIONS.iter() {
                 for dice_idx in 0..252 {
                     for state in 0..n {
                         let state: optizee::State = state.into();
-                        state.child(action_idx, dice_idx);
+                        state.child(action, dice_idx);
                     }
                 }
             }
@@ -29,7 +29,7 @@ mod bench {
             let n = test::black_box(100);
             for state in 0..n {
                 let state: optizee::State = state.into();
-                optizee::widget(state, &scores.state_scores);
+                scores.widget(state);
             }
         });
     }
