@@ -181,8 +181,7 @@ mod math {
                         .sum::<u8>(),
                     EntryAction::FULL_HOUSE
                         if *dice.iter().max().unwrap() == 3_u8
-                            && *dice.iter().filter(|&&i| i != 3_u8).max().unwrap()
-                                == 2_u8 =>
+                            && *dice.iter().filter(|&&i| i != 3_u8).max().unwrap() == 2_u8 =>
                     {
                         25
                     }
@@ -196,7 +195,7 @@ mod math {
                     EntryAction::CHANCE => dice
                         .iter()
                         .enumerate()
-                        .map(|(idx, count)| count * (idx as u8+ 1))
+                        .map(|(idx, count)| count * (idx as u8 + 1))
                         .sum::<u8>(),
                     _ => 0,
                 };
@@ -559,22 +558,23 @@ impl State {
         child
     }
 
-
     pub fn score_and_child(self, action_idx: EntryAction, dice_idx: u8) -> (f32, State) {
         let child = self.child(action_idx, dice_idx);
 
-        let mut normal_score = f32::from(DICE_AND_ENTRY_SCORES[(action_idx.as_idx(), dice_idx as usize)]);
+        let mut normal_score =
+            f32::from(DICE_AND_ENTRY_SCORES[(action_idx.as_idx(), dice_idx as usize)]);
         let upper_bonus = if !self.upper_complete() && child.upper_complete() {
             35_f32
         } else {
             0_f32
         };
 
-        let yahtzee_bonus = if YAHTZEE_DICE[dice_idx as usize].is_some() && self.yahtzee_bonus_eligible {
-            100_f32
-        } else {
-            0_f32
-        };
+        let yahtzee_bonus =
+            if YAHTZEE_DICE[dice_idx as usize].is_some() && self.yahtzee_bonus_eligible {
+                100_f32
+            } else {
+                0_f32
+            };
 
         // joker rule
         // yahtzee box filled
