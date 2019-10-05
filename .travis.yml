@@ -10,4 +10,4 @@ rust:
 script:
   - cargo build --verbose
   - cargo test --verbose
-  - cargo clippy -- -D warnings -W clippy::pedantic
+  - cargo clippy -- -D warnings
