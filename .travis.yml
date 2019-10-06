@@ -7,10 +7,7 @@ rust:
   - beta
   - stable
 
-before_script:
-  - rustup component add clippy
-
 script:
   - cargo build --verbose
   - cargo test --verbose
-  - if [[ "$TRAVIS_RUST_VERSION" = "stable" ]]; then cargo clippy -- -D warnings; fi
+  - if [[ "$TRAVIS_RUST_VERSION" = "stable" ]]; then rustup component add clippy && cargo clippy -- -D warnings; fi
