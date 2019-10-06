@@ -1,6 +1,6 @@
 extern crate optizee;
 
 fn main() {
-    let mut scores = optizee::Scores::new();
-    scores.build();
+    let scores = optizee::Scores::new();
+    println!("{:#?}", scores.values(optizee::State::default()));
 }

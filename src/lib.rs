@@ -328,25 +328,51 @@ mod math {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scores {
-    pub state_scores: Array1<f32>,
-}
-
-impl Default for Scores {
-    fn default() -> Scores {
-        let state_scores = Array1::zeros(NUM_STATES as usize);
-
-        Scores { state_scores }
-    }
+    state_scores: Array1<f32>,
+    valid_states: Box<[bool]>,
 }
 
 impl Scores {
     pub fn new() -> Scores {
-        Scores::default()
+        let state_scores = Array1::zeros(NUM_STATES as usize);
+        let valid_states = Box::new([false; 0]);
+        let mut scores = Scores {
+            state_scores,
+            valid_states,
+        };
+        scores.set_valid_states();
+        scores.set_scores();
+        scores
     }
 
-    pub fn build(&mut self) {
-        let valid_states = self.valid_states();
+    pub fn entry_scores(&self, state: State, dice: &DiceCounts) -> Option<Box<[f32]>> {
+        if self.valid_state(state) {
+            if let Some(&dice_idx) = DICE_IDX_LOOKUP.get(dice) {
+                let scores = self.values(state);
+                let entries: Vec<f32> = scores
+                    .entry_actions
+                    .column(dice_idx)
+                    .iter()
+                    .cloned()
+                    .collect();
+                Some(entries.into_boxed_slice())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
 
+    pub fn second_keepers_scores(&self, state: State, dice: &DiceCounts) -> Option<Box<[f32]>> {
+        None
+    }
+
+    pub fn first_keepers_scores(&self, state: State, dice: &DiceCounts) -> Option<Box<[f32]>> {
+        None
+    }
+
+    fn set_scores(&mut self) {
         // We go level-by-level, bottom to top, for correctness when multiprocessing
         for level in (0..NUM_ENTRY_ACTIONS).rev() {
             let mut new_scores = vec![0_f32; NUM_STATES as usize];
@@ -357,8 +383,8 @@ impl Scores {
                 .for_each(|(state_idx, score)| {
                     let state: State = state_idx.into();
                     let state_level = state.level();
-                    if valid_states[state_idx] && state_level == level as usize {
-                        *score = self.widget(state);
+                    if self.valid_state(state) && state_level == level as usize {
+                        *score = self.values(state).value;
                     }
                 });
 
@@ -371,22 +397,11 @@ impl Scores {
         }
     }
 
-    // Todo. Required for basic library functionality.
-    pub fn values(&self, _state: State) -> ExpectedValues {
-        ExpectedValues {
-            entry_actions: Vec::new(),
-            third_dice: Vec::new(),
-            second_keepers: Vec::new(),
-            second_dice: Vec::new(),
-            first_keepers: Vec::new(),
-            first_dice: Vec::new(),
-            value: 0_f32,
-        }
-    }
+    pub fn values(&self, state: State) -> ExpectedValues {
+        let mut expected_values = ExpectedValues::default();
 
-    pub fn widget(&self, state: State) -> f32 {
         // values of each entry for each final dice roll
-        let entry_scores = Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
+        let entry_actions = Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
             let action = EntryAction::from_bits(1 << action_idx).unwrap();
             if state.is_valid_action(action) {
                 let (score, child) = state.score_and_child(action, dice_idx as u8);
@@ -396,46 +411,56 @@ impl Scores {
                 0_f32
             }
         });
+
+        expected_values.entry_actions = entry_actions.clone();
+
         // value of each final dice roll
-        let max_action_values =
-            entry_scores.fold_axis(Axis(0), 0_f32, |acc, value| acc.max(*value));
+        let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, value| acc.max(*value));
 
-        let mut avg_action_values: Array1<f32> = Array1::zeros(462);
+        expected_values.third_dice = third_dice.clone();
 
-        Zip::from(&mut avg_action_values)
+        let mut second_keepers: Array1<f32> = Array1::zeros(462);
+
+        Zip::from(&mut second_keepers)
             .and(KEEPERS_TO_DICE_PROBABILITIES.genrows())
             .apply(|avg, act| {
-                *avg = (&act * &max_action_values).sum();
+                *avg = (&act * &third_dice).sum();
             });
 
-        let mut dice_values: Array1<f32> = Array1::zeros(252);
-        Zip::from(&mut dice_values)
+        let mut second_dice = third_dice;
+        Zip::from(&mut second_dice)
             .and(DICE_TO_ALLOWED_KEEPERS.genrows())
             .apply(|val, dice_to_action| {
-                *val =
-                    (&dice_to_action * &avg_action_values).fold(0_f32, |acc, elem| acc.max(*elem));
+                *val = (&dice_to_action * &second_keepers).fold(0_f32, |acc, elem| acc.max(*elem));
             });
 
-        Zip::from(&mut avg_action_values)
+        expected_values.second_dice = second_dice.clone();
+
+        let mut first_keepers = second_keepers;
+
+        Zip::from(&mut first_keepers)
             .and(KEEPERS_TO_DICE_PROBABILITIES.genrows())
             .apply(|avg, act| {
-                *avg = (&act * &dice_values).sum();
+                *avg = (&act * &second_dice).sum();
             });
 
-        Zip::from(&mut dice_values)
+        expected_values.first_keepers = first_keepers.clone();
+
+        let mut first_dice = second_dice;
+        Zip::from(&mut first_dice)
             .and(DICE_TO_ALLOWED_KEEPERS.genrows())
             .apply(|val, dice_to_action| {
-                *val =
-                    (&dice_to_action * &avg_action_values).fold(0_f32, |acc, elem| acc.max(*elem));
+                *val = (&dice_to_action * &first_keepers).fold(0_f32, |acc, elem| acc.max(*elem));
             });
 
-        let first_roll = KEEPERS_TO_DICE_PROBABILITIES.index_axis(Axis(0), 0);
-        first_roll.dot(&dice_values)
+        expected_values.first_dice = first_dice.clone();
+
+        let first_roll_probabilities = KEEPERS_TO_DICE_PROBABILITIES.index_axis(Axis(0), 0);
+        expected_values.value = first_roll_probabilities.dot(&first_dice);
+        expected_values
     }
 
-    // this can be rewritten as merely iterating in order over states
-    // no queue or stack required
-    fn valid_states(&self) -> Vec<bool> {
+    fn set_valid_states(&mut self) {
         let mut valid_markers = vec![false; NUM_STATES as usize];
         let default_idx: usize = State::default().into();
         valid_markers[default_idx] = true;
@@ -455,7 +480,12 @@ impl Scores {
             }
         }
 
-        valid_markers
+        self.valid_states = valid_markers.into_boxed_slice();
+    }
+
+    pub fn valid_state(&self, state: State) -> bool {
+        let state_idx: usize = state.into();
+        self.valid_states[state_idx]
     }
 }
 
@@ -532,6 +562,7 @@ impl State {
     pub fn level(self) -> usize {
         self.entries.bits().count_ones() as usize
     }
+
     pub fn child(self, action: EntryAction, dice_idx: u8) -> State {
         let mut child = self;
 
@@ -609,18 +640,31 @@ impl State {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpectedValues {
-    entry_actions: Vec<Option<f32>>,
-    third_dice: Vec<f32>,
-    second_keepers: Vec<f32>,
-    second_dice: Vec<f32>,
-    first_keepers: Vec<f32>,
-    first_dice: Vec<f32>,
+    entry_actions: Array2<f32>,
+    third_dice: Array1<f32>,
+    second_keepers: Array1<f32>,
+    second_dice: Array1<f32>,
+    first_keepers: Array1<f32>,
+    first_dice: Array1<f32>,
     value: f32,
 }
 
+impl Default for ExpectedValues {
+    fn default() -> ExpectedValues {
+        ExpectedValues {
+            entry_actions: Array2::zeros((0, 0)),
+            third_dice: Array1::zeros(0),
+            second_keepers: Array1::zeros(0),
+            second_dice: Array1::zeros(0),
+            first_keepers: Array1::zeros(0),
+            first_dice: Array1::zeros(0),
+            value: 0_f32,
+        }
+    }
+}
+
 pub fn score() -> ExpectedValues {
-    let mut score = Scores::new();
-    score.build();
+    let score = Scores::new();
     score.values(State::default())
 }
 
