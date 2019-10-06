@@ -1,4 +1,13 @@
+sudo: false
 language: rust
+cache: cargo
+
 rust:
   - nightly
-cache: cargo
+  - beta
+  - stable
+
+script:
+  - cargo build --verbose
+  - cargo test --verbose
+  - if [[ "$TRAVIS_RUST_VERSION" = "stable" ]]; then rustup component add clippy && cargo clippy -- -D warnings; fi

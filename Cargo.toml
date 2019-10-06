@@ -2,11 +2,13 @@
 name = "optizee"
 version = "0.1.0"
 authors = ["Jonathan Stites <mail@jonstites.com>"]
+edition = "2018"
 
 [dependencies]
-clap = "2"
-permutohedron = "0.2.4"
-itertools = "0.7.8"
-flame = "0.2.2"
-flamer = "0.3"
-time = "*"
+ndarray = { version = "0.13.0"}
+rayon = "1.2"
+lazy_static = "1.4"
+bitflags = "1.2"
+
+[profile.test]
+opt-level = 3

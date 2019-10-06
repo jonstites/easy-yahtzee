@@ -1,856 +1,647 @@
-#![allow(dead_code, unused_variables, unused_parens, unused_imports)]
-#![feature(nll)]
-#![feature(try_trait)]
-#![feature(test)]
-
-extern crate itertools;
-extern crate test;
-
-use test::Bencher;
-use itertools::Itertools;
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::collections::VecDeque;
-use std::slice::Iter;
-use std::result;
+use std::convert::From;
 
+extern crate ndarray;
+extern crate rayon;
 
+use ndarray::prelude::*;
+use ndarray::Zip;
+use rayon::prelude::*;
 
-use self::Entry::*;
+#[macro_use]
+extern crate lazy_static;
 
-const DICE_TO_ROLL: i32 = 5;
-const DICE_SIDES: i32 = 6;
+#[macro_use]
+extern crate bitflags;
 
-type Result<T> = result::Result<T, YahtzeeError>;
+// 2^13 * 2 * 64
+// 13 Entries, 1 bit for Yahtzee bonus eligibility, and 64 for upper score
+const NUM_STATES: u32 = 1_048_576;
 
-#[derive(Debug, PartialEq)]
-pub enum YahtzeeError {
-    BadConfig,
-    InternalError,
-    MissingState(std::option::NoneError)
+// Calculated empirically - many states can never be reached
+#[allow(dead_code)]
+const NUM_VALID_STATES: u32 = 536_448;
+#[warn(dead_code)]
+
+// d6
+const NUM_DICE_FACES: u8 = 6;
+
+// 5 dice are used in yahtzee
+const NUM_DICE: u8 = 5;
+
+// C(10, 5) + C(9, 4) + ... C(5, 0)
+const NUM_KEEPERS: u16 = 462;
+
+// C(10, 5)
+const NUM_DICE_COMBINATIONS: u8 = 252;
+const NUM_ENTRY_ACTIONS: u8 = 13;
+
+pub const ENTRY_ACTIONS: [EntryAction; 13] = [
+    EntryAction::ONE,
+    EntryAction::TWO,
+    EntryAction::THREE,
+    EntryAction::FOUR,
+    EntryAction::FIVE,
+    EntryAction::SIX,
+    EntryAction::THREE_OF_A_KIND,
+    EntryAction::FOUR_OF_A_KIND,
+    EntryAction::FULL_HOUSE,
+    EntryAction::SMALL_STRAIGHT,
+    EntryAction::LARGE_STRAIGHT,
+    EntryAction::YAHTZEE,
+    EntryAction::CHANCE,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DiceCounts([u8; NUM_DICE_FACES as usize]);
+
+lazy_static! {
+    // Global static variables. Initialize once, read-only from anywhere.
+    static ref YAHTZEE_DICE: Vec<Option<EntryAction>> = math::yahtzee_dice();
+    static ref DICE_IDX_LOOKUP: HashMap<DiceCounts, usize> = math::dice_idx_lookup();
+    static ref IDX_DICE_LOOKUP: HashMap<usize, DiceCounts> = math::idx_dice_lookup();
+    static ref DICE_AND_ENTRY_SCORES: Array2<u8> = math::dice_and_entry_scores();
+    static ref DICE_TO_ALLOWED_KEEPERS: Array2<f32> = math::dice_to_keepers();
+    static ref KEEPERS_TO_DICE_PROBABILITIES: Array2<f32> = math::keepers_to_dice();
 }
 
-impl From<std::option::NoneError> for YahtzeeError {
-    fn from(err: std::option::NoneError) -> YahtzeeError {
-        YahtzeeError::MissingState(err)
-    }
-}
+mod math {
+    use super::EntryAction;
+    use super::*;
+    /// Generates all dice combinations for a given number of dice
+    pub fn dice_combinations(num_dice: u8) -> Vec<DiceCounts> {
+        let mut dice = [0_u8; NUM_DICE_FACES as usize];
+        dice[0] = num_dice;
 
-#[derive(Debug)]
-pub struct ConfigBuilder {
-    upper_section_bonus: i32,
-    yahtzee_bonus: i32,
-    dice_to_roll: i32,
-    dice_sides: i32
-}
+        let mut dice_combinations = Vec::new();
+        dice_combinations.push(DiceCounts(dice));
 
-impl ConfigBuilder {
+        // Continue until the last dice combination in lexicographic order is created
+        while dice[NUM_DICE_FACES as usize - 1] != num_dice {
+            // index of rightmost non-zero count
+            let mut rightmost = 0;
+            for (idx, count) in dice.iter().enumerate() {
+                if *count > 0 {
+                    rightmost = idx;
+                }
+            }
 
-    pub fn default() -> Config {
-        ConfigBuilder::new().build().unwrap()
-    }
-    
-    pub fn new() -> ConfigBuilder {
-        ConfigBuilder {
-            upper_section_bonus: 35,
-            yahtzee_bonus: 100,
-            dice_to_roll: 5,
-            dice_sides: 6
-        }
-    }
+            // If possible, move one from to the right by one
+            if rightmost + 1 < dice.len() {
+                dice[rightmost] -= 1;
+                dice[rightmost + 1] += 1;
 
-    pub fn upper_section_bonus(&mut self, bonus: i32) -> &mut Self {
-        self.upper_section_bonus = bonus;
-        self
-    }
-
-    pub fn yahtzee_bonus(&mut self, bonus: i32) -> &mut Self {
-        self.yahtzee_bonus = bonus;
-        self
-    }
-
-    pub fn dice_to_roll(&mut self, number: i32) -> &mut Self {
-        self.dice_to_roll = number;
-        self
-    }
-
-    pub fn dice_sides(&mut self, number: i32) -> &mut Self {
-        self.dice_sides = number;
-        self
-    }
-    
-    pub fn build(&self) -> Result<Config> {
-        if self.dice_to_roll < 0 || self.dice_sides < 1 {
-            Err(YahtzeeError::BadConfig)
-        } else {
-            Ok(Config {
-                upper_section_bonus: self.upper_section_bonus,
-                yahtzee_bonus: self.yahtzee_bonus,
-                dice_to_roll: self.dice_to_roll,
-                dice_sides: self.dice_sides
-            })
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Config {
-    upper_section_bonus: i32,
-    yahtzee_bonus: i32,
-    dice_to_roll: i32,
-    dice_sides: i32
-}
-
-// also vector to box works just fine (?!), with hash too.
-pub struct ActionScores {
-    state_values: HashMap<State, f64>,
-    state_builder: StateBuilder
-}
-
-impl ActionScores {
-
-    pub fn new(config: Config) -> ActionScores {
-        let state_values = HashMap::new();
-        let state_builder = StateBuilder::new(config);
-        
-        ActionScores {
-            state_values,
-            state_builder,
-        }
-    }
-
-    pub fn init(&mut self) {
-        let starting_state = State::default();
-        self.init_from_state(starting_state);
-    }
-    
-    pub fn init_from_state(&mut self, starting_state: State) {
-        let mut states = self.state_builder.children(starting_state);
-        while let Some(state) = states.pop() {
-            let score = self.get_score(state).unwrap();
-            self.state_values.insert(state, score);
-        }
-    }
-
-    pub fn value_of_state(&self, state: State) -> Result<f64> {
-        self.get_score(state)
-    }
-
-    pub fn value_of_entry(
-        &self,        
-        entry: Entry,
-        state: State,
-        dice: Vec<i32>,
-    ) -> Result<f64> {
-        let dice = DiceCombination::from_vec(dice);
-        let child = self.state_builder.child(state, entry, dice);
-        let score = state.score(entry, dice) as f64;
-        let child_score = *self.state_values.get(&child)?;
-        Ok(score + child_score)
-    }
-
-    pub fn value_of_keepers(
-        &self,        
-        keepers: Vec<i32>,
-        rolls_remaining: i32,
-        state: State
-    ) -> Result<f64> {
-        let default_full_state = Fs::I(
-            FullState {
-                dice: DiceCombination::new(),
-                rolls_remaining: 3
-            });
-
-        let mut fs =  FullStateCalculator {
-            minimal_state: &state,
-            minimal_state_values: &self.state_values,
-            possible_rolls: &self.state_builder.possible_rolls,
-            roll_probs: &self.state_builder.rolls,
-            full_state_values: HashMap::new(),
-            state_builder: &self.state_builder,
-        };
-
-        // Handle Error  here
-        fs.full_state_calculation(default_full_state)?;
-
-        let lookup_fs = Fs::I(
-            FullState {
-                dice: DiceCombination::from_vec(keepers),
-                rolls_remaining: rolls_remaining,
-            });
-        Ok(*fs.full_state_values.get(&lookup_fs)?)
-    }
-
-    fn get_score(&self, state: State) -> Result<f64> {
-        let default_full_state = Fs::I(
-            FullState {
-                dice: DiceCombination::new(),
-                rolls_remaining: 3 
-            });
-
-        let score =  FullStateCalculator {
-            minimal_state: &state,
-            minimal_state_values: &self.state_values,
-            possible_rolls: &self.state_builder.possible_rolls,
-            roll_probs: &self.state_builder.rolls,
-            full_state_values: HashMap::new(),
-            state_builder: &self.state_builder,
-        }.full_state_calculation(default_full_state);
-        score
-    }
-}
-
-
-#[derive(Debug)]
-struct StateBuilder {
-    config: Config,
-    rolls: Vec<HashMap<DiceCombination, f64>>,
-    possible_rolls: HashSet<DiceCombination>
-}
-
-impl StateBuilder {
-
-    // precondition: dice_to_roll must be non-negative
-    // precondition: dice_sides must be positive
-    // This is guaranteed by checks in ConfigBuilder
-    // TODO: Remove the hard-coded number of dice in DiceCombination
-    // This will require using a Box<i32> rather than array
-    fn new(config: Config) -> StateBuilder {
-        
-        assert!(config.dice_to_roll >= 0);
-        assert!(config.dice_sides > 0);
-
-        let mut rolls = Vec::new();
-        for dice_number in 0..=config.dice_to_roll {
-            let probabilities = DiceCombination::probabilities(dice_number);
-            rolls.push(probabilities);
-        }
-
-        let possible_rolls = rolls
-            .last()
-            .unwrap()
-            .iter()
-            .map(|(key, _)| *key)
-            .collect();
-        
-        StateBuilder {
-            config,
-            rolls,
-            possible_rolls
-        }
-    }
-
-    pub fn children(&self, starting_state: State) -> Vec<State> {
-        let mut queue = VecDeque::new();
-        queue.push_back(starting_state);
-        
-        let mut added = HashSet::new();
-        added.insert(starting_state);
-        let mut states = Vec::new();
-
-        while let Some(state) = queue.pop_front() {
-            states.push(state);
-            for entry in Entry::iterator().filter(|&e| state.is_valid(&e)) {
-                for roll in self.possible_rolls.clone() {
-                    let child = self.child(state, *entry, roll);
-                    if !added.contains(&child) {
-                        queue.push_back(child);
-                        added.insert(child);                        
+            // Otherwise, go to the second rightmost count, move one of _it_ to the right by one.
+            // Then, also take the rightmost count and dump all of them one past the second rightmost.
+            } else {
+                let mut second_rightmost = 0;
+                for (idx, count) in dice.iter().enumerate() {
+                    if *count > 0 && idx < rightmost {
+                        second_rightmost = idx;
                     }
                 }
+                // Save the current count at rightmost, in case this in the current target
+                // from second rightmost
+                let target = second_rightmost + 1;
+                let num_rightmost = dice[rightmost];
+
+                // Move one from second rightmost
+                dice[second_rightmost] -= 1;
+                dice[target] += 1;
+
+                // Move all from rightmost
+                dice[target] += num_rightmost;
+                dice[rightmost] -= num_rightmost;
             }
+            dice_combinations.push(DiceCounts(dice));
         }
-        states
+        dice_combinations
     }
 
-    fn child(&self, parent: State, entry: Entry, roll: DiceCombination) -> State {
-        let mut entries_taken = parent.entries_taken.clone();
-
-        let index = entry as usize;
-        entries_taken[index] = true;     
-
-        let upper_score_total = parent.new_upper_score(entry, roll);
-        let positive_yahtzee = parent.positive_yahtzee || ((entry == Yahtzee) && (roll.is_yahtzee()));
-        
-        State {
-            entries_taken,
-            upper_score_total,
-            positive_yahtzee
-        }
-    }
-    
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
-pub struct State {
-    pub entries_taken: [bool; 13],
-    positive_yahtzee: bool,
-    upper_score_total: i32,
-}
-
-impl State {
-
-    pub fn default() -> State {
-        State {
-            entries_taken: [false; 13],
-            positive_yahtzee: false,
-            upper_score_total: 0,
-        }
-    }
-
-    fn is_valid(&self, entry: &Entry) -> bool {
-        !self.entries_taken[*entry as usize]
-    }
-
-    fn new_upper_score(&self, entry: Entry, roll: DiceCombination) -> i32 {
-        let index = entry as usize;
-        let additional_upper_score = match entry {
-            Ones => 1 * roll.dice[index],
-            Twos => 2 * roll.dice[index],
-            Threes => 3 * roll.dice[index],
-            Fours => 4 * roll.dice[index],
-            Fives => 5 * roll.dice[index],
-            Sixes => 6 * roll.dice[index],
-            _ => 0,
-        };
-        
-        63.min(self.upper_score_total + additional_upper_score)
-        
-    }
-
-    fn score(&self, entry: Entry, roll: DiceCombination) -> i32 {
-        let new_upper_score = self.new_upper_score(entry, roll);
-        let old_upper_score = self.upper_score_total;
-            
-        let upper_score_bonus = match (old_upper_score, new_upper_score) {
-            (63, 63) => 0,
-            (_, 63) => 35, // TODO: use config here
-            _ => 0,
-        };
-        
-        let yahtzee_bonus = match (roll.is_yahtzee() && self.positive_yahtzee) {
-            true => 100,
-            false => 0,
-        };
-
-        let dice_score = self.score_dice(entry, roll);
-        //println!("{:?} {:?} {:?} {:?} {:?}", upper_score_bonus, yahtzee_bonus, dice_score, entry, roll);
-        let total_score = upper_score_bonus + yahtzee_bonus + dice_score;
-        total_score
-    }
-
-    fn score_dice(&self, entry: Entry, roll: DiceCombination) -> i32 {
-        // implemented as free choice joker rule
-        // todo: support configuration for joker rule
-        let index = entry as usize;
-        
-        let yahtzee_index = roll.dice.iter().position(|&x| x == 5);
-            
-        let joker = roll.is_yahtzee() &&
-                self.entries_taken[Yahtzee as usize] &&
-                self.entries_taken[yahtzee_index.unwrap()];
-
-
-        match entry {
-            Ones => 1 * roll.dice[index],
-            Twos => 2 * roll.dice[index],
-            Threes => 3 * roll.dice[index],
-            Fours => 4 * roll.dice[index],
-            Fives => 5 * roll.dice[index],
-            Sixes => 6 * roll.dice[index],
-            ThreeOfAKind => {
-                if roll.dice.iter().max().unwrap() >= &3 {
-                    return roll.dice.iter()
-                        .enumerate()
-                        .map(|(i, count)| count * (i as i32 + 1))
-                        .sum();
-                }
-                return 0;
-            },
-            FourOfAKind => {
-                if roll.dice.iter().max().unwrap() >= &4 {
-                    return roll.dice.iter()
-                        .enumerate()
-                        .map(|(i, count)| count * (i as i32 + 1))
-                        .sum();
-                }
-                return 0;
-            }
-            FullHouse => {
-                let counts = roll.dice.iter().collect::<HashSet<_>>();
-                if joker || (counts.contains(&3) && counts.contains(&2)) {
-                    return 25;
-                }
-                return 0;
-            }
-            SmallStraight => {
-                let runs = roll.dice.into_iter().group_by(|&die_count| die_count > &0);
-                let longest_run = runs.into_iter()
-                    .filter(|(is_positive, _)| *is_positive)
-                    .map(|(_, group)| group.collect::<Vec<_>>().len())
-                    .max().unwrap();
-
-                if joker || longest_run >= 4 {
-                    return 30;
-                }
-                return 0;
-            }
-            LargeStraight => {
-                let runs = roll.dice.iter().group_by(|&die_count| die_count > &0);
-                let longest_run = runs.into_iter()
-                    .filter(|(is_positive, _)| *is_positive)
-                    .map(|(_, group)| group.collect::<Vec<_>>().len())
-                    .max().unwrap();
-
-                if joker || longest_run >= 5 {
-                    return 40;
-                }
-                return 0;
-
-            }
-            Yahtzee => {
-                if roll.is_yahtzee() {
-                    return 50;
-                }
-                return 0;
-            },
-            Chance => roll.dice.iter()
-                .enumerate()
-                .map(|(i, count)| count * (i as i32 + 1))
-                .sum(),
-        }
-    }
-
-    
-    fn is_terminal(&self) -> bool {
-        self.entries_taken.iter().all(|&x| x)
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
-struct FullState {
-    rolls_remaining: i32,
-    dice: DiceCombination
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
-enum Fs {
-    I(FullState),
-    C(FullState)
-}
-
-struct FullStateCalculator<'a> {
-    minimal_state: &'a State,
-    minimal_state_values: &'a HashMap<State, f64>,
-    possible_rolls: &'a HashSet<DiceCombination>,
-    roll_probs: &'a Vec<HashMap<DiceCombination, f64>>,
-    full_state_values: HashMap<Fs, f64>,
-    state_builder: &'a StateBuilder
-}
-
-impl<'a> FullStateCalculator<'a> {
-    
-    
-    fn best_entry_score(&self, full_state: &FullState) -> Result<f64> {
-
-        let output = Entry::iterator()
-            .filter(|&e| self.minimal_state.is_valid(&e))                
-            .map(|&e| -> Result<_> {
-                let score = self.minimal_state.score(e, full_state.dice) as f64;
-                let child = self.state_builder.child(*self.minimal_state, e, full_state.dice);
-                let child_score = self.minimal_state_values.get(&child)?;
-                Ok(score + child_score)
-            }).collect::<Result<Vec<f64>>>()?;
-
-        let best = output.into_iter().fold(std::f64::NAN, f64::max); // Find the largest non-NaN in vector, or NaN otherwise
-        Ok(best)
-    }
-
-
-    fn average_rolled_dice_score(
-        &mut self,
-        full_state: &FullState,
-    ) -> Result<f64> {
-
-        let keeper_fs = Fs::I(*full_state);
-        let keeper = full_state.dice;
-        let dice_to_roll: i32 = DICE_TO_ROLL - (keeper.dice.iter().sum::<i32>());
-        let mut expected_value = 0.0;
-        for (keeper_roll, keeper_roll_probability) in self.roll_probs[dice_to_roll as usize].iter() {
-            let new_dice = keeper.add(keeper_roll);
-            let new_fs = Fs::C(FullState{dice: new_dice, rolls_remaining: full_state.rolls_remaining - 1});
-            let new_dice_expected_value = self.full_state_calculation(new_fs)?;
-            expected_value += new_dice_expected_value * keeper_roll_probability;
-        }
-        Ok(expected_value)
-    }
-
-    fn best_keeper_score(
-        &mut self,
-        full_state: &FullState,
-    ) -> Result<f64> {
-
-        let output = full_state.dice.possible_keepers().iter()
-            .map(|&keeper| Fs::I(FullState{dice: keeper, rolls_remaining: full_state.rolls_remaining}))
-            .map(|new_fs| -> Result<_> {
-                let score = self.full_state_calculation(new_fs)?;
-                Ok(score)
-            }).collect::<Result<Vec<f64>>>()?;
-        Ok(output.into_iter().fold(std::f64::NAN, f64::max)) // Find the largest non-NaN in vector, or NaN otherwise
-    }
-
-    fn full_state_calculation(&mut self, full_state: Fs) -> Result<f64> {
-
-        if self.minimal_state.is_terminal() {
-            return Ok(0.0);
-        }
-
-        match full_state {
-            Fs::C(ref s)
-                if s.rolls_remaining == 0
-                => {
-                    if !self.full_state_values.contains_key(&full_state) {
-                        let score = self.best_entry_score(s)?;
-                        self.full_state_values.insert(full_state, score);
-                    }
-                    return Ok(*self.full_state_values.get(&full_state).unwrap());
-                },
-            Fs::I(ref s) => {
-                if !self.full_state_values.contains_key(&full_state) {
-                    let score = self.average_rolled_dice_score(s)?;
-                    self.full_state_values.insert(full_state, score);
-                }
-                return Ok(*self.full_state_values.get(&full_state).unwrap());
-            },
-            Fs::C(ref s) => {
-                if !self.full_state_values.contains_key(&full_state) {
-                    let score = self.best_keeper_score(s)?;
-                    self.full_state_values.insert(full_state, score);
-                }
-                return Ok(*self.full_state_values.get(&full_state)?);
-            },            
-        }
-    }
-}
-    
-
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
-struct DiceCombination {
-    dice: [i32; DICE_SIDES as usize],
-}
-
-impl DiceCombination {
-
-    fn new() -> DiceCombination {
-
-        DiceCombination {
-            dice: [0; DICE_SIDES as usize],
-        }
-    }
-
-    fn from_permutation(permutation: Vec<i32>) -> DiceCombination {
-        let mut combination = [0; DICE_SIDES as usize];
-        for die in permutation {
-            let index: usize = die as usize;
-            let count = combination[index];
-            combination[index] = count + 1;
-        }
-        
-        DiceCombination {
-            dice: combination,
-        }
-    }
-
-    fn probabilities(
-        dice_number: i32
-    ) -> HashMap<DiceCombination, f64> {
-
-        // Special case to handle the ability to "roll" 0 dice.
-        if dice_number == 0 {
-            let mut probabilities = HashMap::new();
-            probabilities.insert(DiceCombination::new(), 1.0);
-            return probabilities;
-        }
-
-        let divisor = (DICE_SIDES as f64).powf(dice_number as f64);
-        let mut probabilities = HashMap::new();
-
-        let permutation_it = (0..dice_number)
-            .map(|_| 0..(DICE_SIDES as i32))
-            .multi_cartesian_product();
-
-        for permutation in permutation_it {
-            let combination = DiceCombination::from_permutation(permutation);
-                
-            let probability = probabilities
-                .entry(combination)
-                .or_insert(0.0);
-
-            *probability += 1.0 / divisor;
-        }
-        probabilities
-    }
-
-    fn is_yahtzee(&self) -> bool {
-        self.dice.iter().max().unwrap() >= &5
-    }
-
-    fn possible_keepers(&self) -> Vec<DiceCombination> {
-        self.dice.iter()
-            .map(|i| 0..=*i)
-            .multi_cartesian_product()
-            .map(|new_counts| DiceCombination::from_vec(new_counts))
+    /// Generates a lookup from `DiceCounts` to index
+    pub fn dice_idx_lookup() -> HashMap<DiceCounts, usize> {
+        dice_combinations(NUM_DICE as u8)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, dice)| (dice, idx))
             .collect()
     }
 
-    fn add(&self, other: &DiceCombination) -> DiceCombination {
-        let mut new_dice = self.dice.clone();
-
-        for (index, count) in other.dice.iter().enumerate() {
-            new_dice[index] += count;
-        }
-
-        DiceCombination {
-            dice: new_dice,
-        }
+    pub fn idx_dice_lookup() -> HashMap<usize, DiceCounts> {
+        dice_combinations(NUM_DICE as u8)
+            .into_iter()
+            .enumerate()
+            .collect()
     }
 
+    /// Creates a vector specifying which `DiceCounts` are Yahtzees
+    /// If it is a Yahtzee, specify the kind (ones, twos, etc)
+    pub fn yahtzee_dice() -> Vec<Option<EntryAction>> {
+        let mut yahtzees = vec![None; NUM_DICE_COMBINATIONS as usize];
+        let dice_lookup = dice_idx_lookup();
 
-    fn from_vec(vec_counts: Vec<i32>) -> DiceCombination {
-        let mut counts = [0; DICE_SIDES as usize];
+        yahtzees[dice_lookup[&DiceCounts([5, 0, 0, 0, 0, 0])]] = Some(EntryAction::ONE);
+        yahtzees[dice_lookup[&DiceCounts([0, 5, 0, 0, 0, 0])]] = Some(EntryAction::TWO);
+        yahtzees[dice_lookup[&DiceCounts([0, 0, 5, 0, 0, 0])]] = Some(EntryAction::THREE);
+        yahtzees[dice_lookup[&DiceCounts([0, 0, 0, 5, 0, 0])]] = Some(EntryAction::FOUR);
+        yahtzees[dice_lookup[&DiceCounts([0, 0, 0, 0, 5, 0])]] = Some(EntryAction::FIVE);
+        yahtzees[dice_lookup[&DiceCounts([0, 0, 0, 0, 0, 5])]] = Some(EntryAction::SIX);
 
-        for (index, count) in vec_counts.iter().enumerate() {
-            counts[index] = *count;
+        yahtzees
+    }
+
+    pub fn dice_and_entry_scores() -> Array2<u8> {
+        let shape = (NUM_ENTRY_ACTIONS as usize, NUM_DICE_COMBINATIONS as usize);
+        let mut scores = Array2::zeros(shape);
+
+        let dice_combinations = dice_combinations(NUM_DICE);
+
+        for (dice_idx, dice) in dice_combinations.into_iter().enumerate() {
+            let dice = dice.0;
+            let small_straight = dice[..4].iter().all(|&x| x > 0)
+                || dice[1..5].iter().all(|&x| x > 0)
+                || dice[2..6].iter().all(|&x| x > 0);
+            for (action_idx, &action) in ENTRY_ACTIONS.iter().enumerate() {
+                let score = match action {
+                    EntryAction::ONE => dice[0],
+                    EntryAction::TWO => 2 * dice[1],
+                    EntryAction::THREE => 3 * dice[2],
+                    EntryAction::FOUR => 4 * dice[3],
+                    EntryAction::FIVE => 5 * dice[4],
+                    EntryAction::SIX => 6 * dice[5],
+                    EntryAction::THREE_OF_A_KIND if *dice.iter().max().unwrap() >= 3_u8 => dice
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, count)| count * (idx as u8 + 1))
+                        .sum::<u8>(),
+                    EntryAction::FOUR_OF_A_KIND if *dice.iter().max().unwrap() >= 4_u8 => dice
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, count)| count * (idx as u8 + 1))
+                        .sum::<u8>(),
+                    EntryAction::FULL_HOUSE
+                        if *dice.iter().max().unwrap() == 3_u8
+                            && *dice.iter().filter(|&&i| i != 3_u8).max().unwrap() == 2_u8 =>
+                    {
+                        25
+                    }
+                    EntryAction::SMALL_STRAIGHT if small_straight => 30,
+                    EntryAction::LARGE_STRAIGHT
+                        if dice == [1, 1, 1, 1, 1, 0] || dice == [0, 1, 1, 1, 1, 1] =>
+                    {
+                        40
+                    }
+                    EntryAction::YAHTZEE if *dice.iter().max().unwrap() == 5_u8 => 50,
+                    EntryAction::CHANCE => dice
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, count)| count * (idx as u8 + 1))
+                        .sum::<u8>(),
+                    _ => 0,
+                };
+                scores[(action_idx, dice_idx)] = score;
+            }
+        }
+        scores
+    }
+    // Matrix of 252x462 of allowed keepers from each dice roll
+    pub fn dice_to_keepers() -> Array2<f32> {
+        let shape = (NUM_DICE_COMBINATIONS as usize, NUM_KEEPERS as usize);
+        let mut dice_to_keepers: Array2<f32> = Array2::ones(shape);
+
+        let dice: Vec<DiceCounts> = dice_combinations(NUM_DICE);
+        let keepers: Vec<DiceCounts> = (0..=5).flat_map(dice_combinations).collect();
+
+        for (dice_idx, dice) in dice.iter().enumerate() {
+            for (keeper_idx, keeper) in keepers.iter().enumerate() {
+                for (die_count, keeper_die_count) in dice.0.iter().zip(keeper.0.iter()) {
+                    // Invalid action - cannot legitimately have keeper
+                    // if count is greater than the dice roll
+                    if keeper_die_count > die_count {
+                        dice_to_keepers[(dice_idx, keeper_idx)] = 0_f32;
+                    }
+                }
+            }
+        }
+        dice_to_keepers
+    }
+
+    // Matrix of 462x252 of transition probabilities from Keepers to Dice
+    pub fn keepers_to_dice() -> Array2<f32> {
+        let dice_idx_lookup: HashMap<DiceCounts, usize> = dice_combinations(NUM_DICE)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, dice)| (dice, idx))
+            .collect();
+
+        let shape = (NUM_KEEPERS as usize, NUM_DICE_COMBINATIONS as usize);
+        let mut keepers_to_dice = Array2::zeros(shape);
+
+        // all possible dice combinations, from 0 dice to 5 dice
+        let keepers = (0..=NUM_DICE).flat_map(dice_combinations);
+
+        for (keeper_idx, keeper) in keepers.enumerate() {
+            let num_keeper_dice = keeper.0.iter().sum::<u8>();
+            let num_remaining_dice = 5_u8 - num_keeper_dice;
+
+            for mut roll in dice_combinations(num_remaining_dice) {
+                let roll_probability = dice_probability(&roll);
+                // merge keeper with thrown roll
+                for die_idx in 0..keeper.0.len() {
+                    roll.0[die_idx] += keeper.0[die_idx];
+                }
+                let dice_idx = dice_idx_lookup[&roll];
+                keepers_to_dice[(keeper_idx, dice_idx)] = roll_probability;
+            }
         }
 
-        DiceCombination {dice: counts }
-
+        keepers_to_dice
     }
-    
+
+    // Odds of rolling a particular dice combination
+    // Can be computed from the values themselves - no need to consider permutations
+    // Ignore clippy warnings because we know these values (explain better here)
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn dice_probability(dice: &DiceCounts) -> f32 {
+        let total_dice: u8 = dice.0.iter().sum();
+        let mut permutations_num = 1;
+        let mut remaining_dice = total_dice;
+        for &count in &dice.0 {
+            permutations_num *= choose(remaining_dice as usize, count as usize);
+            remaining_dice -= count;
+        }
+
+        let total_permutations = f32::from(NUM_DICE_FACES).powi(i32::from(total_dice));
+        (permutations_num as f32) / total_permutations
+    }
+
+    // C(n, k) - does not need to be any more efficient than this
+    fn choose(n: usize, k: usize) -> usize {
+        let mut answer = 1;
+        for num in (k + 1)..=n {
+            answer *= num;
+        }
+
+        for num in 1..=(n - k) {
+            answer /= num;
+        }
+        answer
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_dice_combinations() {
+            let dice_combinations = dice_combinations(NUM_DICE);
+            assert_eq!(dice_combinations.len(), NUM_DICE_COMBINATIONS as usize);
+        }
+
+        #[test]
+        fn test_yahtzee_dice() {
+            let yahtzee_dice = yahtzee_dice();
+
+            assert_eq!(yahtzee_dice.len(), NUM_DICE_COMBINATIONS as usize);
+
+            assert_eq!(
+                yahtzee_dice.iter().filter(|d| d.is_some()).count(),
+                NUM_DICE_FACES as usize
+            );
+
+            let expected = vec![
+                ([5, 0, 0, 0, 0, 0], EntryAction::ONE),
+                ([0, 5, 0, 0, 0, 0], EntryAction::TWO),
+                ([0, 0, 5, 0, 0, 0], EntryAction::THREE),
+                ([0, 0, 0, 5, 0, 0], EntryAction::FOUR),
+                ([0, 0, 0, 0, 5, 0], EntryAction::FIVE),
+                ([0, 0, 0, 0, 0, 5], EntryAction::SIX),
+            ];
+
+            for (dice, value) in expected.into_iter() {
+                let idx = DICE_IDX_LOOKUP[&DiceCounts(dice)];
+                assert_eq!(yahtzee_dice[idx], Some(value));
+            }
+        }
+    }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
-pub enum Entry {
-    Ones,
-    Twos,
-    Threes,
-    Fours,
-    Fives,
-    Sixes,    
-    ThreeOfAKind,
-    FourOfAKind,
-    FullHouse,
-    SmallStraight,
-    LargeStraight,
-    Yahtzee,
-    Chance
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scores {
+    pub state_scores: Array1<f32>,
 }
 
-impl Entry {
+impl Default for Scores {
+    fn default() -> Scores {
+        let state_scores = Array1::zeros(NUM_STATES as usize);
 
-    fn iterator() -> Iter<'static, Entry> {
-        static ENTRIES: [Entry;  13] = [
-            Ones,
-            Twos,
-            Threes,
-            Fours,
-            Fives,
-            Sixes,    
-            ThreeOfAKind,
-            FourOfAKind,
-            FullHouse,
-            SmallStraight,
-            LargeStraight,
-            Yahtzee,
-            Chance
-        ];
-        ENTRIES.into_iter()
+        Scores { state_scores }
+    }
+}
+
+impl Scores {
+    pub fn new() -> Scores {
+        Scores::default()
     }
 
+    pub fn build(&mut self) {
+        let valid_states = self.valid_states();
+
+        // We go level-by-level, bottom to top, for correctness when multiprocessing
+        for level in (0..NUM_ENTRY_ACTIONS).rev() {
+            let mut new_scores = vec![0_f32; NUM_STATES as usize];
+
+            new_scores
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(state_idx, score)| {
+                    let state: State = state_idx.into();
+                    let state_level = state.level();
+                    if valid_states[state_idx] && state_level == level as usize {
+                        *score = self.widget(state);
+                    }
+                });
+
+            // write this level's scores
+            for (score_idx, score) in new_scores.into_iter().enumerate() {
+                if score > 0_f32 {
+                    self.state_scores[score_idx] = score;
+                }
+            }
+        }
+    }
+
+    // Todo. Required for basic library functionality.
+    pub fn values(&self, _state: State) -> ExpectedValues {
+        ExpectedValues {
+            entry_actions: Vec::new(),
+            third_dice: Vec::new(),
+            second_keepers: Vec::new(),
+            second_dice: Vec::new(),
+            first_keepers: Vec::new(),
+            first_dice: Vec::new(),
+            value: 0_f32,
+        }
+    }
+
+    pub fn widget(&self, state: State) -> f32 {
+        // values of each entry for each final dice roll
+        let entry_scores = Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
+            let action = EntryAction::from_bits(1 << action_idx).unwrap();
+            if state.is_valid_action(action) {
+                let (score, child) = state.score_and_child(action, dice_idx as u8);
+                let child_idx: usize = child.into();
+                score + self.state_scores[child_idx]
+            } else {
+                0_f32
+            }
+        });
+        // value of each final dice roll
+        let max_action_values =
+            entry_scores.fold_axis(Axis(0), 0_f32, |acc, value| acc.max(*value));
+
+        let mut avg_action_values: Array1<f32> = Array1::zeros(462);
+
+        Zip::from(&mut avg_action_values)
+            .and(KEEPERS_TO_DICE_PROBABILITIES.genrows())
+            .apply(|avg, act| {
+                *avg = (&act * &max_action_values).sum();
+            });
+
+        let mut dice_values: Array1<f32> = Array1::zeros(252);
+        Zip::from(&mut dice_values)
+            .and(DICE_TO_ALLOWED_KEEPERS.genrows())
+            .apply(|val, dice_to_action| {
+                *val =
+                    (&dice_to_action * &avg_action_values).fold(0_f32, |acc, elem| acc.max(*elem));
+            });
+
+        Zip::from(&mut avg_action_values)
+            .and(KEEPERS_TO_DICE_PROBABILITIES.genrows())
+            .apply(|avg, act| {
+                *avg = (&act * &dice_values).sum();
+            });
+
+        Zip::from(&mut dice_values)
+            .and(DICE_TO_ALLOWED_KEEPERS.genrows())
+            .apply(|val, dice_to_action| {
+                *val =
+                    (&dice_to_action * &avg_action_values).fold(0_f32, |acc, elem| acc.max(*elem));
+            });
+
+        let first_roll = KEEPERS_TO_DICE_PROBABILITIES.index_axis(Axis(0), 0);
+        first_roll.dot(&dice_values)
+    }
+
+    // this can be rewritten as merely iterating in order over states
+    // no queue or stack required
+    fn valid_states(&self) -> Vec<bool> {
+        let mut valid_markers = vec![false; NUM_STATES as usize];
+        let default_idx: usize = State::default().into();
+        valid_markers[default_idx] = true;
+
+        for state_idx in 0..(NUM_STATES as usize) {
+            let elem: State = state_idx.into();
+            if valid_markers[state_idx] {
+                for &action in &ENTRY_ACTIONS {
+                    if elem.is_valid_action(action) {
+                        for dice_idx in 0..NUM_DICE_COMBINATIONS {
+                            let child = elem.child(action, dice_idx);
+                            let idx: usize = child.into();
+                            valid_markers[idx] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        valid_markers
+    }
+}
+
+bitflags! {
+    pub struct EntryAction: u16 {
+        const ONE             = 1;
+        const TWO             = 1 << 1;
+        const THREE           = 1 << 2;
+        const FOUR            = 1 << 3;
+        const FIVE            = 1 << 4;
+        const SIX             = 1 << 5;
+        const THREE_OF_A_KIND = 1 << 6;
+        const FOUR_OF_A_KIND  = 1 << 7;
+        const FULL_HOUSE      = 1 << 8;
+        const SMALL_STRAIGHT  = 1 << 9;
+        const LARGE_STRAIGHT  = 1 << 10;
+        const YAHTZEE         = 1 << 11;
+        const CHANCE          = 1 << 12;
+    }
+}
+
+impl EntryAction {
+    pub fn as_idx(self) -> usize {
+        let mut idx = 0;
+        let mut value = self.bits();
+        while value > 1 {
+            value >>= 1;
+            idx += 1;
+        }
+        idx
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct State {
+    entries: EntryAction,
+    yahtzee_bonus_eligible: bool,
+    upper_score_remaining: u8,
+}
+
+impl Default for State {
+    fn default() -> State {
+        State {
+            entries: EntryAction::empty(),
+            yahtzee_bonus_eligible: false,
+            upper_score_remaining: 63,
+        }
+    }
+}
+
+impl From<usize> for State {
+    fn from(value: usize) -> Self {
+        let value = value.min(NUM_STATES as usize - 1);
+        State {
+            entries: EntryAction::from_bits((value >> 7) as u16).unwrap(),
+            yahtzee_bonus_eligible: (value >> 6) & 1 == 1,
+            upper_score_remaining: (value & 0b111_111) as u8,
+        }
+    }
+}
+
+impl From<State> for usize {
+    fn from(value: State) -> usize {
+        let mut result = (value.entries.bits() as usize) << 7;
+        if value.yahtzee_bonus_eligible {
+            result |= 1 << 6;
+        }
+        result |= value.upper_score_remaining as usize;
+        result as usize
+    }
+}
+
+impl State {
+    pub fn level(self) -> usize {
+        self.entries.bits().count_ones() as usize
+    }
+    pub fn child(self, action: EntryAction, dice_idx: u8) -> State {
+        let mut child = self;
+
+        // set action
+        child.entries |= action;
+
+        // set upper score
+        let upper_actions = EntryAction::ONE
+            | EntryAction::TWO
+            | EntryAction::THREE
+            | EntryAction::FOUR
+            | EntryAction::FIVE
+            | EntryAction::SIX;
+
+        if upper_actions.contains(action) {
+            let score = DICE_AND_ENTRY_SCORES[(action.as_idx(), dice_idx as usize)];
+            child.upper_score_remaining = child.upper_score_remaining.saturating_sub(score as u8);
+        }
+
+        // set yahtzee eligibility
+        if action == EntryAction::YAHTZEE && YAHTZEE_DICE[dice_idx as usize].is_some() {
+            child.yahtzee_bonus_eligible = true;
+        }
+        child
+    }
+
+    pub fn score_and_child(self, action_idx: EntryAction, dice_idx: u8) -> (f32, State) {
+        let child = self.child(action_idx, dice_idx);
+
+        let mut normal_score =
+            f32::from(DICE_AND_ENTRY_SCORES[(action_idx.as_idx(), dice_idx as usize)]);
+        let upper_bonus = if !self.upper_complete() && child.upper_complete() {
+            35_f32
+        } else {
+            0_f32
+        };
+
+        let yahtzee_bonus =
+            if YAHTZEE_DICE[dice_idx as usize].is_some() && self.yahtzee_bonus_eligible {
+                100_f32
+            } else {
+                0_f32
+            };
+
+        // joker rule
+        // yahtzee box filled
+        if self.entries.contains(EntryAction::YAHTZEE) {
+            // dice is yahtzee
+            if let Some(yahtzee_idx) = YAHTZEE_DICE[dice_idx as usize] {
+                // upper entry filled
+                if !self.is_valid_action(yahtzee_idx) {
+                    if action_idx == EntryAction::FULL_HOUSE {
+                        normal_score = 25_f32;
+                    } else if action_idx == EntryAction::SMALL_STRAIGHT {
+                        normal_score = 30_f32;
+                    } else if action_idx == EntryAction::LARGE_STRAIGHT {
+                        normal_score = 40_f32;
+                    }
+                }
+            }
+        }
+
+        let score = normal_score + upper_bonus + yahtzee_bonus;
+        (score, child)
+    }
+
+    fn is_valid_action(self, action_idx: EntryAction) -> bool {
+        !self.entries.contains(action_idx)
+    }
+
+    fn upper_complete(self) -> bool {
+        self.upper_score_remaining == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpectedValues {
+    entry_actions: Vec<Option<f32>>,
+    third_dice: Vec<f32>,
+    second_keepers: Vec<f32>,
+    second_dice: Vec<f32>,
+    first_keepers: Vec<f32>,
+    first_dice: Vec<f32>,
+    value: f32,
+}
+
+pub fn score() -> ExpectedValues {
+    let mut score = Scores::new();
+    score.build();
+    score.values(State::default())
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-
     #[test]
-    fn test_config_builder_upper_section_bonus_ok() {
-        let bonus = 45;
-        let config = ConfigBuilder::new()
-            .upper_section_bonus(bonus)
-            .build();
-
-        assert_eq!(config.unwrap().upper_section_bonus, bonus);
+    fn test_valid_states() {
+        let scores = Scores::new();
+        let states = scores.valid_states();
+        let num_valid = states.iter().filter(|x| **x).count();
+        assert_eq!(num_valid, NUM_VALID_STATES as usize);
     }
 
     #[test]
-    fn test_config_builder_yahtzee_bonus_ok() {
-        let bonus = 45;
-        let config = ConfigBuilder::new()
-            .yahtzee_bonus(bonus)
-            .build();
-
-        assert_eq!(config.unwrap().yahtzee_bonus, bonus);
+    fn test_expected_value() {
+        let default_idx: usize = State::default().into();
+        let mut scores = Scores::new();
+        scores.build();
+        let expected_value = scores.state_scores[default_idx];
+        assert!((expected_value - 254.5896).abs() < 0.0001);
     }
-
-    #[test]
-    fn test_config_builder_dice_to_roll_ok() {
-        let dice_to_roll = 11;
-        let config = ConfigBuilder::new()
-            .dice_to_roll(dice_to_roll)
-            .build();
-
-        assert_eq!(config.unwrap().dice_to_roll, dice_to_roll);
-    }
-
-    #[test]
-    fn test_config_builder_dice_to_roll_err() {
-        let dice_to_roll = -4;
-        let config = ConfigBuilder::new()
-            .dice_to_roll(dice_to_roll)
-            .build();
-
-        assert_eq!(config.expect_err(""), YahtzeeError::BadConfig);
-    }
-
-    #[test]
-    fn test_config_builder_dice_sides_ok() {
-        let dice_sides = 11;
-        let config = ConfigBuilder::new()
-            .dice_sides(dice_sides)
-            .build();
-
-        assert_eq!(config.unwrap().dice_sides, dice_sides);
-    }
-
-    #[test]
-    fn test_config_builder_dice_sides_err() {
-        let dice_sides = 0;
-        let config = ConfigBuilder::new()
-            .dice_sides(dice_sides)
-            .build();
-
-        assert_eq!(config.expect_err(""), YahtzeeError::BadConfig);
-    }
-        
-    #[test]
-    fn test_roll_probabilities_empty_roll() {
-        let empty_roll = DiceCombination::new();
-        let actual = DiceCombination::probabilities(0);
-
-        assert!(actual.contains_key(&empty_roll));
-
-        let expected_prob = 1.0;
-        assert_eq!(actual.get(&empty_roll).unwrap(), &expected_prob);
-    }
-
-    #[test]
-    fn test_roll_probabilities_correct() {
-        let probabilities = DiceCombination::probabilities(5);
-
-        let actual_dice_combinations = probabilities.len();
-        let expected_dice_combinations = 252;
-        assert_eq!(actual_dice_combinations, expected_dice_combinations);
-        
-        let total_prob: f64 = probabilities.values().into_iter().sum();
-        let abs_difference = (total_prob - 1.0).abs();
-        let tolerance = 0.0000001;
-        assert!(abs_difference < tolerance);
-    }
-
-    #[test]
-    fn test_correct_children() {
-        let state_builder =StateBuilder::new(ConfigBuilder::default());
-        let mut starting_state = State::default();
-        for i in 0..5 {
-            starting_state.entries_taken[i] = true;
-        }
-        let children = state_builder.children(starting_state);
-
-        assert_eq!(1344, children.len());
-    }
-
-    #[bench]
-    fn bench_full_state(b: &mut Bencher) {
-        let mut action_scores = ActionScores::new(ConfigBuilder::default());
-        let mut starting_state = State::default();
-        
-        for i in 1..13 {
-            starting_state.entries_taken[i] = true;
-        }
-        
-        action_scores.init_from_state(starting_state);
-
-        b.iter(|| {
-            action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, starting_state)
-        })
-    }
-
-    
-    #[test]
-    fn test_state_value() {
-        let mut action_scores = ActionScores::new(ConfigBuilder::default());
-        let mut starting_state = State::default();
-        for i in 1..10 {
-            starting_state.entries_taken[i] = true;
-        }
-        action_scores.init_from_state(starting_state);
-        let actual_value = action_scores.value_of_state(starting_state).unwrap();
-        let expected_value = 55.581619_f64;
-        let abs_difference = (actual_value - expected_value).abs();
-        let tolerance = 0.00001;
-        assert!(abs_difference < tolerance);
-    }
-
-    #[test]
-    fn test_state_value_bad() {
-        let mut action_scores = ActionScores::new(ConfigBuilder::default());
-        let mut starting_state = State::default();
-        for i in 1..10 {
-            starting_state.entries_taken[i] = true;
-        }
-        action_scores.init_from_state(starting_state);
-        let result = action_scores.value_of_state(State::default());
-        match result {
-            Err(YahtzeeError::MissingState(_)) => {},
-            _ => assert!(false),
-        }
-    }
-
-    
-    #[test]
-    fn test_entry_value() {
-        let mut action_scores = ActionScores::new(ConfigBuilder::default());
-        let mut starting_state = State::default();
-        for i in 2..10 {
-            starting_state.entries_taken[i] = true;
-        }
-        action_scores.init_from_state(starting_state);
-        let actual_value = action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, starting_state).unwrap();
-        let expected_value = 72.42314_f64;
-        let abs_difference = (actual_value - expected_value).abs();
-        let tolerance = 0.00001;
-        assert!(abs_difference < tolerance);
-    }
-
-
-    #[test]
-    fn test_entry_value_bad() {
-        let mut action_scores = ActionScores::new(ConfigBuilder::default());
-        let mut starting_state = State::default();
-        for i in 2..10 {
-            starting_state.entries_taken[i] = true;
-        }
-        action_scores.init_from_state(starting_state);
-        let result = action_scores.value_of_keepers(vec!(0, 4, 0, 0, 0, 0), 1, State::default());
-        match result {
-            Err(YahtzeeError::MissingState(_)) => {},
-            _ => assert!(false),
-        }
-    }
-    
 }
-
-
-
-
