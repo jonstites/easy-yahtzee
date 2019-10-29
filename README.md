@@ -1,6 +1,6 @@
 # Easy Yahtzee
 
-[![Build Status](https://travis-ci.com/jonstites/sir-rolls-a-lot.svg?branch=master)](https://travis-ci.com/jonstites/sir-rolls-a-lot)
+[![Build Status](https://travis-ci.com/jonstites/easy-yahtzee.svg?branch=master)](https://travis-ci.com/jonstites/easy-yahtzee)
 
 
 Topics: dynamic programming, graphs, combinatorics, probability, linear algebra, benchmarking, Rust, safe concurrency, web assembly...
