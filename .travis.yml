@@ -9,5 +9,4 @@ rust:
 
 script:
   - cargo build --verbose
-  - cargo test --verbose
-  - if [[ "$TRAVIS_RUST_VERSION" = "stable" ]]; then rustup component add clippy && cargo clippy -- -D warnings; fi
+  - travis_wait cargo test --verbose
