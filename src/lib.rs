@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::convert::From;
+use std::fmt;
+use std::fmt::Display;
 
 extern crate ndarray;
 extern crate rayon;
@@ -7,6 +9,7 @@ extern crate rayon;
 use ndarray::prelude::*;
 use ndarray::Zip;
 use rayon::prelude::*;
+use serde::{Serialize, Deserialize};
 
 #[macro_use]
 extern crate lazy_static;
@@ -53,13 +56,30 @@ pub const ENTRY_ACTIONS: [EntryAction; 13] = [
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DiceCounts([u8; NUM_DICE_FACES as usize]);
+pub struct DiceCounts(pub [u8; NUM_DICE_FACES as usize]);
+
+impl Display for DiceCounts {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut dice = Vec::new();
+        for (idx, &count) in self.0.iter().enumerate() {
+            for _i in 0..count {
+                dice.push((1+idx).to_string());
+            }
+        }
+        while dice.len() < 5 {
+            dice.push("-".to_string());
+        }
+        write!(f, "{}", dice.join(" "))
+    }
+}
 
 lazy_static! {
     // Global static variables. Initialize once, read-only from anywhere.
     static ref YAHTZEE_DICE: Vec<Option<EntryAction>> = math::yahtzee_dice();
     static ref DICE_IDX_LOOKUP: HashMap<DiceCounts, usize> = math::dice_idx_lookup();
+    static ref KEEPER_IDX_LOOKUP: HashMap<DiceCounts, usize> = math::keepers_idx_lookup();
     static ref IDX_DICE_LOOKUP: HashMap<usize, DiceCounts> = math::idx_dice_lookup();
+    static ref IDX_KEEPERS_LOOKUP: HashMap<usize, DiceCounts> = math::idx_keepers_lookup();
     static ref DICE_AND_ENTRY_SCORES: Array2<u8> = math::dice_and_entry_scores();
     static ref DICE_TO_ALLOWED_KEEPERS: Array2<f32> = math::dice_to_keepers();
     static ref KEEPERS_TO_DICE_PROBABILITIES: Array2<f32> = math::keepers_to_dice();
@@ -127,8 +147,22 @@ mod math {
             .collect()
     }
 
+    /// Generates a lookup from `DiceCounts` to index, for keepers
+    pub fn keepers_idx_lookup() -> HashMap<DiceCounts, usize> {
+        (0..=5).flat_map(dice_combinations)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, dice)| (dice, idx))
+            .collect()
+    }
     pub fn idx_dice_lookup() -> HashMap<usize, DiceCounts> {
         dice_combinations(NUM_DICE as u8)
+            .into_iter()
+            .enumerate()
+            .collect()
+    }
+    pub fn idx_keepers_lookup() -> HashMap<usize, DiceCounts> {
+        (0..=5).flat_map(dice_combinations)
             .into_iter()
             .enumerate()
             .collect()
@@ -150,6 +184,7 @@ mod math {
         yahtzees
     }
 
+    
     pub fn dice_and_entry_scores() -> Array2<u8> {
         let shape = (NUM_ENTRY_ACTIONS as usize, NUM_DICE_COMBINATIONS as usize);
         let mut scores = Array2::zeros(shape);
@@ -326,7 +361,8 @@ mod math {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scores {
     state_scores: Array1<f32>,
     valid_states: Box<[bool]>,
@@ -343,33 +379,6 @@ impl Scores {
         scores.set_valid_states();
         scores.set_scores();
         scores
-    }
-
-    pub fn entry_scores(&self, state: State, dice: &DiceCounts) -> Option<Box<[f32]>> {
-        if self.valid_state(state) {
-            if let Some(&dice_idx) = DICE_IDX_LOOKUP.get(dice) {
-                let scores = self.values(state);
-                let entries: Vec<f32> = scores
-                    .entry_actions
-                    .column(dice_idx)
-                    .iter()
-                    .cloned()
-                    .collect();
-                Some(entries.into_boxed_slice())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    pub fn second_keepers_scores(&self, state: State, dice: &DiceCounts) -> Option<Box<[f32]>> {
-        None
-    }
-
-    pub fn first_keepers_scores(&self, state: State, dice: &DiceCounts) -> Option<Box<[f32]>> {
-        None
     }
 
     fn set_scores(&mut self) {
@@ -397,8 +406,10 @@ impl Scores {
         }
     }
 
+   
     pub fn values(&self, state: State) -> ExpectedValues {
         let mut expected_values = ExpectedValues::default();
+        expected_values.state = state;
 
         // values of each entry for each final dice roll
         let entry_actions = Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
@@ -426,6 +437,7 @@ impl Scores {
             .apply(|avg, act| {
                 *avg = (&act * &third_dice).sum();
             });
+        expected_values.second_keepers = second_keepers.clone();
 
         let mut second_dice = third_dice;
         Zip::from(&mut second_dice)
@@ -490,6 +502,7 @@ impl Scores {
 }
 
 bitflags! {
+    #[derive(Default)]
     pub struct EntryAction: u16 {
         const ONE             = 1;
         const TWO             = 1 << 1;
@@ -521,9 +534,9 @@ impl EntryAction {
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct State {
-    entries: EntryAction,
-    yahtzee_bonus_eligible: bool,
-    upper_score_remaining: u8,
+    pub entries: EntryAction,
+    pub yahtzee_bonus_eligible: bool,
+    pub upper_score_remaining: u8,
 }
 
 impl Default for State {
@@ -646,7 +659,8 @@ pub struct ExpectedValues {
     second_dice: Array1<f32>,
     first_keepers: Array1<f32>,
     first_dice: Array1<f32>,
-    value: f32,
+    pub value: f32,
+    state: State,
 }
 
 impl Default for ExpectedValues {
@@ -659,13 +673,53 @@ impl Default for ExpectedValues {
             first_keepers: Array1::zeros(0),
             first_dice: Array1::zeros(0),
             value: 0_f32,
+            state: State::default(),
         }
     }
 }
 
-pub fn score() -> ExpectedValues {
-    let score = Scores::new();
-    score.values(State::default())
+impl ExpectedValues {
+
+    pub fn first_keepers_score(&self, dice: DiceCounts) -> Vec<(DiceCounts, f32)> {
+        let mut result = Vec::new();
+        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        
+        for keeper_idx in 0..(NUM_KEEPERS as usize) {
+            if DICE_TO_ALLOWED_KEEPERS[(dice_idx, keeper_idx)] > 0.0 {
+                result.push((IDX_KEEPERS_LOOKUP.get(&keeper_idx).unwrap().clone(), self.first_keepers[keeper_idx]))
+            }
+        }
+        
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result
+    }
+
+    pub fn second_keepers_score(&self, dice: DiceCounts) -> Vec<(DiceCounts, f32)> {
+        let mut result = Vec::new();
+        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        
+        for keeper_idx in 0..(NUM_KEEPERS as usize) {
+            if DICE_TO_ALLOWED_KEEPERS[(dice_idx, keeper_idx)] > 0.0 {
+                let keeper = IDX_KEEPERS_LOOKUP.get(&keeper_idx).unwrap().clone();
+                result.push((keeper, self.second_keepers[keeper_idx]));
+            }
+        }
+        
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result
+    }
+
+    pub fn entries_score(&self, dice: DiceCounts) -> Vec<(EntryAction, f32)> {
+        let mut result = Vec::new();
+        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        for (action_idx, &action) in ENTRY_ACTIONS.iter().enumerate() {
+            if self.state.is_valid_action(action) {
+                result.push((action, self.entry_actions[(action_idx, dice_idx)]));
+            }
+        }
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result
+    }    
 }
 
 #[cfg(test)]
@@ -675,16 +729,14 @@ mod tests {
     #[test]
     fn test_valid_states() {
         let scores = Scores::new();
-        let states = scores.valid_states();
-        let num_valid = states.iter().filter(|x| **x).count();
+        let num_valid = scores.valid_states.iter().filter(|x| **x).count();
         assert_eq!(num_valid, NUM_VALID_STATES as usize);
     }
 
     #[test]
     fn test_expected_value() {
         let default_idx: usize = State::default().into();
-        let mut scores = Scores::new();
-        scores.build();
+        let scores = Scores::new();
         let expected_value = scores.state_scores[default_idx];
         assert!((expected_value - 254.5896).abs() < 0.0001);
     }
