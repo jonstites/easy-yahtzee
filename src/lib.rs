@@ -9,7 +9,7 @@ extern crate rayon;
 use ndarray::prelude::*;
 use ndarray::Zip;
 use rayon::prelude::*;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[macro_use]
 extern crate lazy_static;
@@ -63,7 +63,7 @@ impl Display for DiceCounts {
         let mut dice = Vec::new();
         for (idx, &count) in self.0.iter().enumerate() {
             for _i in 0..count {
-                dice.push((1+idx).to_string());
+                dice.push((1 + idx).to_string());
             }
         }
         while dice.len() < 5 {
@@ -149,7 +149,8 @@ mod math {
 
     /// Generates a lookup from `DiceCounts` to index, for keepers
     pub fn keepers_idx_lookup() -> HashMap<DiceCounts, usize> {
-        (0..=5).flat_map(dice_combinations)
+        (0..=5)
+            .flat_map(dice_combinations)
             .into_iter()
             .enumerate()
             .map(|(idx, dice)| (dice, idx))
@@ -162,7 +163,8 @@ mod math {
             .collect()
     }
     pub fn idx_keepers_lookup() -> HashMap<usize, DiceCounts> {
-        (0..=5).flat_map(dice_combinations)
+        (0..=5)
+            .flat_map(dice_combinations)
             .into_iter()
             .enumerate()
             .collect()
@@ -184,7 +186,6 @@ mod math {
         yahtzees
     }
 
-    
     pub fn dice_and_entry_scores() -> Array2<u8> {
         let shape = (NUM_ENTRY_ACTIONS as usize, NUM_DICE_COMBINATIONS as usize);
         let mut scores = Array2::zeros(shape);
@@ -361,7 +362,6 @@ mod math {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scores {
     state_scores: Array1<f32>,
@@ -406,7 +406,6 @@ impl Scores {
         }
     }
 
-   
     pub fn values(&self, state: State) -> ExpectedValues {
         let mut expected_values = ExpectedValues::default();
         expected_values.state = state;
@@ -679,17 +678,19 @@ impl Default for ExpectedValues {
 }
 
 impl ExpectedValues {
-
     pub fn first_keepers_score(&self, dice: DiceCounts) -> Vec<(DiceCounts, f32)> {
         let mut result = Vec::new();
         let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
-        
+
         for keeper_idx in 0..(NUM_KEEPERS as usize) {
             if DICE_TO_ALLOWED_KEEPERS[(dice_idx, keeper_idx)] > 0.0 {
-                result.push((IDX_KEEPERS_LOOKUP.get(&keeper_idx).unwrap().clone(), self.first_keepers[keeper_idx]))
+                result.push((
+                    IDX_KEEPERS_LOOKUP.get(&keeper_idx).unwrap().clone(),
+                    self.first_keepers[keeper_idx],
+                ))
             }
         }
-        
+
         result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         result
     }
@@ -697,14 +698,14 @@ impl ExpectedValues {
     pub fn second_keepers_score(&self, dice: DiceCounts) -> Vec<(DiceCounts, f32)> {
         let mut result = Vec::new();
         let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
-        
+
         for keeper_idx in 0..(NUM_KEEPERS as usize) {
             if DICE_TO_ALLOWED_KEEPERS[(dice_idx, keeper_idx)] > 0.0 {
                 let keeper = IDX_KEEPERS_LOOKUP.get(&keeper_idx).unwrap().clone();
                 result.push((keeper, self.second_keepers[keeper_idx]));
             }
         }
-        
+
         result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         result
     }
@@ -719,7 +720,7 @@ impl ExpectedValues {
         }
         result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         result
-    }    
+    }
 }
 
 #[cfg(test)]

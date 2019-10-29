@@ -1,58 +1,68 @@
-use optizee::{DiceCounts, Scores, State, ENTRY_ACTIONS, EntryAction};
+use easy_yahtzee::{DiceCounts, EntryAction, Scores, State, ENTRY_ACTIONS};
 
 use std::env;
 use std::fs::File;
+use std::io::prelude::*;
 use std::io::Write;
 use std::path::Path;
-use std::io::prelude::*;
 
 #[macro_use]
 extern crate clap;
-use clap::{Arg, App};
+use clap::{App, Arg};
 
 fn main() -> std::io::Result<()> {
-
     let matches = App::new("easy-yahtzee")
         .version(crate_version!())
-        .arg(Arg::with_name("output")
-            .short("o")
-            .long("output")
-            .value_name("output")
-            .help("Regenerate scores and save to file")
-            .takes_value(true))
-        .arg(Arg::with_name("input")
-            .short("i")
-            .long("input")
-            .value_name("input")
-            .help("Load scores from a file")
-            .takes_value(true))            
-        .arg(Arg::with_name("roll")
-            .short("r")
-            .long("roll")
-            .possible_values(&["1", "2", "3"])
-            .help("Which yahtzee roll are you on?")
-            .takes_value(true))
-        .arg(Arg::with_name("dice")
-            .short("d")
-            .long("dice")
-            .help("What dice did you roll?")
-            .takes_value(true)
+        .arg(
+            Arg::with_name("output")
+                .short("o")
+                .long("output")
+                .value_name("output")
+                .help("Regenerate scores and save to file")
+                .takes_value(true),
         )
-        .arg(Arg::with_name("upper_score_remaining")
-            .short("u")
-            .long("upper_score_remaining")
-            .help("Upper score remaining before bonus")
-            .takes_value(true)
+        .arg(
+            Arg::with_name("input")
+                .short("i")
+                .long("input")
+                .value_name("input")
+                .help("Load scores from a file")
+                .takes_value(true),
         )
-        .arg(Arg::with_name("yahtzee_eligible")
-            .long("yahtzee_eligible")
-            .help("Eligible for yahtzee bonus")
+        .arg(
+            Arg::with_name("roll")
+                .short("r")
+                .long("roll")
+                .possible_values(&["1", "2", "3"])
+                .help("Which yahtzee roll are you on?")
+                .takes_value(true),
         )
-        .arg(Arg::with_name("entries")
-            .long("entries")
-            .short("e")
-            .takes_value(true)
-            .help("Impossible to decipher entry bitstring"))
+        .arg(
+            Arg::with_name("dice")
+                .short("d")
+                .long("dice")
+                .help("What dice did you roll?")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("upper_score_remaining")
+                .short("u")
+                .long("upper_score_remaining")
+                .help("Upper score remaining before bonus")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("yahtzee_eligible")
+                .long("yahtzee_eligible")
+                .help("Eligible for yahtzee bonus"),
+        )
+        .arg(
+            Arg::with_name("entries")
+                .long("entries")
+                .short("e")
+                .takes_value(true)
+                .help("Impossible to decipher entry bitstring"),
+        )
         .get_matches();
 
     let scores = if let Some(input) = matches.value_of("input") {
@@ -74,9 +84,10 @@ fn main() -> std::io::Result<()> {
     }
 
     match matches.value_of("roll") {
-        Some("1") => {    
+        Some("1") => {
             let dice = parse_dice(matches.value_of("dice").expect("No dice provided"));
-            let upper_score_remaining: u8 = matches.value_of("upper_score_remaining")
+            let upper_score_remaining: u8 = matches
+                .value_of("upper_score_remaining")
                 .expect("no upper remaining specified")
                 .parse()
                 .expect("could not parse upper as u8");
@@ -85,16 +96,17 @@ fn main() -> std::io::Result<()> {
             let state = State {
                 upper_score_remaining,
                 yahtzee_bonus_eligible,
-                entries
+                entries,
             };
             let result = scores.values(state);
             for entry in result.first_keepers_score(dice) {
                 println!("{:.*}\t{}", 5, entry.1, entry.0);
             }
-        },
+        }
         Some("2") => {
             let dice = parse_dice(matches.value_of("dice").expect("No dice provided"));
-                        let upper_score_remaining: u8 = matches.value_of("upper_score_remaining")
+            let upper_score_remaining: u8 = matches
+                .value_of("upper_score_remaining")
                 .expect("no upper remaining specified")
                 .parse()
                 .expect("could not parse upper as u8");
@@ -103,16 +115,17 @@ fn main() -> std::io::Result<()> {
             let state = State {
                 upper_score_remaining,
                 yahtzee_bonus_eligible,
-                entries
+                entries,
             };
             let result = scores.values(state);
             for entry in result.second_keepers_score(dice) {
                 println!("{:.*}\t{}", 5, entry.1, entry.0);
-            }        
-        },
+            }
+        }
         Some("3") => {
             let dice = parse_dice(matches.value_of("dice").expect("No dice provided"));
-                        let upper_score_remaining: u8 = matches.value_of("upper_score_remaining")
+            let upper_score_remaining: u8 = matches
+                .value_of("upper_score_remaining")
                 .expect("no upper remaining specified")
                 .parse()
                 .expect("could not parse upper as u8");
@@ -121,13 +134,13 @@ fn main() -> std::io::Result<()> {
             let state = State {
                 upper_score_remaining,
                 yahtzee_bonus_eligible,
-                entries
+                entries,
             };
             let result = scores.values(state);
             for entry in result.entries_score(dice) {
                 println!("{:08}\t{:?}", entry.1, entry.0);
             }
-        },
+        }
         _ => (),
     };
 
@@ -135,7 +148,10 @@ fn main() -> std::io::Result<()> {
 }
 
 fn parse_dice(dice_str: &str) -> DiceCounts {
-    let dice: Vec<usize> = dice_str.split(",").map(|d| d.parse().expect("bad dice provided")).collect();
+    let dice: Vec<usize> = dice_str
+        .split(",")
+        .map(|d| d.parse().expect("bad dice provided"))
+        .collect();
 
     if dice.len() != 5 {
         panic!("Expected 5 dice, not {}", dice.len());
@@ -145,7 +161,7 @@ fn parse_dice(dice_str: &str) -> DiceCounts {
         if die > 6 || die == 0 {
             panic!("Dice out of bounds: {}", die);
         }
-        
+
         counts[die - 1] += 1;
     }
     DiceCounts(counts)
