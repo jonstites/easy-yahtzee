@@ -45,23 +45,11 @@ fn main() -> std::io::Result<()> {
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("upper_score_remaining")
-                .short("u")
-                .long("upper_score_remaining")
-                .help("Upper score remaining before bonus")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("yahtzee_eligible")
-                .long("yahtzee_eligible")
-                .help("Eligible for yahtzee bonus"),
-        )
-        .arg(
-            Arg::with_name("entries")
-                .long("entries")
-                .short("e")
+            Arg::with_name("score_sheet")
+                .long("score_sheet")
+                .short("s")
                 .takes_value(true)
-                .help("Impossible to decipher entry bitstring"),
+                .help("Yahtzee score sheet, 13 values, eg 2,0,,,,,,,,,,,"),
         )
         .get_matches();
 
@@ -83,60 +71,22 @@ fn main() -> std::io::Result<()> {
         f.write_all(&encoded[..]).unwrap();
     }
 
+    let dice = parse_dice(matches.value_of("dice").expect("No dice provided"));
+    let state = parse_score_sheet(matches.value_of("score_sheet").expect("no score sheet"));
+    let result = scores.values(state);
+    println!("{:?}", state);
     match matches.value_of("roll") {
         Some("1") => {
-            let dice = parse_dice(matches.value_of("dice").expect("No dice provided"));
-            let upper_score_remaining: u8 = matches
-                .value_of("upper_score_remaining")
-                .expect("no upper remaining specified")
-                .parse()
-                .expect("could not parse upper as u8");
-            let yahtzee_bonus_eligible: bool = matches.is_present("yahtzee_bonus_eligible");
-            let entries = parse_entries(matches.value_of("entries").expect("expected entries"));
-            let state = State {
-                upper_score_remaining,
-                yahtzee_bonus_eligible,
-                entries,
-            };
-            let result = scores.values(state);
             for entry in result.first_keepers_score(dice) {
                 println!("{:.*}\t{}", 5, entry.1, entry.0);
             }
         }
         Some("2") => {
-            let dice = parse_dice(matches.value_of("dice").expect("No dice provided"));
-            let upper_score_remaining: u8 = matches
-                .value_of("upper_score_remaining")
-                .expect("no upper remaining specified")
-                .parse()
-                .expect("could not parse upper as u8");
-            let yahtzee_bonus_eligible: bool = matches.is_present("yahtzee_bonus_eligible");
-            let entries = parse_entries(matches.value_of("entries").expect("expected entries"));
-            let state = State {
-                upper_score_remaining,
-                yahtzee_bonus_eligible,
-                entries,
-            };
-            let result = scores.values(state);
-            for entry in result.second_keepers_score(dice) {
+            for entry in result.first_keepers_score(dice) {
                 println!("{:.*}\t{}", 5, entry.1, entry.0);
             }
         }
         Some("3") => {
-            let dice = parse_dice(matches.value_of("dice").expect("No dice provided"));
-            let upper_score_remaining: u8 = matches
-                .value_of("upper_score_remaining")
-                .expect("no upper remaining specified")
-                .parse()
-                .expect("could not parse upper as u8");
-            let yahtzee_bonus_eligible: bool = matches.is_present("yahtzee_bonus_eligible");
-            let entries = parse_entries(matches.value_of("entries").expect("expected entries"));
-            let state = State {
-                upper_score_remaining,
-                yahtzee_bonus_eligible,
-                entries,
-            };
-            let result = scores.values(state);
             for entry in result.entries_score(dice) {
                 println!("{:08}\t{:?}", entry.1, entry.0);
             }
@@ -167,19 +117,29 @@ fn parse_dice(dice_str: &str) -> DiceCounts {
     DiceCounts(counts)
 }
 
-fn parse_entries(entries_str: &str) -> EntryAction {
-    let chars: Vec<char> = entries_str.chars().collect();
-    if chars.len() != 13 {
-        panic!("Expected entries length 13 not {}", chars.len());
+fn parse_score_sheet(entries_str: &str) -> State {
+    let scores: Vec<&str> = entries_str.split(',').collect();
+    let mut upper_score_remaining = 63_u8;
+    let mut entries = EntryAction::default();
+    let mut yahtzee_bonus_eligible = false;
+    for (idx, score) in scores.iter().enumerate() {
+        if score == &"" {
+            continue
+        }
+        if idx == 11 {
+            yahtzee_bonus_eligible = true;
+        }
+        entries |= ENTRY_ACTIONS[idx];
+        if idx < 6 {
+            let score = score.parse().expect("bad scoresheet");
+            upper_score_remaining = upper_score_remaining.saturating_sub(score);
+        }
+        
     }
 
-    let mut entry = EntryAction::default();
-    for idx in 0..13 {
-        match chars[idx] {
-            '0' => (),
-            '1' => entry |= ENTRY_ACTIONS[idx],
-            _ => panic!("Expected bits, not {}", chars[idx]),
-        }
+    State {
+        upper_score_remaining,
+        yahtzee_bonus_eligible,
+        entries,
     }
-    entry
 }
