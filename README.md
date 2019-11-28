@@ -3,7 +3,21 @@
 [![Build Status](https://travis-ci.com/jonstites/easy-yahtzee.svg?branch=master)](https://travis-ci.com/jonstites/easy-yahtzee)
 
 
-Topics: dynamic programming, graphs, combinatorics, probability, linear algebra, benchmarking, Rust, safe concurrency, web assembly...
+Topics: dynamic programming, graphs, combinatorics, probability, linear algebra, benchmarking, Rust, safe concurrency...
+
+## Why this project
+`easy-yahtzee` provides the ability to maximize the expected Yahtzee score.
+
+This does already exist, but I wanted to see if I could write my own.
+
+## Goals
+Really understand the problem of Yahtzee score maximization.
+
+Create the fastest Yahtzee score maximizer.
+
+Fun.
+
+Learn Rust.
 
 ## Yahtzee
 
@@ -15,11 +29,29 @@ Yahtzee is a dice-based game that contains elements of both luck and strategy.
 
 ## Literature Search
 
+[Tom Verhoeff at Eindhoven University](www-set.win.tue.nl/~wstomv/misc/yahtzee/slides-2up.pdf) seems to have been the first to solve this problem.
 
-Novel: nothing? Maybe correctness / exactness?
-Performance?
+I would love to run the code - it is open source - but it is FreePascal and I have not yet been successful in compiling it. A web front-end is available at http://www-set.win.tue.nl/~wstomv/misc/yahtzee/ .
 
-buy that Yahtzee book?
+Olaf Vancura wrote a book on it called Advantage Yahtzee but as far as I can tell, has never published any code on it.
+
+James Glenn published a [paper]() in 2006. He wrote his own code independently in Java, but it seems to be password protected.
+
+[Tim Palpant](https://github.com/timpalpant/yahtzee) wrote a version in Go that I _was_ able to run and compile. Will post the comparison eventually.
+
+Two students at KTH Royal Institute of Technology wrote a [paper](https://www.csc.kth.se/utbildning/kth/kurser/DD143X/dkand12/Group5Mikael/final/Markus_Felldin_and_Vinit_Sood.pdf) on optimal Yahtzee but did not succeed in having a correct solution.
+
+Some guy in Holland wrote one without bonuses: http://www.holderied.de/yahtzee/
+
+There's another project but it is quite different in that it simulates games instead of being exact: https://github.com/sorenchr/yahtzeebot
+
+
+## Why this project
+
+The main thing was to do it myself. Also, I wanted the code to be super easy to compile, to have the best performance, and to have a more modern interface.
+
+(So far I have not done the latter)
+
 
 ## Design
 Object: maximize expected score.
