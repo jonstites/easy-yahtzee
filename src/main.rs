@@ -8,79 +8,64 @@ use std::path::Path;
 
 #[macro_use]
 extern crate clap;
-use clap::{App, Arg};
+use clap::{App, Arg, SubCommand};
+use exitfailure::ExitFailure;
+use failure::ResultExt;
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<(), ExitFailure> {
+    
     let matches = App::new("easy-yahtzee")
         .version(crate_version!())
-        .arg(
-            Arg::with_name("output")
-                .short("o")
-                .long("output")
-                .value_name("output")
-                .help("Regenerate scores and save to file")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("input")
-                .short("i")
-                .long("input")
-                .value_name("input")
-                .help("Load scores from a file")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("roll")
-                .short("r")
-                .long("roll")
-                .possible_values(&["1", "2", "3"])
-                .help("Which yahtzee roll are you on?")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("dice")
-                .short("d")
-                .long("dice")
-                .help("What dice did you roll?")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("upper_score_remaining")
-                .short("u")
-                .long("upper_score_remaining")
-                .help("Upper score remaining before bonus")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("yahtzee_eligible")
-                .long("yahtzee_eligible")
-                .help("Eligible for yahtzee bonus"),
-        )
-        .arg(
-            Arg::with_name("entries")
-                .long("entries")
-                .short("e")
-                .takes_value(true)
-                .help("Impossible to decipher entry bitstring"),
-        )
+	.subcommand(SubCommand::with_name("save")
+		    .about("save scores to a file")
+		    .arg(
+			Arg::with_name("output")
+			    .short("o")
+			    .long("output")
+			    .value_name("output")
+			    .help("Regenerate scores and save to file")
+			    .required(true)
+			    .takes_value(true)))
+	.subcommand(SubCommand::with_name("score")
+		    .about("score different options")
+		    .arg(
+			Arg::with_name("input")
+			    .short("i")
+			    .long("input")
+			    .value_name("input")
+			    .help("Load scores from a file")
+			    .required(true)
+			    .takes_value(true)))
         .get_matches();
 
-    let scores = if let Some(input) = matches.value_of("input") {
+    if let Some(save_matches) = matches.subcommand_matches("save") {
+	let scores = Scores::new();
+	let output = save_matches.value_of("output").unwrap();
+        let dest_path = Path::new(&output);
+        let mut f = File::create(&dest_path)?;
+        let encoded: Vec<u8> = bincode::serialize(&scores)?;
+        f.write_all(&encoded[..])?;
+    } else if let Some(score_matches) = matches.subcommand_matches("score") {
+	let input = score_matches.value_of("input").unwrap();
         let scores_path = Path::new(&input);
         let mut scores_file = File::open(scores_path)?;
         let mut buffer = Vec::new();
         scores_file.read_to_end(&mut buffer)?;
-        let scores: Scores = bincode::deserialize(&buffer).unwrap();
+        let scores: Scores = bincode::deserialize(&buffer)?;
+
+	// loop through all entries, prompt for roll #
+    }
+
+    
+    Ok(())
+    /*
+    let scores = if let Some(input) = matches.value_of("input") {
         scores
     } else {
         Scores::new()
     };
 
     if let Some(output) = matches.value_of("output") {
-        let dest_path = Path::new(&output);
-        let mut f = File::create(&dest_path).unwrap();
-        let encoded: Vec<u8> = bincode::serialize(&scores).unwrap();
-        f.write_all(&encoded[..]).unwrap();
     }
 
     match matches.value_of("roll") {
@@ -181,5 +166,5 @@ fn parse_entries(entries_str: &str) -> EntryAction {
             _ => panic!("Expected bits, not {}", chars[idx]),
         }
     }
-    entry
+    entry*/
 }
