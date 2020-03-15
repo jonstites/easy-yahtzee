@@ -1,0 +1,11 @@
+html, body {
+    width: 100%;
+    background: #FAFAFA;
+    font-family: monospace;
+}
+
+.yahtzeeapp {
+    border-color: red;
+    border-width: .25em;
+    border-style: double;
+}
