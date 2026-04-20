@@ -522,6 +522,29 @@ bitflags! {
     }
 }
 
+// The set returned is state-independent: for upper categories, joker-enabled
+// values (e.g. 25 in Fives from a Yahtzee joker) are only included if they're
+// already reachable via normal scoring, so the set may not reflect every value
+// achievable under the joker rule in a given state.
+pub fn achievable_scores(entry_idx: usize) -> Vec<u8> {
+    let action = ENTRY_ACTIONS[entry_idx];
+    let row = DICE_AND_ENTRY_SCORES.row(action.as_idx());
+    let mut values: std::collections::BTreeSet<u8> = row.iter().copied().collect();
+    match action {
+        EntryAction::FULL_HOUSE => {
+            values.insert(25);
+        }
+        EntryAction::SMALL_STRAIGHT => {
+            values.insert(30);
+        }
+        EntryAction::LARGE_STRAIGHT => {
+            values.insert(40);
+        }
+        _ => {}
+    }
+    values.into_iter().collect()
+}
+
 impl EntryAction {
     pub fn as_idx(self) -> usize {
         let mut idx = 0;
@@ -602,6 +625,24 @@ impl State {
             child.yahtzee_bonus_eligible = true;
         }
         child
+    }
+
+    pub fn entry_score(self, action: EntryAction, dice: &DiceCounts) -> u8 {
+        let dice_idx = *DICE_IDX_LOOKUP.get(dice).unwrap();
+        let mut score = DICE_AND_ENTRY_SCORES[(action.as_idx(), dice_idx)];
+        if self.entries.contains(EntryAction::YAHTZEE) {
+            if let Some(yahtzee_face) = YAHTZEE_DICE[dice_idx] {
+                if self.entries.contains(yahtzee_face) {
+                    score = match action {
+                        EntryAction::FULL_HOUSE => 25,
+                        EntryAction::SMALL_STRAIGHT => 30,
+                        EntryAction::LARGE_STRAIGHT => 40,
+                        _ => score,
+                    };
+                }
+            }
+        }
+        score
     }
 
     pub fn score_and_child(self, action_idx: EntryAction, dice_idx: u8) -> (f32, State) {
@@ -711,6 +752,161 @@ impl ExpectedValues {
 
         result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         result
+    }
+
+    /// Expected points scored on this turn alone (including any +35 upper or
+    /// +100 Yahtzee bonuses earned during it), given the current dice and roll
+    /// number, assuming optimal play from here. Complements `value`, which is
+    /// the EV of all remaining points (this turn + future turns).
+    pub fn this_turn_ev(&self, dice: DiceCounts, roll: u8) -> f32 {
+        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        match roll {
+            3 => self.this_turn_roll3_dice(dice_idx),
+            2 => {
+                let k = self.best_keeper(dice_idx, &self.second_keepers);
+                self.this_turn_from_keeper_to_roll3(k)
+            }
+            1 => {
+                let k = self.best_keeper(dice_idx, &self.first_keepers);
+                self.this_turn_from_keeper_to_roll2(k)
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn this_turn_roll3_dice(&self, dice_idx: usize) -> f32 {
+        let mut best_action_idx = 0;
+        let mut best_val = f32::NEG_INFINITY;
+        for a in 0..(NUM_ENTRY_ACTIONS as usize) {
+            let v = self.entry_actions[(a, dice_idx)];
+            if v > best_val {
+                best_val = v;
+                best_action_idx = a;
+            }
+        }
+        if best_val == f32::NEG_INFINITY {
+            return 0.0;
+        }
+        self.state
+            .score_and_child(ENTRY_ACTIONS[best_action_idx], dice_idx as u8)
+            .0
+    }
+
+    fn best_keeper(&self, dice_idx: usize, keeper_values: &Array1<f32>) -> usize {
+        let mut best_k = 0;
+        let mut best_val = f32::NEG_INFINITY;
+        for k in 0..(NUM_KEEPERS as usize) {
+            if DICE_TO_ALLOWED_KEEPERS[(dice_idx, k)] > 0.0 && keeper_values[k] > best_val {
+                best_val = keeper_values[k];
+                best_k = k;
+            }
+        }
+        best_k
+    }
+
+    fn this_turn_from_keeper_to_roll3(&self, keeper_idx: usize) -> f32 {
+        let mut expected = 0.0_f32;
+        for d in 0..(NUM_DICE_COMBINATIONS as usize) {
+            let p = KEEPERS_TO_DICE_PROBABILITIES[(keeper_idx, d)];
+            if p > 0.0 {
+                expected += p * self.this_turn_roll3_dice(d);
+            }
+        }
+        expected
+    }
+
+    fn this_turn_from_keeper_to_roll2(&self, keeper_idx: usize) -> f32 {
+        let mut expected = 0.0_f32;
+        for d in 0..(NUM_DICE_COMBINATIONS as usize) {
+            let p = KEEPERS_TO_DICE_PROBABILITIES[(keeper_idx, d)];
+            if p > 0.0 {
+                let k2 = self.best_keeper(d, &self.second_keepers);
+                expected += p * self.this_turn_from_keeper_to_roll3(k2);
+            }
+        }
+        expected
+    }
+
+    /// Per-keeper `(overall_ev, this_turn_ev)` pairs for roll 1. `overall_ev`
+    /// is the EV of playing the rest of the game optimally after keeping those
+    /// dice; `this_turn_ev` is the portion scored on this turn only.
+    pub fn first_keepers_with_turn_ev(
+        &self,
+        dice: DiceCounts,
+    ) -> Vec<(DiceCounts, f32, f32)> {
+        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        let turn_ev_roll3 = self.turn_ev_by_roll3_dice();
+        let turn_ev_roll2 = self.turn_ev_by_roll2_dice(&turn_ev_roll3);
+        let mut result = Vec::new();
+        for keeper_idx in 0..(NUM_KEEPERS as usize) {
+            if DICE_TO_ALLOWED_KEEPERS[(dice_idx, keeper_idx)] > 0.0 {
+                let keeper = IDX_KEEPERS_LOOKUP.get(&keeper_idx).unwrap().clone();
+                let turn_ev: f32 = (0..NUM_DICE_COMBINATIONS as usize)
+                    .map(|d| KEEPERS_TO_DICE_PROBABILITIES[(keeper_idx, d)] * turn_ev_roll2[d])
+                    .sum();
+                result.push((keeper, self.first_keepers[keeper_idx], turn_ev));
+            }
+        }
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result
+    }
+
+    /// Per-keeper `(overall_ev, this_turn_ev)` pairs for roll 2.
+    pub fn second_keepers_with_turn_ev(
+        &self,
+        dice: DiceCounts,
+    ) -> Vec<(DiceCounts, f32, f32)> {
+        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        let turn_ev_roll3 = self.turn_ev_by_roll3_dice();
+        let mut result = Vec::new();
+        for keeper_idx in 0..(NUM_KEEPERS as usize) {
+            if DICE_TO_ALLOWED_KEEPERS[(dice_idx, keeper_idx)] > 0.0 {
+                let keeper = IDX_KEEPERS_LOOKUP.get(&keeper_idx).unwrap().clone();
+                let turn_ev: f32 = (0..NUM_DICE_COMBINATIONS as usize)
+                    .map(|d| KEEPERS_TO_DICE_PROBABILITIES[(keeper_idx, d)] * turn_ev_roll3[d])
+                    .sum();
+                result.push((keeper, self.second_keepers[keeper_idx], turn_ev));
+            }
+        }
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result
+    }
+
+    /// Per-entry `(overall_ev, this_turn_ev)` pairs for roll 3. `this_turn_ev`
+    /// is deterministic — the immediate score of the entry (including any +35
+    /// upper or +100 Yahtzee bonus triggered by taking it this turn).
+    pub fn entries_with_turn_ev(
+        &self,
+        dice: DiceCounts,
+    ) -> Vec<(EntryAction, f32, f32)> {
+        let mut result = Vec::new();
+        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        for (action_idx, &action) in ENTRY_ACTIONS.iter().enumerate() {
+            if self.state.is_valid_action(action) {
+                let overall = self.entry_actions[(action_idx, dice_idx)];
+                let turn = self.state.score_and_child(action, dice_idx as u8).0;
+                result.push((action, overall, turn));
+            }
+        }
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result
+    }
+
+    fn turn_ev_by_roll3_dice(&self) -> Vec<f32> {
+        (0..NUM_DICE_COMBINATIONS as usize)
+            .map(|d| self.this_turn_roll3_dice(d))
+            .collect()
+    }
+
+    fn turn_ev_by_roll2_dice(&self, turn_ev_roll3: &[f32]) -> Vec<f32> {
+        (0..NUM_DICE_COMBINATIONS as usize)
+            .map(|d| {
+                let k2 = self.best_keeper(d, &self.second_keepers);
+                (0..NUM_DICE_COMBINATIONS as usize)
+                    .map(|d3| KEEPERS_TO_DICE_PROBABILITIES[(k2, d3)] * turn_ev_roll3[d3])
+                    .sum()
+            })
+            .collect()
     }
 
     pub fn entries_score(&self, dice: DiceCounts) -> Vec<(EntryAction, f32)> {

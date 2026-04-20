@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
-use yahtzee_core::{DiceCounts, EntryAction, Scores, State, ENTRY_ACTIONS};
+use yahtzee_core::{
+    achievable_scores, DiceCounts, EntryAction, ExpectedValues, Scores, State, ENTRY_ACTIONS,
+};
 
 #[wasm_bindgen]
 pub struct Solver {
@@ -18,12 +20,15 @@ pub struct StateInput {
 pub struct KeeperRec {
     pub dice: Vec<u8>,
     pub ev: f32,
+    pub turn_ev: f32,
+    pub best_entry: Option<&'static str>,
 }
 
 #[derive(Serialize, Clone)]
 pub struct EntryRec {
     pub entry: &'static str,
     pub ev: f32,
+    pub turn_ev: f32,
 }
 
 #[derive(Serialize, Clone)]
@@ -59,6 +64,43 @@ impl Solver {
         let state = build_state(&input).map_err(js_err)?;
         Ok(self.inner.values(state).value)
     }
+
+    #[wasm_bindgen(js_name = thisTurnEv)]
+    pub fn this_turn_ev(
+        &self,
+        state_js: JsValue,
+        dice: Vec<u8>,
+        roll: u8,
+    ) -> Result<f32, JsValue> {
+        let input: StateInput = serde_wasm_bindgen::from_value(state_js)?;
+        let state = build_state(&input).map_err(js_err)?;
+        let dice_counts = dice_to_counts(&dice).map_err(js_err)?;
+        if !(1..=3).contains(&roll) {
+            return Err(JsValue::from_str("roll must be 1, 2, or 3"));
+        }
+        Ok(self.inner.values(state).this_turn_ev(dice_counts, roll))
+    }
+}
+
+#[wasm_bindgen(js_name = entryScore)]
+pub fn entry_score_js(state_js: JsValue, dice: Vec<u8>, entry_idx: u8) -> Result<u8, JsValue> {
+    let input: StateInput = serde_wasm_bindgen::from_value(state_js)?;
+    let state = build_state(&input).map_err(js_err)?;
+    let dice_counts = dice_to_counts(&dice).map_err(js_err)?;
+    let idx = entry_idx as usize;
+    if idx >= ENTRY_ACTIONS.len() {
+        return Err(JsValue::from_str("entry_idx out of range"));
+    }
+    Ok(state.entry_score(ENTRY_ACTIONS[idx], &dice_counts))
+}
+
+#[wasm_bindgen(js_name = achievableScores)]
+pub fn achievable_scores_js(entry_idx: u8) -> Result<Vec<u8>, JsValue> {
+    let idx = entry_idx as usize;
+    if idx >= ENTRY_ACTIONS.len() {
+        return Err(JsValue::from_str("entry_idx out of range"));
+    }
+    Ok(achievable_scores(idx))
 }
 
 pub fn core_recommend(
@@ -76,11 +118,13 @@ pub fn core_recommend(
             value: values.value,
             keepers: Some(
                 values
-                    .first_keepers_score(dice_counts)
+                    .first_keepers_with_turn_ev(dice_counts)
                     .into_iter()
-                    .map(|(d, ev)| KeeperRec {
+                    .map(|(d, ev, turn_ev)| KeeperRec {
+                        best_entry: best_entry_for_full_keeper(&values, &d),
                         dice: counts_to_faces(&d),
                         ev,
+                        turn_ev,
                     })
                     .collect(),
             ),
@@ -90,11 +134,13 @@ pub fn core_recommend(
             value: values.value,
             keepers: Some(
                 values
-                    .second_keepers_score(dice_counts)
+                    .second_keepers_with_turn_ev(dice_counts)
                     .into_iter()
-                    .map(|(d, ev)| KeeperRec {
+                    .map(|(d, ev, turn_ev)| KeeperRec {
+                        best_entry: best_entry_for_full_keeper(&values, &d),
                         dice: counts_to_faces(&d),
                         ev,
+                        turn_ev,
                     })
                     .collect(),
             ),
@@ -105,11 +151,12 @@ pub fn core_recommend(
             keepers: None,
             entries: Some(
                 values
-                    .entries_score(dice_counts)
+                    .entries_with_turn_ev(dice_counts)
                     .into_iter()
-                    .map(|(a, ev)| EntryRec {
+                    .map(|(a, ev, turn_ev)| EntryRec {
                         entry: action_name(a),
                         ev,
+                        turn_ev,
                     })
                     .collect(),
             ),
@@ -157,6 +204,17 @@ fn counts_to_faces(dc: &DiceCounts) -> Vec<u8> {
         }
     }
     out
+}
+
+fn best_entry_for_full_keeper(values: &ExpectedValues, dice: &DiceCounts) -> Option<&'static str> {
+    if dice.0.iter().map(|&c| c as u16).sum::<u16>() != 5 {
+        return None;
+    }
+    values
+        .entries_with_turn_ev(dice.clone())
+        .into_iter()
+        .next()
+        .map(|(a, _, _)| action_name(a))
 }
 
 fn action_name(a: EntryAction) -> &'static str {
