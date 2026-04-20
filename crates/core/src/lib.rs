@@ -362,16 +362,19 @@ mod math {
     }
 }
 
+// Packed bitset over NUM_STATES entries (16_384 u64 words = 128 KiB).
+const VALID_STATES_WORDS: usize = (NUM_STATES as usize + 63) / 64;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scores {
     state_scores: Array1<f32>,
-    valid_states: Box<[bool]>,
+    valid_states: Box<[u64]>,
 }
 
 impl Scores {
     pub fn new() -> Scores {
         let state_scores = Array1::zeros(NUM_STATES as usize);
-        let valid_states = Box::new([false; 0]);
+        let valid_states = vec![0_u64; VALID_STATES_WORDS].into_boxed_slice();
         let mut scores = Scores {
             state_scores,
             valid_states,
@@ -472,31 +475,31 @@ impl Scores {
     }
 
     fn set_valid_states(&mut self) {
-        let mut valid_markers = vec![false; NUM_STATES as usize];
+        let mut words = vec![0_u64; VALID_STATES_WORDS];
         let default_idx: usize = State::default().into();
-        valid_markers[default_idx] = true;
+        words[default_idx / 64] |= 1_u64 << (default_idx % 64);
 
         for state_idx in 0..(NUM_STATES as usize) {
-            let elem: State = state_idx.into();
-            if valid_markers[state_idx] {
+            if (words[state_idx / 64] >> (state_idx % 64)) & 1 == 1 {
+                let elem: State = state_idx.into();
                 for &action in &ENTRY_ACTIONS {
                     if elem.is_valid_action(action) {
                         for dice_idx in 0..NUM_DICE_COMBINATIONS {
                             let child = elem.child(action, dice_idx);
                             let idx: usize = child.into();
-                            valid_markers[idx] = true;
+                            words[idx / 64] |= 1_u64 << (idx % 64);
                         }
                     }
                 }
             }
         }
 
-        self.valid_states = valid_markers.into_boxed_slice();
+        self.valid_states = words.into_boxed_slice();
     }
 
     pub fn valid_state(&self, state: State) -> bool {
         let state_idx: usize = state.into();
-        self.valid_states[state_idx]
+        (self.valid_states[state_idx / 64] >> (state_idx % 64)) & 1 == 1
     }
 }
 
@@ -730,7 +733,11 @@ mod tests {
     #[test]
     fn test_valid_states() {
         let scores = Scores::new();
-        let num_valid = scores.valid_states.iter().filter(|x| **x).count();
+        let num_valid: usize = scores
+            .valid_states
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum();
         assert_eq!(num_valid, NUM_VALID_STATES as usize);
     }
 

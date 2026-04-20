@@ -1,0 +1,16 @@
+[package]
+name = "yahtzee-wasm"
+version = "0.1.0"
+authors = ["Jonathan Stites <mail@jonstites.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+yahtzee-core = { path = "../core" }
+bincode = "1.2"
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"
+serde = { version = "1.0", features = ["derive"] }

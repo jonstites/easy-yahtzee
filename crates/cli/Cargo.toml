@@ -1,0 +1,20 @@
+[package]
+name = "yahtzee-cli"
+version = "0.1.0"
+authors = ["Jonathan Stites <mail@jonstites.com>"]
+edition = "2018"
+
+[[bin]]
+name = "easy-yahtzee"
+path = "src/main.rs"
+
+[[bin]]
+name = "build-cache"
+path = "src/build_cache.rs"
+
+[dependencies]
+yahtzee-core = { path = "../core" }
+bincode = "1.2"
+brotli = "6"
+clap = "2.33"
+sha2 = "0.10"
