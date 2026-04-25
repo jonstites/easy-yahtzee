@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use yahtzee_core::{
-    achievable_scores, DiceCounts, EntryAction, ExpectedValues, Scores, State, ENTRY_ACTIONS,
+    achievable_scores, DiceCounts, EntryAction, Scores, State, ENTRY_ACTIONS,
 };
 
 #[wasm_bindgen]
@@ -21,12 +21,13 @@ pub struct KeeperRec {
     pub dice: Vec<u8>,
     pub ev: f32,
     pub turn_ev: f32,
-    pub best_entry: Option<&'static str>,
 }
 
 #[derive(Serialize, Clone)]
 pub struct EntryRec {
-    pub entry: &'static str,
+    /// Index into `ENTRY_ACTIONS` (0 = ones, …, 12 = chance). The UI maps this
+    /// directly to its label/lookup arrays — no need to round-trip a string.
+    pub entry: u8,
     pub ev: f32,
     pub turn_ev: f32,
 }
@@ -34,8 +35,18 @@ pub struct EntryRec {
 #[derive(Serialize, Clone)]
 pub struct Recommendation {
     pub value: f32,
+    /// Per-keeper rankings on rolls 1 and 2; `None` on roll 3 (no more rolls).
+    /// The all-5 keeper is intentionally excluded: "keep all 5 then re-roll
+    /// some later" is strictly dominated by "re-roll those now". The only
+    /// useful "keep everything" interpretation is "score these dice now",
+    /// which the `entries` field captures with the actual score-now EV.
     pub keepers: Option<Vec<KeeperRec>>,
-    pub entries: Option<Vec<EntryRec>>,
+    /// Per-entry rankings, populated on every roll. On roll 3 these are the
+    /// only options. On rolls 1 and 2 they represent "skip the remaining
+    /// rolls and score this dice in this category", with `ev` / `turn_ev`
+    /// reflecting that decision (no further rolls), so the UI can merge them
+    /// with the keeper list and sort by overall EV.
+    pub entries: Vec<EntryRec>,
 }
 
 #[wasm_bindgen]
@@ -113,55 +124,49 @@ pub fn core_recommend(
     let dice_counts = dice_to_counts(dice)?;
     let values = scores.values(state);
 
-    Ok(match roll {
-        1 => Recommendation {
-            value: values.value,
-            keepers: Some(
-                values
-                    .first_keepers_with_turn_ev(dice_counts)
-                    .into_iter()
-                    .map(|(d, ev, turn_ev)| KeeperRec {
-                        best_entry: best_entry_for_full_keeper(&values, &d),
-                        dice: counts_to_faces(&d),
-                        ev,
-                        turn_ev,
-                    })
-                    .collect(),
-            ),
-            entries: None,
-        },
-        2 => Recommendation {
-            value: values.value,
-            keepers: Some(
-                values
-                    .second_keepers_with_turn_ev(dice_counts)
-                    .into_iter()
-                    .map(|(d, ev, turn_ev)| KeeperRec {
-                        best_entry: best_entry_for_full_keeper(&values, &d),
-                        dice: counts_to_faces(&d),
-                        ev,
-                        turn_ev,
-                    })
-                    .collect(),
-            ),
-            entries: None,
-        },
-        3 => Recommendation {
-            value: values.value,
-            keepers: None,
-            entries: Some(
-                values
-                    .entries_with_turn_ev(dice_counts)
-                    .into_iter()
-                    .map(|(a, ev, turn_ev)| EntryRec {
-                        entry: action_name(a),
-                        ev,
-                        turn_ev,
-                    })
-                    .collect(),
-            ),
-        },
+    let entries: Vec<EntryRec> = values
+        .entries_with_turn_ev(dice_counts.clone())
+        .into_iter()
+        .map(|(a, ev, turn_ev)| EntryRec {
+            entry: action_idx(a),
+            ev,
+            turn_ev,
+        })
+        .collect();
+
+    let keepers = match roll {
+        1 => Some(
+            values
+                .first_keepers_with_turn_ev(dice_counts)
+                .into_iter()
+                .filter(|(d, _, _)| keeper_size(d) < 5)
+                .map(|(d, ev, turn_ev)| KeeperRec {
+                    dice: counts_to_faces(&d),
+                    ev,
+                    turn_ev,
+                })
+                .collect(),
+        ),
+        2 => Some(
+            values
+                .second_keepers_with_turn_ev(dice_counts)
+                .into_iter()
+                .filter(|(d, _, _)| keeper_size(d) < 5)
+                .map(|(d, ev, turn_ev)| KeeperRec {
+                    dice: counts_to_faces(&d),
+                    ev,
+                    turn_ev,
+                })
+                .collect(),
+        ),
+        3 => None,
         _ => return Err("roll must be 1, 2, or 3".into()),
+    };
+
+    Ok(Recommendation {
+        value: values.value,
+        keepers,
+        entries,
     })
 }
 
@@ -206,34 +211,18 @@ fn counts_to_faces(dc: &DiceCounts) -> Vec<u8> {
     out
 }
 
-fn best_entry_for_full_keeper(values: &ExpectedValues, dice: &DiceCounts) -> Option<&'static str> {
-    if dice.0.iter().map(|&c| c as u16).sum::<u16>() != 5 {
-        return None;
-    }
-    values
-        .entries_with_turn_ev(dice.clone())
-        .into_iter()
-        .next()
-        .map(|(a, _, _)| action_name(a))
+fn keeper_size(dice: &DiceCounts) -> u16 {
+    dice.0.iter().map(|&c| c as u16).sum()
 }
 
-fn action_name(a: EntryAction) -> &'static str {
-    match a {
-        EntryAction::ONE => "ones",
-        EntryAction::TWO => "twos",
-        EntryAction::THREE => "threes",
-        EntryAction::FOUR => "fours",
-        EntryAction::FIVE => "fives",
-        EntryAction::SIX => "sixes",
-        EntryAction::THREE_OF_A_KIND => "three_of_a_kind",
-        EntryAction::FOUR_OF_A_KIND => "four_of_a_kind",
-        EntryAction::FULL_HOUSE => "full_house",
-        EntryAction::SMALL_STRAIGHT => "small_straight",
-        EntryAction::LARGE_STRAIGHT => "large_straight",
-        EntryAction::YAHTZEE => "yahtzee",
-        EntryAction::CHANCE => "chance",
-        _ => "unknown",
-    }
+/// Index of an `EntryAction` in `ENTRY_ACTIONS` (0..13). Panics on a
+/// non-canonical action; in practice the core only ever hands us actions from
+/// `ENTRY_ACTIONS` so this is unreachable.
+fn action_idx(a: EntryAction) -> u8 {
+    ENTRY_ACTIONS
+        .iter()
+        .position(|&x| x == a)
+        .expect("unknown EntryAction") as u8
 }
 
 fn js_err(s: String) -> JsValue {

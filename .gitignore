@@ -82,6 +82,12 @@ web/.vite/
 **/.vite/
 *.tsbuildinfo
 
+# Playwright artefacts
+web/test-results/
+web/playwright-report/
+web/blob-report/
+web/.playwright/
+
 # Env files (never commit secrets)
 .env
 .env.local

@@ -1,27 +1,25 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import init, { Solver, achievableScores, entryScore } from 'yahtzee-wasm';
-
-  const ENTRY_LABELS = [
-    'Ones', 'Twos', 'Threes', 'Fours', 'Fives', 'Sixes',
-    'Three of a kind', 'Four of a kind', 'Full house',
-    'Small straight', 'Large straight', 'Yahtzee', 'Chance',
-  ] as const;
-
-  const HOW_TO_SCORE = [
-    'count 1s', 'count 2s', 'count 3s', 'count 4s', 'count 5s', 'count 6s',
-    'sum of dice', 'sum of dice', '25', '30', '40', '50', 'sum of dice',
-  ] as const;
-
-  const ENTRY_NAME_TO_IDX: Record<string, number> = {
-    ones: 0, twos: 1, threes: 2, fours: 3, fives: 4, sixes: 5,
-    three_of_a_kind: 6, four_of_a_kind: 7, full_house: 8,
-    small_straight: 9, large_straight: 10, yahtzee: 11, chance: 12,
-  };
+  import { ENTRY_LABELS, PIP_POS, YAHTZEE_IDX } from './constants';
+  import {
+    cycleFace,
+    formatAllowed,
+    isYahtzee,
+    keepMaskFor,
+    maxYahtzeeBonuses as maxYahtzeeBonusesFor,
+    parseScoreInput,
+    randomDice,
+    scoreContributionMask,
+  } from './scoring';
+  import { buildChoices, type Recommendation } from './recommendation';
+  import Scorecard from './Scorecard.svelte';
+  import HelpModal from './HelpModal.svelte';
 
   let solver: Solver | null = null;
   let loading = true;
   let loadError: string | null = null;
+  let showHelp = false;
 
   let rawInputs: string[] = new Array(13).fill('');
   let yahtzeeBonuses = 0;
@@ -64,54 +62,36 @@
   let allowedLabels: string[] = [];
   let wasmReady = false;
 
-  function formatAllowed(vals: number[]): string {
-    if (vals.length <= 6) return vals.join(', ');
-    const contiguous = (xs: number[]) => xs.every((v, i) => i === 0 || v === xs[i - 1] + 1);
-    if (contiguous(vals)) return `${vals[0]}–${vals[vals.length - 1]}`;
-    if (vals[0] === 0) {
-      const rest = vals.slice(1);
-      if (contiguous(rest)) return `0 or ${rest[0]}–${rest[rest.length - 1]}`;
-    }
-    return vals.join(', ');
-  }
-
-  function parseRaw(raw: string, i: number): { value: number | null; error: string | null } {
-    const t = raw.trim();
-    if (t === '') return { value: null, error: null };
-    if (!/^-?\d+$/.test(t)) return { value: null, error: 'whole number' };
-    const n = parseInt(t, 10);
-    if (!wasmReady) return { value: n, error: null };
-    if (allowedSets[i].has(n)) return { value: n, error: null };
-    return { value: null, error: allowedLabels[i] };
-  }
-
-  $: parsed = rawInputs.map((r, i) => parseRaw(r, i));
+  $: parsed = rawInputs.map((r, i) =>
+    parseScoreInput(
+      r,
+      wasmReady ? { values: allowedSets[i], label: allowedLabels[i] } : null,
+    ),
+  );
   $: scores = parsed.map(p => p.value);
   $: errors = parsed.map(p => p.error);
   let dice: number[] = [1, 1, 1, 1, 1];
   let kept: boolean[] = [false, false, false, false, false];
   let roll: 1 | 2 | 3 = 1;
 
-  type KeeperRec = { dice: number[]; ev: number; turn_ev: number; best_entry: string | null };
-  type EntryRec = { entry: string; ev: number; turn_ev: number };
-  type Recommendation = {
-    value: number;
-    keepers: KeeperRec[] | null;
-    entries: EntryRec[] | null;
-  };
   let rec: Recommendation | null = null;
   let recError: string | null = null;
 
   onMount(async () => {
+    // Run wasm init and the scores.bin fetch concurrently — neither depends
+    // on the other until we want to construct the Solver from the bytes.
     try {
-      await init();
+      const [, bytes] = await Promise.all([
+        init(),
+        fetch('/scores.bin').then(async resp => {
+          if (!resp.ok) throw new Error(`fetch scores.bin: ${resp.status}`);
+          return new Uint8Array(await resp.arrayBuffer());
+        }),
+      ]);
       allowedByEntry = Array.from({ length: 13 }, (_, i) => Array.from(achievableScores(i)));
       allowedSets = allowedByEntry.map(vs => new Set(vs));
       allowedLabels = allowedByEntry.map(formatAllowed);
       wasmReady = true;
-      const resp = await fetch('/scores.bin');
-      if (!resp.ok) throw new Error(`fetch scores.bin: ${resp.status}`);
-      const bytes = new Uint8Array(await resp.arrayBuffer());
       solver = new Solver(bytes);
       dice = randomDice();
     } catch (e) {
@@ -121,24 +101,26 @@
     }
   });
 
-  $: entries = scores.map(s => s !== null);
+  // Which scorecard rows are filled (i.e. unavailable to score into again).
+  // Distinct from `rec.entries`, which is the list of scoring recommendations.
+  $: filledMask = scores.map(s => s !== null);
   $: upperFilled = scores.slice(0, 6).reduce<number>((a, b) => a + (b ?? 0), 0);
   $: lowerFilled = scores.slice(6).reduce<number>((a, b) => a + (b ?? 0), 0);
   $: upperScoreRemaining = Math.max(0, 63 - upperFilled);
   $: upperBonus = upperFilled >= 63 ? 35 : 0;
   $: turnsPlayed = scores.filter(s => s !== null).length;
   $: gameOver = turnsPlayed === 13;
-  $: maxYahtzeeBonuses = scores[11] === 50 ? Math.max(0, turnsPlayed - 1) : 0;
+  $: maxYahtzeeBonuses = maxYahtzeeBonusesFor(scores[YAHTZEE_IDX], turnsPlayed);
   $: {
     const clamped = Math.max(0, Math.min(yahtzeeBonuses | 0, maxYahtzeeBonuses));
     if (clamped !== yahtzeeBonuses) yahtzeeBonuses = clamped;
   }
   $: yahtzeeBonusPoints = yahtzeeBonuses * 100;
   $: currentTotal = upperFilled + upperBonus + lowerFilled + yahtzeeBonusPoints;
-  $: yahtzeeBonusEligible = scores[11] === 50;
+  $: yahtzeeBonusEligible = scores[YAHTZEE_IDX] === 50;
 
   $: stateInput = {
-    entries,
+    entries: filledMask,
     yahtzee_bonus_eligible: yahtzeeBonusEligible,
     upper_score_remaining: upperScoreRemaining,
   };
@@ -155,78 +137,37 @@
 
   function cycleDie(i: number, delta: number) {
     pushHistory();
-    const next = ((dice[i] - 1 + delta + 6) % 6) + 1;
+    const next = cycleFace(dice[i], delta);
     dice = dice.map((v, j) => (j === i ? next : v));
   }
 
+  // The Joker rule fires when the dice are a Yahtzee, the Yahtzee box is
+  // already filled (any value), AND the matching upper box is already filled.
+  // Lower-row categories then accept fixed joker scores (full house = 25,
+  // small straight = 30, large straight = 40).
   $: jokerActive = (() => {
     const c = [0, 0, 0, 0, 0, 0];
     for (const v of dice) c[v - 1]++;
     const face = c.findIndex(x => x === 5) + 1;
     if (face === 0) return false;
-    return scores[11] !== null && scores[face - 1] !== null;
+    return scores[YAHTZEE_IDX] !== null && scores[face - 1] !== null;
   })();
 
+  // Highlight the joker-rule indicator only on lower-row "shaped" categories
+  // (full house, small straight, large straight) — those are the ones that
+  // accept the special joker score.
   function isJokerEnabled(i: number): boolean {
     return jokerActive && (i === 8 || i === 9 || i === 10);
   }
 
-  type Choice = {
-    kind: 'keep' | 'score';
-    dice: number[];
-    entry: string | null;
-    turn_ev: number;
-    ev: number;
-  };
+  $: choices = buildChoices(rec);
 
-  $: choices = ((): Choice[] => {
-    if (rec?.keepers) {
-      return rec.keepers.slice(0, 8).map(k => ({
-        kind: k.best_entry ? ('score' as const) : ('keep' as const),
-        dice: k.dice,
-        entry: k.best_entry,
-        turn_ev: k.turn_ev,
-        ev: k.ev,
-      }));
-    }
-    if (rec?.entries) {
-      return rec.entries.map(e => ({
-        kind: 'score' as const,
-        dice: [],
-        entry: e.entry,
-        turn_ev: e.turn_ev,
-        ev: e.ev,
-      }));
-    }
-    return [];
-  })();
-
-  $: hasJokerChoice = choices.some(c => {
-    if (!c.entry) return false;
-    const idx = ENTRY_NAME_TO_IDX[c.entry];
-    return idx !== undefined && isJokerEnabled(idx);
-  });
-
-  function keepMaskFor(faces: number[], currentDice: number[]): boolean[] {
-    const mask = [false, false, false, false, false];
-    const remaining = [0, 0, 0, 0, 0, 0];
-    for (const v of faces) remaining[v - 1]++;
-    for (let i = 0; i < 5; i++) {
-      const f = currentDice[i];
-      if (remaining[f - 1] > 0) {
-        mask[i] = true;
-        remaining[f - 1]--;
-      }
-    }
-    return mask;
-  }
+  $: hasJokerChoice = choices.some(
+    c => c.kind === 'score' && isJokerEnabled(c.entryIdx)
+  );
 
   function toggleKeep(i: number) {
     kept = kept.map((v, j) => (j === i ? !v : v));
-  }
-
-  function randomDice(): number[] {
-    return Array.from({ length: 5 }, () => 1 + Math.floor(Math.random() * 6));
   }
 
   function randomizeDice() {
@@ -236,9 +177,11 @@
     kept = [false, false, false, false, false];
   }
 
+  // Re-roll any die not marked kept and advance the roll counter. Caller is
+  // responsible for the gameOver / roll / all-kept guards (see handleRoll and
+  // applyKeepAndRoll) so callers can do pushHistory only when an action is
+  // actually about to happen.
   function rollDice() {
-    if (gameOver || roll === 3) return;
-    if (kept.every(k => k)) return;
     const next = dice.slice();
     for (let i = 0; i < 5; i++) {
       if (!kept[i]) next[i] = 1 + Math.floor(Math.random() * 6);
@@ -256,31 +199,60 @@
 
   function applyKeepAndRoll(faces: number[]) {
     if (gameOver || roll === 3) return;
+    const mask = keepMaskFor(faces, dice);
+    if (mask.every(k => k)) return; // shouldn't happen — wasm omits the all-5 keeper
     pushHistory();
-    kept = keepMaskFor(faces, dice);
+    kept = mask;
     rollDice();
   }
 
-  function isYahtzee(d: number[]): boolean {
-    return d.every(v => v === d[0]);
+  function applyRerollAll() {
+    if (gameOver || roll === 3) return;
+    pushHistory();
+    kept = [false, false, false, false, false];
+    rollDice();
   }
 
-  function applyScore(entryName: string) {
+  function applyTop() {
+    const c = choices[0];
+    if (!c) return;
+    if (c.kind === 'score') applyScore(c.entryIdx);
+    else if (c.kind === 'keep') applyKeepAndRoll(c.dice);
+    else applyRerollAll();
+  }
+
+  function onKey(e: KeyboardEvent) {
+    if (showHelp) {
+      if (e.key === 'Escape' || e.key === '?') {
+        e.preventDefault();
+        showHelp = false;
+      }
+      return;
+    }
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.key === ' ') { e.preventDefault(); handleRoll(); }
+    else if (e.key === 'Enter') { e.preventDefault(); applyTop(); }
+    else if (e.key === 'r' || e.key === 'R') { e.preventDefault(); randomizeDice(); }
+    else if (e.key === 'u' || e.key === 'U') { e.preventDefault(); undo(); }
+    else if (e.key === '?') { e.preventDefault(); showHelp = true; }
+  }
+
+  function applyScore(idx: number) {
     if (gameOver) return;
-    const idx = ENTRY_NAME_TO_IDX[entryName];
-    if (idx === undefined) return;
+    if (idx < 0 || idx >= 13) return;
     pushHistory();
-    const state = {
-      entries,
-      yahtzee_bonus_eligible: yahtzeeBonusEligible,
-      upper_score_remaining: upperScoreRemaining,
-    };
-    const val = entryScore(state, new Uint8Array(dice), idx);
+    const val = entryScore(stateInput, new Uint8Array(dice), idx);
     rawInputs[idx] = String(val);
-    if (isYahtzee(dice) && yahtzeeBonusEligible && idx !== 11) {
+    // Auto-track Yahtzee bonuses: a fresh Yahtzee scored anywhere except the
+    // Yahtzee box itself, while already eligible (= Yahtzee box holds 50),
+    // earns +100.
+    if (isYahtzee(dice) && yahtzeeBonusEligible && idx !== YAHTZEE_IDX) {
       yahtzeeBonuses = yahtzeeBonuses + 1;
     }
-    const otherFilled = entries.reduce((a, b, i) => a + (i !== idx && b ? 1 : 0), 0);
+    // If this fill completes the game, leave the dice alone so the
+    // game-over screen can render against the final state.
+    const otherFilled = filledMask.reduce((a, b, i) => a + (i !== idx && b ? 1 : 0), 0);
     if (otherFilled + 1 >= 13) {
       kept = [false, false, false, false, false];
       return;
@@ -290,45 +262,20 @@
     roll = 1;
   }
 
-  function scoreContributionMask(entryIdx: number, d: number[]): boolean[] {
-    if (entryIdx >= 0 && entryIdx <= 5) {
-      const face = entryIdx + 1;
-      return d.map(v => v === face);
-    }
-    if (entryIdx === 9) {
-      const present = new Set(d);
-      const runs = [[1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6]];
-      let chosen: number[] | null = null;
-      for (const r of runs) {
-        if (r.every(x => present.has(x))) { chosen = r; break; }
-      }
-      if (!chosen) return [false, false, false, false, false];
-      return keepMaskFor(chosen, d);
-    }
-    return [true, true, true, true, true];
-  }
-
+  // Mask of dice the top recommendation cares about. Drives the fade on
+  // non-recommended dice in the dice row. For 'reroll' nothing is highlighted
+  // (we want the user to feel free to re-roll everything).
   $: recKeepMask = (() => {
     const top = choices[0];
     if (!top) return [false, false, false, false, false];
-    if (top.kind === 'keep') {
-      if (top.dice.length === 0) return [false, false, false, false, false];
-      return keepMaskFor(top.dice, dice);
-    }
-    if (top.kind === 'score' && top.entry) {
-      const idx = ENTRY_NAME_TO_IDX[top.entry];
-      if (idx === undefined) return [false, false, false, false, false];
-      return scoreContributionMask(idx, dice);
-    }
+    if (top.kind === 'keep') return keepMaskFor(top.dice, dice);
+    if (top.kind === 'score') return scoreContributionMask(top.entryIdx, dice);
     return [false, false, false, false, false];
   })();
   $: anyRecommended = recKeepMask.some(Boolean);
 
-  $: scoreHighlightIdx = (() => {
-    const top = choices[0];
-    if (!top || top.kind !== 'score' || !top.entry) return -1;
-    return ENTRY_NAME_TO_IDX[top.entry] ?? -1;
-  })();
+  // Which scorecard row to highlight as the top suggestion (-1 = none).
+  $: scoreHighlightIdx = choices[0]?.kind === 'score' ? choices[0].entryIdx : -1;
 
   function setRoll(r: number) {
     if (r === roll) return;
@@ -345,21 +292,18 @@
     roll = 1;
   }
 
-  const PIP_POS: Record<number, [number, number][]> = {
-    1: [[50, 50]],
-    2: [[25, 25], [75, 75]],
-    3: [[25, 25], [50, 50], [75, 75]],
-    4: [[25, 25], [75, 25], [25, 75], [75, 75]],
-    5: [[25, 25], [75, 25], [50, 50], [25, 75], [75, 75]],
-    6: [[25, 25], [75, 25], [25, 50], [75, 50], [25, 75], [75, 75]],
-  };
+  $: projectedFinal = rec ? (currentTotal + rec.value).toFixed(1) : '—';
+  $: turnText = `${Math.min(turnsPlayed + (gameOver ? 0 : 1), 13)} / 13`;
 </script>
+
+<svelte:window on:keydown={onKey} />
 
 <main>
   <header>
     <h1>easy-yahtzee</h1>
     <div class="header-actions">
-      <button class="reset" disabled={history.length === 0} on:click={undo}>Undo</button>
+      <button class="reset" on:click={() => (showHelp = true)} title="Help (?)">?</button>
+      <button class="reset" disabled={history.length === 0} on:click={undo} title="Undo (U)">Undo</button>
       <button class="reset" on:click={resetGame}>Reset</button>
     </div>
   </header>
@@ -370,119 +314,22 @@
     <p class="error">Failed to load: {loadError}</p>
   {:else}
     <div class="layout">
-      <section class="scorecard">
-        <div class="section-label">Upper</div>
-        <table class="sheet">
-          <colgroup>
-            <col />
-            <col class="col-howto" />
-            <col class="col-score" />
-          </colgroup>
-          <tbody>
-            {#each ENTRY_LABELS.slice(0, 6) as label, i}
-              {@const filled = scores[i] !== null}
-              {@const err = errors[i]}
-              <tr class:filled class:invalid={err !== null} class:best={scoreHighlightIdx === i && !filled}>
-                <td>{label}</td>
-                <td class="howto">
-                  <svg class="pip-icon" viewBox="0 0 100 100" aria-hidden="true">
-                    <rect x="8" y="8" width="84" height="84" rx="16" ry="16" />
-                    {#each PIP_POS[i + 1] as [cx, cy]}
-                      <circle cx={cx} cy={cy} r="14" />
-                    {/each}
-                  </svg>
-                  {HOW_TO_SCORE[i]}
-                </td>
-                <td class="score-cell">
-                  <input
-                    class="score-edit"
-                    class:invalid={err !== null}
-                    type="text"
-                    inputmode="numeric"
-                    bind:value={rawInputs[i]}
-                  />
-                  {#if err}<div class="err">{err}</div>{/if}
-                </td>
-              </tr>
-            {/each}
-            <tr class="computed">
-              <td>Upper subtotal</td>
-              <td class="howto arrow">→</td>
-              <td>{upperFilled} / 63</td>
-            </tr>
-            <tr class="computed">
-              <td>Upper bonus</td>
-              <td class="howto">+35 at ≥63</td>
-              <td>{upperBonus === 35 ? '+35' : '0'}</td>
-            </tr>
-          </tbody>
-        </table>
-
-        <div class="section-label">Lower</div>
-        <table class="sheet">
-          <colgroup>
-            <col />
-            <col class="col-howto" />
-            <col class="col-score" />
-          </colgroup>
-          <tbody>
-            {#each ENTRY_LABELS.slice(6) as label, j}
-              {@const i = j + 6}
-              {@const filled = scores[i] !== null}
-              {@const err = errors[i]}
-              {@const joker = isJokerEnabled(i)}
-              <tr class:filled class:invalid={err !== null} class:best={scoreHighlightIdx === i && !filled}>
-                <td>
-                  {label}
-                  {#if joker}<a
-                    class="joker"
-                    href="https://en.wikipedia.org/wiki/Yahtzee#Yahtzee_bonuses_and_Joker_rules"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >Joker Rule</a>{/if}
-                </td>
-                <td class="howto">{HOW_TO_SCORE[i]}</td>
-                <td class="score-cell">
-                  <input
-                    class="score-edit"
-                    class:invalid={err !== null}
-                    type="text"
-                    inputmode="numeric"
-                    bind:value={rawInputs[i]}
-                  />
-                  {#if err}<div class="err">{err}</div>{/if}
-                </td>
-              </tr>
-            {/each}
-            <tr class="computed">
-              <td>
-                <label class="inline">
-                  Extra Yahtzees
-                  <input
-                    type="number"
-                    min="0"
-                    max={maxYahtzeeBonuses}
-                    class="score-edit"
-                    disabled={maxYahtzeeBonuses === 0}
-                    bind:value={yahtzeeBonuses}
-                  />
-                </label>
-              </td>
-              <td class="howto">+100 each</td>
-              <td>
-                {yahtzeeBonusPoints ? `+${yahtzeeBonusPoints}` : '0'}
-                {#if yahtzeeBonusEligible}<span class="note">(eligible)</span>{/if}
-              </td>
-            </tr>
-          </tbody>
-        </table>
-
-        <div class="totals">
-          <div><span>Current score</span><strong>{currentTotal}</strong></div>
-          <div><span>Projected final</span><strong>{rec ? (currentTotal + rec.value).toFixed(1) : '—'}</strong></div>
-          <div><span>Turn</span><strong>{Math.min(turnsPlayed + (gameOver ? 0 : 1), 13)} / 13</strong></div>
-        </div>
-      </section>
+      <Scorecard
+        bind:rawInputs
+        bind:yahtzeeBonuses
+        {errors}
+        {scores}
+        {scoreHighlightIdx}
+        {isJokerEnabled}
+        {maxYahtzeeBonuses}
+        {yahtzeeBonusPoints}
+        {yahtzeeBonusEligible}
+        {upperFilled}
+        {upperBonus}
+        {currentTotal}
+        {projectedFinal}
+        {turnText}
+      />
 
       <section class="play">
         {#if gameOver}
@@ -518,7 +365,6 @@
         </div>
 
         <div class="roll-row">
-          <span class="label">Roll</span>
           {#each [1, 2, 3] as r}
             <button class="seg" class:on={roll === r} on:click={() => setRoll(r)}>
               {r}
@@ -554,17 +400,15 @@
               </div>
               <ol class="choice-list">
                 {#each choices as c, ci}
-                  {@const entryIdx = c.entry ? ENTRY_NAME_TO_IDX[c.entry] : undefined}
-                  {@const joker = entryIdx !== undefined && isJokerEnabled(entryIdx)}
                   <li class:top={ci === 0}>
                     <span class="choice-label">
                       {#if c.kind === 'score'}
                         <em>score in</em>
-                        <span class="chip entry">
-                          {entryIdx !== undefined ? ENTRY_LABELS[entryIdx] : c.entry}
-                        </span>
-                        {#if joker}<span class="joker-dot" aria-hidden="true">★</span>{/if}
-                      {:else if c.dice.length === 0}
+                        <span class="chip entry">{ENTRY_LABELS[c.entryIdx]}</span>
+                        {#if isJokerEnabled(c.entryIdx)}
+                          <span class="joker-dot" aria-hidden="true">★</span>
+                        {/if}
+                      {:else if c.kind === 'reroll'}
                         <em>re-roll all</em>
                       {:else}
                         <em>keep</em>
@@ -580,13 +424,14 @@
                     </span>
                     <code>{roll === 3 ? c.turn_ev.toFixed(0) : c.turn_ev.toFixed(2)}</code>
                     <code>{(currentTotal + c.ev).toFixed(1)}</code>
-                    {#if c.kind === 'score' && c.entry}
-                      {@const entryName = c.entry}
-                      <button class="apply" class:primary={ci === 0} on:click={() => applyScore(entryName)}>Apply</button>
+                    {#if c.kind === 'score'}
+                      {@const idx = c.entryIdx}
+                      <button class="apply" class:primary={ci === 0} on:click={() => applyScore(idx)}>Apply</button>
                     {:else if c.kind === 'keep'}
-                      <button class="apply" class:primary={ci === 0} disabled={roll === 3} on:click={() => applyKeepAndRoll(c.dice)}>Apply</button>
+                      {@const faces = c.dice}
+                      <button class="apply" class:primary={ci === 0} disabled={roll === 3} on:click={() => applyKeepAndRoll(faces)}>Apply</button>
                     {:else}
-                      <span></span>
+                      <button class="apply" class:primary={ci === 0} disabled={roll === 3} on:click={applyRerollAll}>Apply</button>
                     {/if}
                   </li>
                 {/each}
@@ -604,6 +449,8 @@
       </section>
     </div>
   {/if}
+
+  <HelpModal bind:open={showHelp} />
 </main>
 
 <style>
@@ -684,128 +531,7 @@
     .layout { grid-template-columns: 1fr; }
   }
 
-  .scorecard {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 0.75rem 1rem;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-  }
-  .section-label {
-    font-weight: 700;
-    font-size: var(--text-md);
-    letter-spacing: var(--eyebrow-spacing);
-    text-transform: uppercase;
-    color: var(--fg);
-    margin: 0.75rem 0 0.25rem;
-  }
-  table.sheet {
-    width: 100%;
-    border-collapse: collapse;
-    border: 1px solid var(--fg);
-  }
-  table.sheet td {
-    padding: 0.3rem 0.5rem;
-    border: 1px solid var(--fg);
-    font-size: var(--text-md);
-  }
-  table.sheet td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
-  table.sheet .col-howto { width: 5.5rem; }
-  table.sheet .col-score { width: 4.75rem; }
-  td.howto {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    text-align: left !important;
-    white-space: nowrap;
-  }
-  td.howto.arrow {
-    font-size: var(--text-lg);
-    color: var(--fg);
-    text-align: center !important;
-    line-height: 1;
-  }
-  .pip-icon {
-    width: 0.95rem;
-    height: 0.95rem;
-    display: inline-block;
-    vertical-align: -0.18em;
-    margin-right: 0.25rem;
-  }
-  .pip-icon rect { fill: var(--bg-card); stroke: var(--fg); stroke-width: 7; }
-  .pip-icon circle { fill: var(--fg); }
-  tr.filled td:first-child { color: var(--fg-strike); text-decoration: line-through; }
-  tr.best td:first-child {
-    font-weight: 600;
-    box-shadow: inset 3px 0 0 var(--accent);
-    padding-left: calc(0.5rem + 3px);
-  }
-  tr.computed td { color: var(--fg-muted); font-size: var(--text-sm); }
-  tr.computed td:first-child { color: var(--fg); }
-  .note { color: var(--fg-dim); font-size: var(--text-xs); font-weight: normal; }
-  .joker {
-    display: inline-block;
-    font-size: 0.7rem;
-    font-weight: 600;
-    letter-spacing: 0.03em;
-    color: #6b4a06;
-    background: #fff3c4;
-    border: 1px solid #e2c868;
-    border-radius: 3px;
-    padding: 0 0.3rem;
-    margin-left: 0.3rem;
-    vertical-align: middle;
-    text-decoration: none;
-  }
-  .joker:hover { background: #ffe899; }
-  .joker-dot { color: #c39509; font-size: 0.75rem; margin-left: 0.2rem; }
-
-  .score-edit {
-    width: 3.4rem;
-    text-align: right;
-    padding: 0.15rem 0.3rem;
-    border: 1px solid var(--border-input);
-    border-radius: 3px;
-    font-size: var(--text-md);
-    font-variant-numeric: tabular-nums;
-    background: var(--bg-card);
-  }
-  .score-edit::placeholder { color: var(--fg-faint); font-style: italic; }
-  .score-edit:focus { outline: 2px solid #c9bf9c; outline-offset: 0; }
-  .score-edit.invalid { border-color: var(--err); background: var(--err-bg); color: var(--err); }
-  .score-edit.invalid:focus { outline-color: var(--err); }
-  .err { color: var(--err); font-size: var(--text-xs); }
-  tr.invalid { background: var(--err-row-bg); }
-  .inline {
-    display: inline-flex;
-    gap: 0.4rem;
-    align-items: center;
-    font-size: var(--text-sm);
-    color: var(--fg-muted);
-  }
-
-  .totals {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 0.75rem;
-    margin-top: 0.75rem;
-    padding-top: 0.75rem;
-    border-top: 2px solid var(--border);
-  }
-  .totals > div {
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-  }
-  .totals span {
-    font-size: var(--text-xs);
-    color: var(--fg-dim);
-    text-transform: uppercase;
-    letter-spacing: var(--eyebrow-spacing);
-  }
-  .totals strong {
-    font-size: var(--text-lg);
-    font-variant-numeric: tabular-nums;
-  }
+  .joker-dot { color: #c39509; font-size: var(--text-xs); margin-left: 0.2rem; }
 
   .play { display: flex; flex-direction: column; gap: 1rem; }
 
@@ -857,7 +583,6 @@
     gap: 0.5rem;
     justify-content: center;
   }
-  .roll-row .label { color: var(--fg-muted); font-size: var(--text-md); margin-right: 0.25rem; }
   .seg {
     width: 2.5rem;
     height: 2rem;
@@ -995,4 +720,5 @@
     font-size: var(--text-sm);
   }
   .error { color: var(--err); }
+
 </style>
