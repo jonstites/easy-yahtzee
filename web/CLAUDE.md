@@ -56,7 +56,7 @@ Vitest's default glob picks up both `*.test.ts` and `*.spec.ts`. `vitest.config.
 
 ## Dev-server quirks
 
-- `vite.config.ts` registers a middleware that intercepts `/scores.bin` requests and streams `static/scores.bin.br` with `Content-Encoding: br`. Don't put a real `scores.bin` at the URL — the brotli middleware short-circuits.
+- `vite.config.ts` registers a middleware that intercepts `/scores.bin` requests and streams `../crates/cli/data/scores.bin.br` (the same brotli blob the CLI embeds) with `Content-Encoding: br`. Don't put a real `scores.bin` at the URL — the brotli middleware short-circuits.
 - `publicDir` is `static/`, not the Vite default `public/`.
 
 ## Conventions
