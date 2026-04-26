@@ -34,6 +34,9 @@ pub use recommend::{
     StateInput,
 };
 
+#[cfg(test)]
+mod proptests;
+
 // 2^13 * 2 * 64
 // 13 Entries, 1 bit for Yahtzee bonus eligibility, and 64 for upper score
 const NUM_STATES: u32 = 1_048_576;
