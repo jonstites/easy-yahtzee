@@ -7,7 +7,7 @@
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
   <div class="modal-backdrop" on:click={close} role="presentation">
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-    <div class="modal" on:click|stopPropagation role="dialog" aria-modal="true" aria-labelledby="help-title">
+    <div class="modal" on:click|stopPropagation role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="help-title">
       <div class="modal-head">
         <h2 id="help-title">Help</h2>
         <button class="modal-close" on:click={close} aria-label="Close">×</button>
