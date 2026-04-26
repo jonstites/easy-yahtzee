@@ -190,11 +190,16 @@
   // responsible for the gameOver / roll / all-kept guards (see handleRoll and
   // applyKeepAndRoll) so callers can do pushHistory only when an action is
   // actually about to happen.
+  //
+  // The kept mask is intentionally preserved across rolls 1→2 and 2→3: those
+  // dice didn't change, so the user's "I've decided these are good" decision
+  // shouldn't get cleared. The kept mask is reset in applyScore (new turn),
+  // resetGame, and randomizeDice — i.e. when the dice values themselves are
+  // discarded.
   function rollDice() {
     for (let i = 0; i < 5; i++) {
       if (!kept[i]) dice[i] = 1 + Math.floor(Math.random() * 6);
     }
-    kept.fill(false);
     roll = (roll + 1) as Roll;
   }
 
@@ -216,6 +221,8 @@
   function applyRerollAll() {
     if (gameOver || roll === 3) return;
     pushHistory();
+    // Explicit clear: rollDice no longer resets keeps, but "re-roll all"
+    // means exactly what it says — drop any prior keep decisions.
     kept.fill(false);
     rollDice();
   }
@@ -348,7 +355,7 @@
         {:else}
         <div class="dice-row">
           {#each dice as face, i}
-            <div class="die-cell" class:faded={anyRecommended && !recKeepMask[i]}>
+            <div class="die-cell" class:lifted={anyRecommended && recKeepMask[i]}>
               <button
                 class="die"
                 onclick={() => cycleDie(i, 1)}
@@ -546,16 +553,26 @@
     display: grid;
     grid-template-columns: repeat(5, 1fr);
     gap: 0.5rem;
+    /* Reserve vertical space so .lifted's translateY doesn't shift the row
+       (or get clipped against the surrounding layout). Matches the lift
+       distance below. */
+    padding-top: 16px;
   }
   .die-cell {
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 0.2rem;
-    transition: opacity 0.15s;
+    transition: transform 0.15s ease;
   }
-  .die-cell.faded { opacity: 0.35; }
-  .die-cell.faded:hover { opacity: 0.7; }
+  /* Recommended dice float up with a soft drop-shadow — a positive cue on
+     the chosen ones, rather than a negative cue (dimming) on the others.
+     Keeps non-recommended dice and their "keep" checkboxes at full
+     contrast, so they don't read as disabled. */
+  .die-cell.lifted { transform: translateY(-16px); }
+  .die-cell.lifted .die svg {
+    filter: drop-shadow(0 8px 8px rgba(0, 0, 0, 0.22));
+  }
   .keep-toggle {
     display: inline-flex;
     align-items: center;
@@ -574,7 +591,7 @@
     cursor: pointer;
     width: 100%;
   }
-  .die svg { width: 100%; height: 100%; display: block; }
+  .die svg { width: 100%; height: 100%; display: block; transition: filter 0.15s ease; }
   .die svg rect {
     fill: var(--bg-card);
     stroke: var(--primary);
