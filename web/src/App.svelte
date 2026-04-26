@@ -16,22 +16,29 @@
   import Scorecard from './Scorecard.svelte';
   import HelpModal from './HelpModal.svelte';
 
-  let solver: Solver | null = null;
-  let loading = true;
-  let loadError: string | null = null;
-  let showHelp = false;
+  // `$state.raw` for the wasm-bound Solver: the binding needs to be reactive
+  // (so the recommend `$effect` re-fires once the solver loads), but we don't
+  // want Svelte to wrap the wasm-bindgen object in a deep proxy — its methods
+  // depend on internal slots that proxies don't preserve.
+  let solver = $state.raw<Solver | null>(null);
+  let loading = $state(true);
+  let loadError: string | null = $state(null);
+  let showHelp = $state(false);
 
-  let rawInputs: string[] = new Array(13).fill('');
-  let yahtzeeBonuses = 0;
+  let rawInputs: string[] = $state(new Array(13).fill(''));
+  let yahtzeeBonuses = $state(0);
+
+  type Roll = 1 | 2 | 3;
+  const ROLLS: Roll[] = [1, 2, 3];
 
   type Snapshot = {
     rawInputs: string[];
     yahtzeeBonuses: number;
     dice: number[];
     kept: boolean[];
-    roll: 1 | 2 | 3;
+    roll: Roll;
   };
-  let history: Snapshot[] = [];
+  let history: Snapshot[] = $state([]);
 
   function snapshot(): Snapshot {
     return {
@@ -57,25 +64,27 @@
     roll = last.roll;
   }
 
-  let allowedByEntry: number[][] = [];
-  let allowedSets: Set<number>[] = [];
-  let allowedLabels: string[] = [];
-  let wasmReady = false;
+  let allowedByEntry: number[][] = $state([]);
+  let allowedSets: Set<number>[] = $state([]);
+  let allowedLabels: string[] = $state([]);
+  let wasmReady = $state(false);
 
-  $: parsed = rawInputs.map((r, i) =>
+  const parsed = $derived(rawInputs.map((r, i) =>
     parseScoreInput(
       r,
       wasmReady ? { values: allowedSets[i], label: allowedLabels[i] } : null,
     ),
-  );
-  $: scores = parsed.map(p => p.value);
-  $: errors = parsed.map(p => p.error);
-  let dice: number[] = [1, 1, 1, 1, 1];
-  let kept: boolean[] = [false, false, false, false, false];
-  let roll: 1 | 2 | 3 = 1;
+  ));
+  const scores = $derived(parsed.map(p => p.value));
+  const errors = $derived(parsed.map(p => p.error));
+  let dice: number[] = $state([1, 1, 1, 1, 1]);
+  let kept: boolean[] = $state([false, false, false, false, false]);
+  let roll: Roll = $state(1);
 
-  let rec: Recommendation | null = null;
-  let recError: string | null = null;
+  // Plain data shape, but `$state.raw` since we always replace the whole
+  // object — no need for a deep proxy.
+  let rec = $state.raw<Recommendation | null>(null);
+  let recError: string | null = $state(null);
 
   onMount(async () => {
     // Run wasm init and the scores.bin fetch concurrently — neither depends
@@ -103,29 +112,30 @@
 
   // Which scorecard rows are filled (i.e. unavailable to score into again).
   // Distinct from `rec.entries`, which is the list of scoring recommendations.
-  $: filledMask = scores.map(s => s !== null);
-  $: upperFilled = scores.slice(0, 6).reduce<number>((a, b) => a + (b ?? 0), 0);
-  $: lowerFilled = scores.slice(6).reduce<number>((a, b) => a + (b ?? 0), 0);
-  $: upperScoreRemaining = Math.max(0, 63 - upperFilled);
-  $: upperBonus = upperFilled >= 63 ? 35 : 0;
-  $: turnsPlayed = scores.filter(s => s !== null).length;
-  $: gameOver = turnsPlayed === 13;
-  $: maxYahtzeeBonuses = maxYahtzeeBonusesFor(scores[YAHTZEE_IDX], turnsPlayed);
-  $: {
+  const filledMask = $derived(scores.map(s => s !== null));
+  const upperFilled = $derived(scores.slice(0, 6).reduce<number>((a, b) => a + (b ?? 0), 0));
+  const lowerFilled = $derived(scores.slice(6).reduce<number>((a, b) => a + (b ?? 0), 0));
+  const upperScoreRemaining = $derived(Math.max(0, 63 - upperFilled));
+  const upperBonus = $derived(upperFilled >= 63 ? 35 : 0);
+  const turnsPlayed = $derived(scores.filter(s => s !== null).length);
+  const gameOver = $derived(turnsPlayed === 13);
+  const maxYahtzeeBonuses = $derived(maxYahtzeeBonusesFor(scores[YAHTZEE_IDX], turnsPlayed));
+  $effect(() => {
     const clamped = Math.max(0, Math.min(yahtzeeBonuses | 0, maxYahtzeeBonuses));
     if (clamped !== yahtzeeBonuses) yahtzeeBonuses = clamped;
-  }
-  $: yahtzeeBonusPoints = yahtzeeBonuses * 100;
-  $: currentTotal = upperFilled + upperBonus + lowerFilled + yahtzeeBonusPoints;
-  $: yahtzeeBonusEligible = scores[YAHTZEE_IDX] === 50;
+  });
+  const yahtzeeBonusPoints = $derived(yahtzeeBonuses * 100);
+  const currentTotal = $derived(upperFilled + upperBonus + lowerFilled + yahtzeeBonusPoints);
+  const yahtzeeBonusEligible = $derived(scores[YAHTZEE_IDX] === 50);
 
-  $: stateInput = {
+  const stateInput = $derived({
     entries: filledMask,
     yahtzee_bonus_eligible: yahtzeeBonusEligible,
     upper_score_remaining: upperScoreRemaining,
-  };
+  });
 
-  $: if (solver) {
+  $effect(() => {
+    if (!solver) return;
     try {
       rec = solver.recommend(stateInput, new Uint8Array(dice), roll) as Recommendation;
       recError = null;
@@ -133,25 +143,24 @@
       rec = null;
       recError = String(e);
     }
-  }
+  });
 
   function cycleDie(i: number, delta: number) {
     pushHistory();
-    const next = cycleFace(dice[i], delta);
-    dice = dice.map((v, j) => (j === i ? next : v));
+    dice[i] = cycleFace(dice[i], delta);
   }
 
   // The Joker rule fires when the dice are a Yahtzee, the Yahtzee box is
   // already filled (any value), AND the matching upper box is already filled.
   // Lower-row categories then accept fixed joker scores (full house = 25,
   // small straight = 30, large straight = 40).
-  $: jokerActive = (() => {
+  const jokerActive = $derived.by(() => {
     const c = [0, 0, 0, 0, 0, 0];
     for (const v of dice) c[v - 1]++;
     const face = c.findIndex(x => x === 5) + 1;
     if (face === 0) return false;
     return scores[YAHTZEE_IDX] !== null && scores[face - 1] !== null;
-  })();
+  });
 
   // Highlight the joker-rule indicator only on lower-row "shaped" categories
   // (full house, small straight, large straight) — those are the ones that
@@ -160,21 +169,21 @@
     return jokerActive && (i === 8 || i === 9 || i === 10);
   }
 
-  $: choices = buildChoices(rec);
+  const choices = $derived(buildChoices(rec));
 
-  $: hasJokerChoice = choices.some(
+  const hasJokerChoice = $derived(choices.some(
     c => c.kind === 'score' && isJokerEnabled(c.entryIdx)
-  );
+  ));
 
   function toggleKeep(i: number) {
-    kept = kept.map((v, j) => (j === i ? !v : v));
+    kept[i] = !kept[i];
   }
 
   function randomizeDice() {
     if (gameOver) return;
     pushHistory();
     dice = randomDice();
-    kept = [false, false, false, false, false];
+    kept.fill(false);
   }
 
   // Re-roll any die not marked kept and advance the roll counter. Caller is
@@ -182,13 +191,11 @@
   // applyKeepAndRoll) so callers can do pushHistory only when an action is
   // actually about to happen.
   function rollDice() {
-    const next = dice.slice();
     for (let i = 0; i < 5; i++) {
-      if (!kept[i]) next[i] = 1 + Math.floor(Math.random() * 6);
+      if (!kept[i]) dice[i] = 1 + Math.floor(Math.random() * 6);
     }
-    dice = next;
-    kept = [false, false, false, false, false];
-    roll = (roll + 1) as 1 | 2 | 3;
+    kept.fill(false);
+    roll = (roll + 1) as Roll;
   }
 
   function handleRoll() {
@@ -209,7 +216,7 @@
   function applyRerollAll() {
     if (gameOver || roll === 3) return;
     pushHistory();
-    kept = [false, false, false, false, false];
+    kept.fill(false);
     rollDice();
   }
 
@@ -254,57 +261,57 @@
     // game-over screen can render against the final state.
     const otherFilled = filledMask.reduce((a, b, i) => a + (i !== idx && b ? 1 : 0), 0);
     if (otherFilled + 1 >= 13) {
-      kept = [false, false, false, false, false];
+      kept.fill(false);
       return;
     }
     dice = randomDice();
-    kept = [false, false, false, false, false];
+    kept.fill(false);
     roll = 1;
   }
 
   // Mask of dice the top recommendation cares about. Drives the fade on
   // non-recommended dice in the dice row. For 'reroll' nothing is highlighted
   // (we want the user to feel free to re-roll everything).
-  $: recKeepMask = (() => {
+  const recKeepMask = $derived.by(() => {
     const top = choices[0];
     if (!top) return [false, false, false, false, false];
     if (top.kind === 'keep') return keepMaskFor(top.dice, dice);
     if (top.kind === 'score') return scoreContributionMask(top.entryIdx, dice);
     return [false, false, false, false, false];
-  })();
-  $: anyRecommended = recKeepMask.some(Boolean);
+  });
+  const anyRecommended = $derived(recKeepMask.some(Boolean));
 
   // Which scorecard row to highlight as the top suggestion (-1 = none).
-  $: scoreHighlightIdx = choices[0]?.kind === 'score' ? choices[0].entryIdx : -1;
+  const scoreHighlightIdx = $derived(choices[0]?.kind === 'score' ? choices[0].entryIdx : -1);
 
-  function setRoll(r: number) {
+  function setRoll(r: Roll) {
     if (r === roll) return;
     pushHistory();
-    roll = r as 1 | 2 | 3;
+    roll = r;
   }
 
   function resetGame() {
     pushHistory();
-    rawInputs = new Array(13).fill('');
+    rawInputs.fill('');
     yahtzeeBonuses = 0;
     dice = randomDice();
-    kept = [false, false, false, false, false];
+    kept.fill(false);
     roll = 1;
   }
 
-  $: projectedFinal = rec ? (currentTotal + rec.value).toFixed(1) : '—';
-  $: turnText = `${Math.min(turnsPlayed + (gameOver ? 0 : 1), 13)} / 13`;
+  const projectedFinal = $derived(rec ? (currentTotal + rec.value).toFixed(1) : '—');
+  const turnText = $derived(`${Math.min(turnsPlayed + (gameOver ? 0 : 1), 13)} / 13`);
 </script>
 
-<svelte:window on:keydown={onKey} />
+<svelte:window onkeydown={onKey} />
 
 <main>
   <header>
     <h1>easy-yahtzee</h1>
     <div class="header-actions">
-      <button class="reset" on:click={() => (showHelp = true)} title="Help (?)">?</button>
-      <button class="reset" disabled={history.length === 0} on:click={undo} title="Undo (U)">Undo</button>
-      <button class="reset" on:click={resetGame}>Reset</button>
+      <button class="reset" onclick={() => (showHelp = true)} title="Help (?)">?</button>
+      <button class="reset" disabled={history.length === 0} onclick={undo} title="Undo (U)">Undo</button>
+      <button class="reset" onclick={resetGame}>Reset</button>
     </div>
   </header>
 
@@ -336,7 +343,7 @@
           <div class="game-over">
             <h2>Game over</h2>
             <p>Final score <strong>{currentTotal}</strong></p>
-            <button class="roll-btn primary" on:click={resetGame}>New game</button>
+            <button class="roll-btn primary" onclick={resetGame}>New game</button>
           </div>
         {:else}
         <div class="dice-row">
@@ -344,9 +351,9 @@
             <div class="die-cell" class:faded={anyRecommended && !recKeepMask[i]}>
               <button
                 class="die"
-                on:click={() => cycleDie(i, 1)}
-                on:contextmenu|preventDefault={() => cycleDie(i, -1)}
-                on:wheel|preventDefault={(e) => cycleDie(i, e.deltaY > 0 ? 1 : -1)}
+                onclick={() => cycleDie(i, 1)}
+                oncontextmenu={(e) => { e.preventDefault(); cycleDie(i, -1); }}
+                onwheel={(e) => { e.preventDefault(); cycleDie(i, e.deltaY > 0 ? 1 : -1); }}
                 title="Click to advance face, right-click or scroll to reverse"
               >
                 <svg viewBox="0 0 100 100">
@@ -357,7 +364,7 @@
                 </svg>
               </button>
               <label class="keep-toggle">
-                <input type="checkbox" checked={kept[i]} on:change={() => toggleKeep(i)} />
+                <input type="checkbox" checked={kept[i]} onchange={() => toggleKeep(i)} />
                 keep
               </label>
             </div>
@@ -365,22 +372,22 @@
         </div>
 
         <div class="roll-row">
-          {#each [1, 2, 3] as r}
-            <button class="seg" class:on={roll === r} on:click={() => setRoll(r)}>
+          {#each ROLLS as r}
+            <button class="seg" class:on={roll === r} onclick={() => setRoll(r)}>
               {r}
             </button>
           {/each}
           <button
             class="roll-btn"
             disabled={roll === 3 || kept.every(k => k)}
-            on:click={handleRoll}
+            onclick={handleRoll}
             title={roll === 3 ? 'No rolls left' : (kept.every(k => k) ? 'All dice kept' : 'Re-roll dice not marked keep')}
           >
             Roll
           </button>
           <button
             class="roll-btn"
-            on:click={randomizeDice}
+            onclick={randomizeDice}
             title="Randomize all dice without advancing the roll"
           >
             Randomize
@@ -426,12 +433,12 @@
                     <code>{(currentTotal + c.ev).toFixed(1)}</code>
                     {#if c.kind === 'score'}
                       {@const idx = c.entryIdx}
-                      <button class="apply" class:primary={ci === 0} on:click={() => applyScore(idx)}>Apply</button>
+                      <button class="apply" class:primary={ci === 0} onclick={() => applyScore(idx)}>Apply</button>
                     {:else if c.kind === 'keep'}
                       {@const faces = c.dice}
-                      <button class="apply" class:primary={ci === 0} disabled={roll === 3} on:click={() => applyKeepAndRoll(faces)}>Apply</button>
+                      <button class="apply" class:primary={ci === 0} disabled={roll === 3} onclick={() => applyKeepAndRoll(faces)}>Apply</button>
                     {:else}
-                      <button class="apply" class:primary={ci === 0} disabled={roll === 3} on:click={applyRerollAll}>Apply</button>
+                      <button class="apply" class:primary={ci === 0} disabled={roll === 3} onclick={applyRerollAll}>Apply</button>
                     {/if}
                   </li>
                 {/each}
