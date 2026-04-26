@@ -15,4 +15,10 @@ rayon = "1"
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
+
+[[bench]]
+name = "recommend"
+harness = false
 proptest = "1"
