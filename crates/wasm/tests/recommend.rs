@@ -21,12 +21,10 @@ fn opening_large_straight_roll_3() {
 
     assert!((rec.value - 254.5896).abs() < 0.0001, "value = {}", rec.value);
 
-    let entries = rec.entries.expect("roll 3 returns entries");
-    let top = &entries[0];
-    assert_eq!(top.entry, "large_straight");
-    assert!(
-        (top.ev - 261.53375).abs() < 0.01,
-        "top EV = {}",
-        top.ev
-    );
+    // Roll 3 has no keepers; the choice list is `entries`.
+    assert!(rec.keepers.is_none(), "roll 3 should have no keepers");
+    let top = &rec.entries[0];
+    // Index 10 == LARGE_STRAIGHT in ENTRY_ACTIONS.
+    assert_eq!(top.entry, 10);
+    assert!((top.ev - 261.53375).abs() < 0.01, "top EV = {}", top.ev);
 }

@@ -20,10 +20,10 @@ Prerequisites:
 
    ```sh
    # from the workspace root
-   cargo run --release --bin build-cache
+   cargo run -p yahtzee-cli --release -- build --output web/static/scores.bin --brotli
    ```
 
-   This writes `web/static/scores.bin.br` (a brotli-compressed bincode of the `Scores` table). The dev server serves it at `/scores.bin` with the right `Content-Encoding`.
+   This writes `web/static/scores.bin`, `web/static/scores.bin.br` (a brotli-compressed bincode of the `Scores` table), and `web/static/MANIFEST` with SHA-256 hashes. The dev server serves the `.br` at `/scores.bin` with the right `Content-Encoding`.
 
 Then in `web/`:
 

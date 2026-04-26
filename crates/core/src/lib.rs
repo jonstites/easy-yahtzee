@@ -17,6 +17,12 @@ extern crate lazy_static;
 #[macro_use]
 extern crate bitflags;
 
+mod recommend;
+pub use recommend::{
+    build_state, counts_to_faces, dice_to_counts, recommend, EntryRec, KeeperRec, Recommendation,
+    StateInput,
+};
+
 // 2^13 * 2 * 64
 // 13 Entries, 1 bit for Yahtzee bonus eligibility, and 64 for upper score
 const NUM_STATES: u32 = 1_048_576;

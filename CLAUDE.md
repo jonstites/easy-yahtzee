@@ -16,11 +16,11 @@ Cargo workspace (`Cargo.toml` lists members; the root is not a crate):
 - Build: `cargo build` (release: `cargo build --release`).
 - Test: `cargo test` — `Cargo.toml` sets `[profile.test] opt-level = 3` because `Scores::new()` is used in tests and is minutes-to-hours slow at `opt-level = 0`.
 - Run a single test: `cargo test -p yahtzee-core test_expected_value -- --nocapture`.
-- CLI: `cargo run -p yahtzee-cli --release -- --help`. Generating scores from scratch is slow, so the typical flow is `cargo run -p yahtzee-cli --release -- -o scores.ytz` once, then `-i scores.ytz ...` for queries.
+- CLI: `cargo run -p yahtzee-cli --release -- --help`. Subcommands are `solve`, `value`, and `build`. Generating the score table is slow, so the typical flow is `cargo run -p yahtzee-cli --release -- build --output scores.bin` once, then `easy-yahtzee solve --scores scores.bin --roll N --dice ...` (and `value` / `--format json`) for queries. The web bundle uses `build --output web/static/scores.bin --brotli` to also produce `scores.bin.br` and a `MANIFEST`.
 - Rebuild wasm after touching `crates/core` or `crates/wasm`: `cd crates/wasm && wasm-pack build --target web --out-dir pkg`. The Svelte dev server picks up the new `pkg/` automatically.
 - Web dev: `cd web && npx vite` (or `pnpm run dev` if pnpm is available). Type check: `npx svelte-check --tsconfig ./tsconfig.json`. Production build: `npx vite build`.
 
-The web app expects `scores.bin` (a bincode-serialized `Scores`) at the site root. Generate it via the CLI and copy to `web/public/scores.bin`.
+The web app expects `scores.bin.br` (brotli-compressed `Scores`) under `web/static/`; the dev-server middleware streams it as `/scores.bin` with `Content-Encoding: br`. The `easy-yahtzee build --brotli` invocation above puts it in the right place.
 
 ## Core architecture
 

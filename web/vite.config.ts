@@ -16,7 +16,9 @@ function serveBrotliScores(): Plugin {
       fs.createReadStream(file).pipe(res);
     } catch {
       res.statusCode = 404;
-      res.end(`scores.bin.br not found — run \`cargo run --release --bin build-cache\``);
+      res.end(
+        `scores.bin.br not found — run \`cargo run -p yahtzee-cli --release -- build --output web/static/scores.bin --brotli\``,
+      );
     }
   };
   return {
