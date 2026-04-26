@@ -56,3 +56,61 @@ jobs:
       - name: wasm-pack build
         working-directory: crates/wasm
         run: wasm-pack build --target web --out-dir pkg
+
+  web:
+    name: Web (vitest + Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/wasm
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      # The web package links `yahtzee-wasm` from `crates/wasm/pkg/`, so the
+      # wasm bundle has to exist before `pnpm install` resolves the link.
+      - name: wasm-pack build
+        working-directory: crates/wasm
+        run: wasm-pack build --target web --out-dir pkg
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: pnpm install
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: svelte-check
+        working-directory: web
+        run: pnpm run check
+
+      - name: vitest
+        working-directory: web
+        run: pnpm test
+
+      - name: Install Playwright browsers
+        working-directory: web
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Playwright e2e
+        working-directory: web
+        run: pnpm e2e
