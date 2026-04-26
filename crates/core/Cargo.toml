@@ -21,3 +21,4 @@ proptest = "1"
 [[bench]]
 name = "recommend"
 harness = false
+proptest = "1"
