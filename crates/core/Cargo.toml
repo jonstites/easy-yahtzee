@@ -13,3 +13,6 @@ bitflags = { version = "2", features = ["serde"] }
 ndarray = { version = "0.16", features = ["serde", "rayon"] }
 rayon = "1"
 serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
