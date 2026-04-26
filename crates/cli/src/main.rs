@@ -1,4 +1,4 @@
-use easy_yahtzee::{DiceCounts, EntryAction, Scores, State, ENTRY_ACTIONS};
+use yahtzee_core::{DiceCounts, EntryAction, Scores, State, ENTRY_ACTIONS};
 
 use std::env;
 use std::fs::File;
