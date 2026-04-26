@@ -221,7 +221,8 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
     let scores = Scores::new();
 
     eprintln!("[build] serializing with bincode ...");
-    let raw: Vec<u8> = bincode::serialize(&scores).context("bincode serialize")?;
+    let raw: Vec<u8> = bincode::serde::encode_to_vec(&scores, bincode::config::standard())
+        .context("bincode serialize")?;
     fs::write(&args.output, &raw)
         .with_context(|| format!("writing {}", args.output.display()))?;
     eprintln!("[build] wrote {} ({} bytes)", args.output.display(), raw.len());
@@ -298,8 +299,9 @@ fn load_or_embedded_scores(path: Option<&std::path::Path>) -> Result<Scores> {
 
 fn load_scores(path: &std::path::Path) -> Result<Scores> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let scores: Scores =
-        bincode::deserialize(&bytes).with_context(|| format!("deserializing {}", path.display()))?;
+    let (scores, _): (Scores, _) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+            .with_context(|| format!("deserializing {}", path.display()))?;
     Ok(scores)
 }
 
@@ -310,8 +312,9 @@ fn embedded_scores() -> Result<Scores> {
     let mut reader: &[u8] = EMBEDDED_SCORES_BR;
     brotli::BrotliDecompress(&mut reader, &mut decompressed)
         .context("decompressing embedded score table")?;
-    let scores: Scores = bincode::deserialize(&decompressed)
-        .context("deserializing embedded score table (regenerate the embed?)")?;
+    let (scores, _): (Scores, _) =
+        bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())
+            .context("deserializing embedded score table (regenerate the embed?)")?;
     Ok(scores)
 }
 

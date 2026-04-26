@@ -121,7 +121,7 @@ pub(crate) fn run_with_io<R: BufRead, W: Write>(
 ) -> Result<u32> {
     let mut rng = match args.seed {
         Some(s) => StdRng::seed_from_u64(s),
-        None => StdRng::from_entropy(),
+        None => StdRng::from_os_rng(),
     };
     let mut card = Scorecard::default();
 
@@ -607,7 +607,7 @@ fn prompt_partial<R: BufRead, W: Write>(
 fn roll_five(rng: &mut StdRng) -> [u8; 5] {
     let mut out = [0u8; 5];
     for slot in &mut out {
-        *slot = rng.gen_range(1..=6);
+        *slot = rng.random_range(1..=6);
     }
     out.sort();
     out
@@ -619,7 +619,7 @@ fn reroll(rng: &mut StdRng, kept: &[u8]) -> [u8; 5] {
         out[i] = d;
     }
     for i in kept.len()..5 {
-        out[i] = rng.gen_range(1..=6);
+        out[i] = rng.random_range(1..=6);
     }
     out.sort();
     out
