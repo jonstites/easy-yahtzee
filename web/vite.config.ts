@@ -5,7 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 function serveBrotliScores(): Plugin {
-  const resolved = (root: string) => path.resolve(root, 'static/scores.bin.br');
+  // Read the canonical brotli blob out of the CLI crate. Same artifact the
+  // CLI binary embeds via `include_bytes!`, so the web and CLI never drift.
+  const resolved = (root: string) => path.resolve(root, '../crates/cli/data/scores.bin.br');
   const handler = (root: string): Connect.SimpleHandleFunction => (req, res) => {
     const file = resolved(root);
     try {
@@ -17,7 +19,7 @@ function serveBrotliScores(): Plugin {
     } catch {
       res.statusCode = 404;
       res.end(
-        `scores.bin.br not found — run \`cargo run -p yahtzee-cli --release -- build --output web/static/scores.bin --brotli\``,
+        `scores.bin.br not found — run \`cargo run -p yahtzee-cli --release -- build --output crates/cli/data/scores.bin --brotli\``,
       );
     }
   };

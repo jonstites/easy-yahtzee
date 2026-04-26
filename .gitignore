@@ -61,10 +61,13 @@ Cargo.lock
 # Generated wasm-pack output
 crates/wasm/pkg/
 
-# Generated solver cache (regenerate with: cargo run --release --bin build-cache)
-web/static/scores.bin
-web/static/scores.bin.br
-web/static/MANIFEST
+# Solver cache. `scores.bin.br` is the canonical artifact and IS tracked — it's
+# the embed source for the CLI binary and what the web dev server streams. The
+# intermediate uncompressed `scores.bin` and the human-readable `MANIFEST` are
+# regenerable and not tracked. Regenerate with:
+#   cargo run -p yahtzee-cli --release -- build --output crates/cli/data/scores.bin --brotli
+crates/cli/data/scores.bin
+crates/cli/data/MANIFEST
 
 # Node / pnpm
 node_modules/

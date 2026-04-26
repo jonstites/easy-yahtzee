@@ -16,11 +16,11 @@ Cargo workspace (`Cargo.toml` lists members; the root is not a crate):
 - Build: `cargo build` (release: `cargo build --release`).
 - Test: `cargo test` — `Cargo.toml` sets `[profile.test] opt-level = 3` because `Scores::new()` is used in tests and is minutes-to-hours slow at `opt-level = 0`.
 - Run a single test: `cargo test -p yahtzee-core test_expected_value -- --nocapture`.
-- CLI: `cargo run -p yahtzee-cli --release -- --help`. Subcommands are `solve`, `value`, and `build`. Generating the score table is slow, so the typical flow is `cargo run -p yahtzee-cli --release -- build --output scores.bin` once, then `easy-yahtzee solve --scores scores.bin --roll N --dice ...` (and `value` / `--format json`) for queries. The web bundle uses `build --output web/static/scores.bin --brotli` to also produce `scores.bin.br` and a `MANIFEST`.
+- CLI: `cargo run -p yahtzee-cli --release -- --help`. Subcommands are `solve`, `value`, and `build`. The CLI binary embeds a brotli-compressed score table at compile time (canonical artifact: `crates/cli/data/scores.bin.br`, ~1 MiB, tracked in git), so `solve` and `value` work out of the box with no `--scores` flag. `--scores PATH` overrides the embed with a raw bincode file from disk — useful when iterating on `crates/core` without rebuilding the CLI. `build` regenerates the table; the web bundle uses `build --output crates/cli/data/scores.bin --brotli`, which also writes the `.br` and a `MANIFEST` and updates the embed source for the next CLI rebuild.
 - Rebuild wasm after touching `crates/core` or `crates/wasm`: `cd crates/wasm && wasm-pack build --target web --out-dir pkg`. The Svelte dev server picks up the new `pkg/` automatically.
 - Web dev: `cd web && npx vite` (or `pnpm run dev` if pnpm is available). Type check: `npx svelte-check --tsconfig ./tsconfig.json`. Production build: `npx vite build`.
 
-The web app expects `scores.bin.br` (brotli-compressed `Scores`) under `web/static/`; the dev-server middleware streams it as `/scores.bin` with `Content-Encoding: br`. The `easy-yahtzee build --brotli` invocation above puts it in the right place.
+The web app expects `scores.bin.br` (brotli-compressed `Scores`) at `crates/cli/data/scores.bin.br` — the same file the CLI embeds. The dev-server middleware in `web/vite.config.ts` reads from there and streams it at `/scores.bin` with `Content-Encoding: br`. There is no longer a separate `web/static/scores.bin.br`.
 
 ## Core architecture
 

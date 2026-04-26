@@ -3,11 +3,13 @@
 //! Subcommands:
 //!   * `solve`  — recommend the next move from a position.
 //!   * `value`  — print the overall expected final score from a position.
-//!   * `build`  — generate the precomputed score table (slow: minutes).
+//!   * `build`  — generate the precomputed score table (~10s on a modern
+//!                desktop at release; minutes on slower hardware or CI).
 //!
-//! For now `solve` and `value` require `--scores PATH` to point at a file
-//! produced by `build`. A follow-up will embed the score table into the
-//! binary so the common case needs no extra files.
+//! `solve` and `value` use the score table embedded in the binary by default
+//! (`crates/cli/data/scores.bin.br`, brotli-decompressed at startup).
+//! `--scores PATH` overrides the embedded blob with a raw bincode file from
+//! disk — useful for testing a freshly-rebuilt table before checking it in.
 
 use std::fs;
 use std::io::Write;
@@ -41,8 +43,9 @@ enum Cmd {
     Solve(SolveArgs),
     /// Print the overall expected final score from a position.
     Value(ValueArgs),
-    /// Generate the precomputed score table and write it to disk. Slow
-    /// (minutes); typically run once per `crates/core` change.
+    /// Generate the precomputed score table and write it to disk. ~10s at
+    /// release on a modern desktop, longer at debug or on slower hardware.
+    /// Typically run once per `crates/core` serialization-layout change.
     Build(BuildArgs),
 }
 
@@ -50,9 +53,11 @@ enum Cmd {
 /// scorecard-space, plus the score-table source.
 #[derive(Args, Clone)]
 struct StateArgs {
-    /// Path to a score table produced by `easy-yahtzee build`.
+    /// Override the embedded score table with a raw bincode file produced by
+    /// `easy-yahtzee build` (no `--brotli`). Useful when iterating on
+    /// `crates/core` without rebuilding the CLI binary.
     #[arg(long, value_name = "PATH")]
-    scores: PathBuf,
+    scores: Option<PathBuf>,
 
     /// Already-filled categories, comma-separated. Names: ones, twos, threes,
     /// fours, fives, sixes, three-of-a-kind, four-of-a-kind, full-house,
@@ -141,7 +146,7 @@ fn main() -> Result<()> {
 }
 
 fn cmd_solve(args: SolveArgs) -> Result<()> {
-    let scores = load_scores(&args.state.scores)?;
+    let scores = load_or_embedded_scores(args.state.scores.as_deref())?;
     let input = state_input(&args.state);
     let rec = recommend(&scores, &input, &args.dice, args.roll)
         .map_err(|e| anyhow!("recommend failed: {e}"))?;
@@ -154,7 +159,7 @@ fn cmd_solve(args: SolveArgs) -> Result<()> {
 }
 
 fn cmd_value(args: ValueArgs) -> Result<()> {
-    let scores = load_scores(&args.state.scores)?;
+    let scores = load_or_embedded_scores(args.state.scores.as_deref())?;
     let input = state_input(&args.state);
     let state = yahtzee_core::build_state(&input).map_err(|e| anyhow!(e))?;
     let value = scores.values(state).value;
@@ -244,10 +249,34 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
 // Helpers: scores I/O, state construction
 // ---------------------------------------------------------------------------
 
+/// The canonical solver table, brotli-compressed bincode of `Scores`. Tracked
+/// in git at `crates/cli/data/scores.bin.br` so fresh clones can build the CLI
+/// without first running the multi-minute `Scores::new()` from `crates/core`.
+const EMBEDDED_SCORES_BR: &[u8] = include_bytes!("../data/scores.bin.br");
+
+fn load_or_embedded_scores(path: Option<&std::path::Path>) -> Result<Scores> {
+    match path {
+        Some(p) => load_scores(p),
+        None => embedded_scores(),
+    }
+}
+
 fn load_scores(path: &std::path::Path) -> Result<Scores> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let scores: Scores =
         bincode::deserialize(&bytes).with_context(|| format!("deserializing {}", path.display()))?;
+    Ok(scores)
+}
+
+/// Decompress and deserialize the embedded score table. Allocates ~4 MiB for
+/// the decompressed bincode buffer; the decode itself takes tens of ms.
+fn embedded_scores() -> Result<Scores> {
+    let mut decompressed: Vec<u8> = Vec::with_capacity(4 * 1024 * 1024);
+    let mut reader: &[u8] = EMBEDDED_SCORES_BR;
+    brotli::BrotliDecompress(&mut reader, &mut decompressed)
+        .context("decompressing embedded score table")?;
+    let scores: Scores = bincode::deserialize(&decompressed)
+        .context("deserializing embedded score table (regenerate the embed?)")?;
     Ok(scores)
 }
 

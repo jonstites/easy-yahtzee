@@ -48,7 +48,7 @@ First-time Playwright setup needs `pnpm exec playwright install chromium` (downl
 ## Things that need rebuilding
 
 - **After touching `crates/core` or `crates/wasm`:** rebuild the wasm pkg with `cd ../crates/wasm && wasm-pack build --target web --out-dir pkg`. The dev server hot-reloads.
-- **After touching `Scores` serialization (in `crates/core`):** regenerate `static/scores.bin.br`: from the repo root, `cargo run -p yahtzee-cli --release -- build --output web/static/scores.bin --brotli`.
+- **After touching `Scores` serialization (in `crates/core`):** regenerate the canonical brotli blob at `crates/cli/data/scores.bin.br` (read by both the CLI's `include_bytes!` and the web dev server): from the repo root, `cargo run -p yahtzee-cli --release -- build --output crates/cli/data/scores.bin --brotli`. There is no longer a separate file under `web/static/`.
 
 ## Vitest / Playwright file globs
 

@@ -16,14 +16,14 @@ Prerequisites:
 
    Re-run this whenever you touch `crates/core` or `crates/wasm`.
 
-4. Generate the solver cache (one-time, slow — minutes on a fast machine):
+4. Generate the solver cache (one-time, ~10s at release on a fast desktop, longer on slower hardware):
 
    ```sh
    # from the workspace root
-   cargo run -p yahtzee-cli --release -- build --output web/static/scores.bin --brotli
+   cargo run -p yahtzee-cli --release -- build --output crates/cli/data/scores.bin --brotli
    ```
 
-   This writes `web/static/scores.bin`, `web/static/scores.bin.br` (a brotli-compressed bincode of the `Scores` table), and `web/static/MANIFEST` with SHA-256 hashes. The dev server serves the `.br` at `/scores.bin` with the right `Content-Encoding`.
+   `crates/cli/data/scores.bin.br` is the canonical brotli-compressed `Scores` table — the **same file** the CLI binary embeds via `include_bytes!`, and the file the dev server streams at `/scores.bin` with `Content-Encoding: br`. The intermediate `scores.bin` and human-readable `MANIFEST` are gitignored. You only need to rerun this when `crates/core`'s serialization layout changes.
 
 Then in `web/`:
 
