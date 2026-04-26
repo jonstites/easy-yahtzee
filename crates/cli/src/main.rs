@@ -1,10 +1,10 @@
 //! `easy-yahtzee` — CLI for the Yahtzee solver.
 //!
 //! Subcommands:
-//!   * `solve`  — recommend the next move from a position.
-//!   * `value`  — print the overall expected final score from a position.
-//!   * `build`  — generate the precomputed score table (~10s on a modern
-//!                desktop at release; minutes on slower hardware or CI).
+//! * `solve`  — recommend the next move from a position.
+//! * `value`  — print the overall expected final score from a position.
+//! * `build`  — generate the precomputed score table (~10s on a modern
+//!   desktop at release; minutes on slower hardware or CI).
 //!
 //! `solve` and `value` use the score table embedded in the binary by default
 //! (`crates/cli/data/scores.bin.br`, brotli-decompressed at startup).
@@ -210,11 +210,10 @@ fn cmd_value(args: ValueArgs) -> Result<()> {
 }
 
 fn cmd_build(args: BuildArgs) -> Result<()> {
-    if let Some(parent) = args.output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
+    if let Some(parent) = args.output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
 
     eprintln!("[build] computing Scores::new() ...");

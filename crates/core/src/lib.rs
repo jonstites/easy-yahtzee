@@ -158,7 +158,7 @@ mod math {
 
     /// Generates a lookup from `DiceCounts` to index
     pub fn dice_idx_lookup() -> HashMap<DiceCounts, usize> {
-        dice_combinations(NUM_DICE as u8)
+        dice_combinations(NUM_DICE)
             .into_iter()
             .enumerate()
             .map(|(idx, dice)| (dice, idx))
@@ -166,11 +166,7 @@ mod math {
     }
 
     pub fn idx_keepers_lookup() -> HashMap<usize, DiceCounts> {
-        (0..=5)
-            .flat_map(dice_combinations)
-            .into_iter()
-            .enumerate()
-            .collect()
+        (0..=5).flat_map(dice_combinations).enumerate().collect()
     }
 
     /// Creates a vector specifying which `DiceCounts` are Yahtzees
@@ -366,7 +362,7 @@ mod math {
 }
 
 // Packed bitset over NUM_STATES entries (16_384 u64 words = 128 KiB).
-const VALID_STATES_WORDS: usize = (NUM_STATES as usize + 63) / 64;
+const VALID_STATES_WORDS: usize = (NUM_STATES as usize).div_ceil(64);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scores {
@@ -375,6 +371,12 @@ pub struct Scores {
 }
 
 impl Scores {
+    // `Default::default()` traditionally implies a cheap construction;
+    // `Scores::new()` runs the entire DP and takes ~22s in tests / minutes at
+    // opt-level 0. Implementing `Default` would be misleading. The CLI / wasm
+    // load a precomputed table from disk rather than calling `new()` at
+    // startup; only the `build` subcommand and tests instantiate fresh.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Scores {
         let state_scores = Array1::zeros(NUM_STATES as usize);
         let valid_states = vec![0_u64; VALID_STATES_WORDS].into_boxed_slice();
@@ -413,10 +415,9 @@ impl Scores {
     }
 
     pub fn values(&self, state: State) -> ExpectedValues {
-        let mut expected_values = ExpectedValues::default();
-        expected_values.state = state;
-
-        // values of each entry for each final dice roll
+        // Overall EV of each (action, final dice) pair: `score + V(child)` for
+        // valid actions, 0 for invalid. We keep this around as part of the
+        // returned `ExpectedValues` so the per-entry EV API can read it.
         let entry_actions = Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
             let action = EntryAction::from_bits(1 << action_idx).unwrap();
             if state.is_valid_action(action) {
@@ -428,53 +429,58 @@ impl Scores {
             }
         });
 
-        expected_values.entry_actions = entry_actions.clone();
-
-        // value of each final dice roll
+        // Value of each roll-3 dice combo: max action overall EV.
         let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, value| acc.max(*value));
 
-        expected_values.third_dice = third_dice.clone();
-
+        // Value of each roll-2 keeper: P(keeper → roll3 dice) · third_dice.
         let mut second_keepers: Array1<f32> = Array1::zeros(462);
-
         Zip::from(&mut second_keepers)
             .and(KEEPERS_TO_DICE_PROBABILITIES.rows())
             .for_each(|avg, act| {
                 *avg = (&act * &third_dice).sum();
             });
-        expected_values.second_keepers = second_keepers.clone();
 
-        let mut second_dice = third_dice;
+        // Value of each roll-2 dice combo: max over k2-valid-for-d2 of
+        // second_keepers. We clone third_dice rather than move-and-overwrite
+        // so the original can flow into the returned struct.
+        let mut second_dice = third_dice.clone();
         Zip::from(&mut second_dice)
             .and(DICE_TO_ALLOWED_KEEPERS.rows())
             .for_each(|val, dice_to_action| {
                 *val = (&dice_to_action * &second_keepers).fold(0_f32, |acc, elem| acc.max(*elem));
             });
 
-        expected_values.second_dice = second_dice.clone();
-
-        let mut first_keepers = second_keepers;
-
+        // Value of each roll-1 keeper: P(keeper → roll2 dice) · second_dice.
+        let mut first_keepers = second_keepers.clone();
         Zip::from(&mut first_keepers)
             .and(KEEPERS_TO_DICE_PROBABILITIES.rows())
             .for_each(|avg, act| {
                 *avg = (&act * &second_dice).sum();
             });
 
-        expected_values.first_keepers = first_keepers.clone();
-
-        let mut first_dice = second_dice;
+        // Value of each roll-1 dice combo: max over k1-valid-for-d1 of
+        // first_keepers.
+        let mut first_dice = second_dice.clone();
         Zip::from(&mut first_dice)
             .and(DICE_TO_ALLOWED_KEEPERS.rows())
             .for_each(|val, dice_to_action| {
                 *val = (&dice_to_action * &first_keepers).fold(0_f32, |acc, elem| acc.max(*elem));
             });
 
-        expected_values.first_dice = first_dice.clone();
-
+        // Marginal over the initial-roll distribution gives overall state EV.
         let first_roll_probabilities = KEEPERS_TO_DICE_PROBABILITIES.index_axis(Axis(0), 0);
-        expected_values.value = first_roll_probabilities.dot(&first_dice);
-        expected_values
+        let value = first_roll_probabilities.dot(&first_dice);
+
+        ExpectedValues {
+            entry_actions,
+            third_dice,
+            second_keepers,
+            second_dice,
+            first_keepers,
+            first_dice,
+            value,
+            state,
+        }
     }
 
     fn set_valid_states(&mut self) {
@@ -621,7 +627,7 @@ impl From<State> for usize {
             result |= 1 << 6;
         }
         result |= value.upper_score_remaining as usize;
-        result as usize
+        result
     }
 }
 
@@ -646,7 +652,7 @@ impl State {
 
         if upper_actions.contains(action) {
             let score = DICE_AND_ENTRY_SCORES[(action.as_idx(), dice_idx as usize)];
-            child.upper_score_remaining = child.upper_score_remaining.saturating_sub(score as u8);
+            child.upper_score_remaining = child.upper_score_remaining.saturating_sub(score);
         }
 
         // set yahtzee eligibility
@@ -731,21 +737,6 @@ pub struct ExpectedValues {
     /// only — independent of any current dice / roll.
     pub value: f32,
     state: State,
-}
-
-impl Default for ExpectedValues {
-    fn default() -> ExpectedValues {
-        ExpectedValues {
-            entry_actions: Array2::zeros((0, 0)),
-            third_dice: Array1::zeros(0),
-            second_keepers: Array1::zeros(0),
-            second_dice: Array1::zeros(0),
-            first_keepers: Array1::zeros(0),
-            first_dice: Array1::zeros(0),
-            value: 0_f32,
-            state: State::default(),
-        }
-    }
 }
 
 impl ExpectedValues {
