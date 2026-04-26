@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/core", "crates/cli", "crates/wasm"]
-resolver = "1"
+resolver = "3"
 
 [profile.test]
 opt-level = 3

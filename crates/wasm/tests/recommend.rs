@@ -6,8 +6,11 @@ fn opening_large_straight_roll_3() {
     let scores = Scores::new();
 
     // Round-trip through bincode to exercise the wire format Solver::new uses.
-    let bytes = bincode::serialize(&scores).expect("serialize");
-    let round_tripped: Scores = bincode::deserialize(&bytes).expect("deserialize");
+    let bytes = bincode::serde::encode_to_vec(&scores, bincode::config::standard())
+        .expect("serialize");
+    let (round_tripped, _): (Scores, _) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+            .expect("deserialize");
     assert_eq!(scores, round_tripped);
 
     let input = StateInput {

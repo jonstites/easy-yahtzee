@@ -2,20 +2,13 @@ use std::collections::HashMap;
 use std::convert::From;
 use std::fmt;
 use std::fmt::Display;
+use std::sync::LazyLock;
 
-extern crate ndarray;
-extern crate rayon;
-
-use ndarray::prelude::*;
+use bitflags::bitflags;
 use ndarray::Zip;
+use ndarray::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-
-#[macro_use]
-extern crate lazy_static;
-
-#[macro_use]
-extern crate bitflags;
 
 mod recommend;
 pub use recommend::{
@@ -79,17 +72,18 @@ impl Display for DiceCounts {
     }
 }
 
-lazy_static! {
-    // Global static variables. Initialize once, read-only from anywhere.
-    static ref YAHTZEE_DICE: Vec<Option<EntryAction>> = math::yahtzee_dice();
-    static ref DICE_IDX_LOOKUP: HashMap<DiceCounts, usize> = math::dice_idx_lookup();
-    static ref KEEPER_IDX_LOOKUP: HashMap<DiceCounts, usize> = math::keepers_idx_lookup();
-    static ref IDX_DICE_LOOKUP: HashMap<usize, DiceCounts> = math::idx_dice_lookup();
-    static ref IDX_KEEPERS_LOOKUP: HashMap<usize, DiceCounts> = math::idx_keepers_lookup();
-    static ref DICE_AND_ENTRY_SCORES: Array2<u8> = math::dice_and_entry_scores();
-    static ref DICE_TO_ALLOWED_KEEPERS: Array2<f32> = math::dice_to_keepers();
-    static ref KEEPERS_TO_DICE_PROBABILITIES: Array2<f32> = math::keepers_to_dice();
-}
+// Global static variables. Initialize once, read-only from anywhere.
+static YAHTZEE_DICE: LazyLock<Vec<Option<EntryAction>>> = LazyLock::new(math::yahtzee_dice);
+static DICE_IDX_LOOKUP: LazyLock<HashMap<DiceCounts, usize>> = LazyLock::new(math::dice_idx_lookup);
+static KEEPER_IDX_LOOKUP: LazyLock<HashMap<DiceCounts, usize>> =
+    LazyLock::new(math::keepers_idx_lookup);
+static IDX_DICE_LOOKUP: LazyLock<HashMap<usize, DiceCounts>> =
+    LazyLock::new(math::idx_dice_lookup);
+static IDX_KEEPERS_LOOKUP: LazyLock<HashMap<usize, DiceCounts>> =
+    LazyLock::new(math::idx_keepers_lookup);
+static DICE_AND_ENTRY_SCORES: LazyLock<Array2<u8>> = LazyLock::new(math::dice_and_entry_scores);
+static DICE_TO_ALLOWED_KEEPERS: LazyLock<Array2<f32>> = LazyLock::new(math::dice_to_keepers);
+static KEEPERS_TO_DICE_PROBABILITIES: LazyLock<Array2<f32>> = LazyLock::new(math::keepers_to_dice);
 
 mod math {
     use super::EntryAction;
@@ -441,16 +435,16 @@ impl Scores {
         let mut second_keepers: Array1<f32> = Array1::zeros(462);
 
         Zip::from(&mut second_keepers)
-            .and(KEEPERS_TO_DICE_PROBABILITIES.genrows())
-            .apply(|avg, act| {
+            .and(KEEPERS_TO_DICE_PROBABILITIES.rows())
+            .for_each(|avg, act| {
                 *avg = (&act * &third_dice).sum();
             });
         expected_values.second_keepers = second_keepers.clone();
 
         let mut second_dice = third_dice;
         Zip::from(&mut second_dice)
-            .and(DICE_TO_ALLOWED_KEEPERS.genrows())
-            .apply(|val, dice_to_action| {
+            .and(DICE_TO_ALLOWED_KEEPERS.rows())
+            .for_each(|val, dice_to_action| {
                 *val = (&dice_to_action * &second_keepers).fold(0_f32, |acc, elem| acc.max(*elem));
             });
 
@@ -459,8 +453,8 @@ impl Scores {
         let mut first_keepers = second_keepers;
 
         Zip::from(&mut first_keepers)
-            .and(KEEPERS_TO_DICE_PROBABILITIES.genrows())
-            .apply(|avg, act| {
+            .and(KEEPERS_TO_DICE_PROBABILITIES.rows())
+            .for_each(|avg, act| {
                 *avg = (&act * &second_dice).sum();
             });
 
@@ -468,8 +462,8 @@ impl Scores {
 
         let mut first_dice = second_dice;
         Zip::from(&mut first_dice)
-            .and(DICE_TO_ALLOWED_KEEPERS.genrows())
-            .apply(|val, dice_to_action| {
+            .and(DICE_TO_ALLOWED_KEEPERS.rows())
+            .for_each(|val, dice_to_action| {
                 *val = (&dice_to_action * &first_keepers).fold(0_f32, |acc, elem| acc.max(*elem));
             });
 
@@ -510,7 +504,7 @@ impl Scores {
 }
 
 bitflags! {
-    #[derive(Default)]
+    #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct EntryAction: u16 {
         const ONE             = 1;
         const TWO             = 1 << 1;

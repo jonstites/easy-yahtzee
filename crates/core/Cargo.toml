@@ -2,15 +2,14 @@
 name = "yahtzee-core"
 version = "0.1.0"
 authors = ["Jonathan Stites <mail@jonstites.com>"]
-edition = "2018"
+edition = "2024"
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-bincode = "1.2"
-bitflags = "1.2"
-lazy_static = "1.4"
-ndarray = { version = "0.13", features = ["serde-1"] }
-rayon = "1.2"
+bincode = { version = "2", features = ["serde"] }
+bitflags = { version = "2", features = ["serde"] }
+ndarray = { version = "0.16", features = ["serde", "rayon"] }
+rayon = "1"
 serde = { version = "1.0", features = ["derive"] }
