@@ -235,7 +235,7 @@ impl Scorecard {
         let entry_value = state.entry_score(action, dice);
         self.entries[entry_idx] = Some(entry_value);
 
-        let dice_is_yahtzee = dice.0.iter().any(|&c| c == 5);
+        let dice_is_yahtzee = dice.0.contains(&5);
 
         // Yahtzee bonus: triggers when YAHTZEE was previously filled with a
         // real 50, AND this turn's dice are a yahtzee, AND we're scoring in a
@@ -324,6 +324,7 @@ fn merged_choices(rec: &Recommendation) -> Vec<Choice> {
 // Turn loop
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // hobby project; refactoring into a struct adds noise
 fn play_turn<R: BufRead, W: Write>(
     card: &mut Scorecard,
     scores: &Scores,
@@ -440,6 +441,7 @@ fn choice_to_action(c: &Choice) -> Action {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // hobby project; refactoring into a struct adds noise
 fn prompt_action<R: BufRead, W: Write>(
     roll: u8,
     rec: &Recommendation,
@@ -615,11 +617,9 @@ fn roll_five(rng: &mut StdRng) -> [u8; 5] {
 
 fn reroll(rng: &mut StdRng, kept: &[u8]) -> [u8; 5] {
     let mut out = [0u8; 5];
-    for (i, &d) in kept.iter().enumerate() {
-        out[i] = d;
-    }
-    for i in kept.len()..5 {
-        out[i] = rng.random_range(1..=6);
+    out[..kept.len()].copy_from_slice(kept);
+    for slot in &mut out[kept.len()..] {
+        *slot = rng.random_range(1..=6);
     }
     out.sort();
     out
