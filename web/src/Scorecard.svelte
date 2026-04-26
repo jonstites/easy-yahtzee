@@ -1,20 +1,39 @@
 <script lang="ts">
   import { ENTRY_LABELS, HOW_TO_SCORE, PIP_POS } from './constants';
 
-  export let rawInputs: string[];
-  export let yahtzeeBonuses: number;
-  export let errors: (string | null)[];
-  export let scores: (number | null)[];
-  export let scoreHighlightIdx: number;
-  export let isJokerEnabled: (i: number) => boolean;
-  export let maxYahtzeeBonuses: number;
-  export let yahtzeeBonusPoints: number;
-  export let yahtzeeBonusEligible: boolean;
-  export let upperFilled: number;
-  export let upperBonus: number;
-  export let currentTotal: number;
-  export let projectedFinal: string;
-  export let turnText: string;
+  type Props = {
+    rawInputs: string[];
+    yahtzeeBonuses: number;
+    errors: (string | null)[];
+    scores: (number | null)[];
+    scoreHighlightIdx: number;
+    isJokerEnabled: (i: number) => boolean;
+    maxYahtzeeBonuses: number;
+    yahtzeeBonusPoints: number;
+    yahtzeeBonusEligible: boolean;
+    upperFilled: number;
+    upperBonus: number;
+    currentTotal: number;
+    projectedFinal: string;
+    turnText: string;
+  };
+
+  let {
+    rawInputs = $bindable(),
+    yahtzeeBonuses = $bindable(),
+    errors,
+    scores,
+    scoreHighlightIdx,
+    isJokerEnabled,
+    maxYahtzeeBonuses,
+    yahtzeeBonusPoints,
+    yahtzeeBonusEligible,
+    upperFilled,
+    upperBonus,
+    currentTotal,
+    projectedFinal,
+    turnText,
+  }: Props = $props();
 </script>
 
 <section class="scorecard">

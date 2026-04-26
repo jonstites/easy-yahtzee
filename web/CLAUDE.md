@@ -16,6 +16,16 @@ Tests:
 - `src/*.test.ts` — vitest unit tests (`pnpm test`).
 - `e2e/app.spec.ts` — Playwright E2E tests (`pnpm e2e`).
 
+## Svelte 5 runes mode
+
+`svelte.config.js` sets `compilerOptions.runes: true`, so every component is in runes mode — `export let`, `$:`, `on:event`, and event modifiers like `|preventDefault` are compile errors, not silently-legacy. Use `$state` / `$derived` / `$effect` / `$props` / `$bindable`, and DOM-property event syntax (`onclick`, `onkeydown`, …).
+
+A few non-obvious rune patterns in `App.svelte`:
+
+- **`$state.raw<T | null>(null)` for the wasm `Solver` and the `Recommendation` payload.** Plain `$state(...)` would deep-proxy them — but the `Solver` is a wasm-bindgen object whose methods rely on internal slots that proxies break, and `Recommendation` is replaced wholesale on every dice/state change so deep tracking is wasted work. The explicit generic on the rune is required: `let x: T | null = $state.raw(null)` infers `x` as `null` (the rune's return type comes from the *value*, not the LHS annotation).
+- **Mutate `$state` arrays in place.** `dice[i] = ...` and `kept.fill(false)` are reactive on a `$state` proxy. Don't fall back to `dice = dice.map(...)` — that allocates a fresh proxy for nothing.
+- **Two-way bindings need `$bindable()`.** `Scorecard` exposes `rawInputs` and `yahtzeeBonuses` as `$bindable`; `HelpModal` exposes `open`. Adding a new `bind:` prop means wrapping the prop default in `$bindable()` on the child.
+
 ## Important invariants (don't quietly break these)
 
 - **Entry indices are canonical.** `EntryRec.entry: u8` in 0..12, mapped via `ENTRY_LABELS[idx]`. There is *no* string-name round-trip with the wasm.

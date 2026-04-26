@@ -1,16 +1,16 @@
 <script lang="ts">
-  export let open = false;
+  let { open = $bindable(false) } = $props();
   function close() { open = false; }
 </script>
 
 {#if open}
-  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-  <div class="modal-backdrop" on:click={close} role="presentation">
-    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-    <div class="modal" on:click|stopPropagation role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="help-title">
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={close} role="presentation">
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
+    <div class="modal" onclick={(e) => e.stopPropagation()} role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="help-title">
       <div class="modal-head">
         <h2 id="help-title">Help</h2>
-        <button class="modal-close" on:click={close} aria-label="Close">×</button>
+        <button class="modal-close" onclick={close} aria-label="Close">×</button>
       </div>
       <div class="modal-body">
         <h3>Keyboard shortcuts</h3>
