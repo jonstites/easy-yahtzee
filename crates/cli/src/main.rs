@@ -21,6 +21,8 @@ use sha2::{Digest, Sha256};
 
 use yahtzee_core::{recommend, Recommendation, Scores, StateInput};
 
+mod play;
+
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
@@ -43,6 +45,8 @@ enum Cmd {
     Solve(SolveArgs),
     /// Print the overall expected final score from a position.
     Value(ValueArgs),
+    /// Play a game interactively, with the solver as a coach (or autopilot).
+    Play(PlayArgs),
     /// Generate the precomputed score table and write it to disk. ~10s at
     /// release on a modern desktop, longer at debug or on slower hardware.
     /// Typically run once per `crates/core` serialization-layout change.
@@ -114,6 +118,33 @@ struct ValueArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct PlayArgs {
+    /// Override the embedded score table. Same semantics as `solve --scores`.
+    #[arg(long, value_name = "PATH")]
+    pub scores: Option<PathBuf>,
+
+    /// Random seed for the dice. Omit for a fresh seed each run. Pairs with
+    /// `--auto` to make a game fully reproducible (great for benchmarking
+    /// the solver's expected score across many runs).
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// Don't auto-roll dice — prompt for the faces you rolled physically.
+    /// Useful as a real-game coach with real dice on the table.
+    #[arg(long)]
+    pub manual_dice: bool,
+
+    /// Take the solver's recommended action automatically every step.
+    #[arg(long)]
+    pub auto: bool,
+
+    /// How many alternatives to display alongside the top recommendation
+    /// each roll (the top pick is always shown). 1 = just the top pick.
+    #[arg(long, default_value_t = 3)]
+    pub top: usize,
+}
+
+#[derive(Args)]
 struct BuildArgs {
     /// Path for the bincode-serialized score table.
     #[arg(short = 'o', long, default_value = "scores.bin")]
@@ -141,6 +172,10 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Solve(args) => cmd_solve(args),
         Cmd::Value(args) => cmd_value(args),
+        Cmd::Play(args) => {
+            let scores = load_or_embedded_scores(args.scores.as_deref())?;
+            play::run(args, scores)
+        }
         Cmd::Build(args) => cmd_build(args),
     }
 }
@@ -309,7 +344,7 @@ fn hex(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Parse `--dice` from either `1,1,3,4,6` or `11346`.
-fn parse_dice(s: &str) -> Result<[u8; 5], String> {
+pub(crate) fn parse_dice(s: &str) -> Result<[u8; 5], String> {
     let digits: Vec<u8> = if s.contains(',') {
         s.split(',')
             .map(|t| {
@@ -367,7 +402,7 @@ fn parse_filled(s: &str) -> Result<[bool; 13], String> {
 // ---------------------------------------------------------------------------
 
 /// Aligned with `yahtzee_core::ENTRY_ACTIONS`.
-const CATEGORY_NAMES: [&str; 13] = [
+pub(crate) const CATEGORY_NAMES: [&str; 13] = [
     "ones",
     "twos",
     "threes",
@@ -401,7 +436,7 @@ const CATEGORY_ALIASES: &[(&str, usize)] = &[
     ("ch", 12),
 ];
 
-fn category_index(name: &str) -> Option<usize> {
+pub(crate) fn category_index(name: &str) -> Option<usize> {
     let n = name.to_ascii_lowercase();
     if let Some(i) = CATEGORY_NAMES.iter().position(|c| *c == n) {
         return Some(i);
@@ -489,7 +524,7 @@ fn render_json(rec: &Recommendation) -> Result<()> {
     Ok(())
 }
 
-fn format_dice(dice: &[u8]) -> String {
+pub(crate) fn format_dice(dice: &[u8]) -> String {
     if dice.is_empty() {
         return "(nothing)".to_string();
     }
