@@ -206,3 +206,71 @@ pub(crate) fn action_idx(a: EntryAction) -> u8 {
         .position(|&x| x == a)
         .expect("unknown EntryAction") as u8
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_state_rejects_upper_score_above_63() {
+        let input = StateInput {
+            entries: [false; 13],
+            yahtzee_bonus_eligible: false,
+            upper_score_remaining: 64,
+        };
+        assert!(build_state(&input).is_err());
+    }
+
+    #[test]
+    fn build_state_accepts_boundary_values() {
+        for r in [0, 1, 62, 63] {
+            let input = StateInput {
+                entries: [false; 13],
+                yahtzee_bonus_eligible: false,
+                upper_score_remaining: r,
+            };
+            let s = build_state(&input).expect("0..=63 is valid");
+            assert_eq!(s.upper_score_remaining, r);
+        }
+    }
+
+    #[test]
+    fn build_state_translates_entries_and_flags() {
+        let mut entries = [false; 13];
+        entries[0] = true; // ONES
+        entries[11] = true; // YAHTZEE
+        let input = StateInput {
+            entries,
+            yahtzee_bonus_eligible: true,
+            upper_score_remaining: 60,
+        };
+        let s = build_state(&input).unwrap();
+        assert!(s.entries.contains(EntryAction::ONE));
+        assert!(s.entries.contains(EntryAction::YAHTZEE));
+        assert!(!s.entries.contains(EntryAction::TWO));
+        assert!(s.yahtzee_bonus_eligible);
+        assert_eq!(s.upper_score_remaining, 60);
+    }
+
+    #[test]
+    fn dice_to_counts_validates_length() {
+        assert!(dice_to_counts(&[1, 2, 3, 4]).is_err());
+        assert!(dice_to_counts(&[1, 2, 3, 4, 5, 6]).is_err());
+        assert!(dice_to_counts(&[]).is_err());
+    }
+
+    #[test]
+    fn dice_to_counts_validates_face() {
+        assert!(dice_to_counts(&[0, 1, 2, 3, 4]).is_err());
+        assert!(dice_to_counts(&[1, 2, 3, 4, 7]).is_err());
+    }
+
+    #[test]
+    fn dice_to_counts_round_trips_through_counts_to_faces() {
+        let raw = [1_u8, 1, 3, 5, 6];
+        let dc = dice_to_counts(&raw).unwrap();
+        let faces = counts_to_faces(&dc);
+        // counts_to_faces emits ascending; raw happens to already be sorted.
+        assert_eq!(faces, raw.to_vec());
+    }
+}
