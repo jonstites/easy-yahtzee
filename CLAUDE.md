@@ -67,7 +67,7 @@ Read off the current state's precomputed tables:
 - `first_keepers_with_turn_ev(dice)` / `second_keepers_with_turn_ev(dice)` / `entries_with_turn_ev(dice)` — same shape as above but each tuple is `(choice, overall_ev, turn_ev)`. `turn_ev` is the expected points scored **on this turn only** if that choice is taken (and optimal play continues thereafter), including any +35 / +100 bonuses triggered this turn.
 - `this_turn_ev(dice, roll) -> f32` — scalar expected-points-this-turn for the current dice/roll, assuming optimal play. Complements `value` (which is this turn + all future turns). On roll 3 it's deterministic (best action's immediate score); on rolls 1/2 it marginalizes through the optimal keeper selection and subsequent dice/action choices using the cached `*_keepers` / `*_dice` arrays.
 
-Private helpers `turn_ev_by_roll3_dice()` and `turn_ev_by_roll2_dice(...)` precompute per-dice turn-EV arrays so the `*_with_turn_ev` outer loops stay cheap (~300 kop on roll 1, ~120 kop on roll 2).
+Private helpers `turn_ev_by_roll3_dice()` and `turn_ev_by_roll2_dice(...)` build per-dice turn-EV arrays at the top of each `*_with_turn_ev` call (recomputed per call, not memoized across calls), so the per-keeper outer loop is a cheap O(num_dice_combos) inner product instead of a nested decision-tree walk (~300 kop on roll 1, ~120 kop on roll 2).
 
 ## Serialization, CLI, wasm
 

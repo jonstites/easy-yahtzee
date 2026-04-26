@@ -1,3 +1,21 @@
+//! Yahtzee solver core: a backward-induction DP over scorecard states.
+//!
+//! Conceptually:
+//!
+//! - A [`State`] is `(filled-categories, yahtzee-bonus-eligible, upper-score-remaining)`,
+//!   packed into a `usize` so we can index a flat `Array1<f32>` of state EVs.
+//! - [`Scores::new`] fills that array level-by-level (from 13 categories filled
+//!   down to 0). Each level only depends on strictly higher levels, so each
+//!   level is computed in parallel via rayon.
+//! - For any state, [`Scores::values`] walks the three-roll decision tree
+//!   backward to produce an [`ExpectedValues`] view: per-keeper EVs on rolls 1
+//!   and 2, per-entry EVs on roll 3, and the overall state value.
+//!
+//! Consumer-facing API (CLI, wasm, web) lives in [`recommend`] — it wraps the
+//! raw types in serializable shapes and validates user input. Day-to-day, most
+//! callers want [`recommend::recommend`] rather than the lower-level types
+//! here.
+
 use std::collections::HashMap;
 use std::convert::From;
 use std::fmt;
@@ -20,10 +38,11 @@ pub use recommend::{
 // 13 Entries, 1 bit for Yahtzee bonus eligibility, and 64 for upper score
 const NUM_STATES: u32 = 1_048_576;
 
-// Calculated empirically - many states can never be reached
-#[allow(dead_code)]
+// Calculated empirically - many states can never be reached.
+// Only referenced from `tests::test_valid_states`; kept here as the canonical
+// source of truth for the reachable-state count.
+#[cfg(test)]
 const NUM_VALID_STATES: u32 = 536_448;
-#[warn(dead_code)]
 
 // d6
 const NUM_DICE_FACES: u8 = 6;
@@ -75,10 +94,6 @@ impl Display for DiceCounts {
 // Global static variables. Initialize once, read-only from anywhere.
 static YAHTZEE_DICE: LazyLock<Vec<Option<EntryAction>>> = LazyLock::new(math::yahtzee_dice);
 static DICE_IDX_LOOKUP: LazyLock<HashMap<DiceCounts, usize>> = LazyLock::new(math::dice_idx_lookup);
-static KEEPER_IDX_LOOKUP: LazyLock<HashMap<DiceCounts, usize>> =
-    LazyLock::new(math::keepers_idx_lookup);
-static IDX_DICE_LOOKUP: LazyLock<HashMap<usize, DiceCounts>> =
-    LazyLock::new(math::idx_dice_lookup);
 static IDX_KEEPERS_LOOKUP: LazyLock<HashMap<usize, DiceCounts>> =
     LazyLock::new(math::idx_keepers_lookup);
 static DICE_AND_ENTRY_SCORES: LazyLock<Array2<u8>> = LazyLock::new(math::dice_and_entry_scores);
@@ -147,21 +162,6 @@ mod math {
             .collect()
     }
 
-    /// Generates a lookup from `DiceCounts` to index, for keepers
-    pub fn keepers_idx_lookup() -> HashMap<DiceCounts, usize> {
-        (0..=5)
-            .flat_map(dice_combinations)
-            .into_iter()
-            .enumerate()
-            .map(|(idx, dice)| (dice, idx))
-            .collect()
-    }
-    pub fn idx_dice_lookup() -> HashMap<usize, DiceCounts> {
-        dice_combinations(NUM_DICE as u8)
-            .into_iter()
-            .enumerate()
-            .collect()
-    }
     pub fn idx_keepers_lookup() -> HashMap<usize, DiceCounts> {
         (0..=5)
             .flat_map(dice_combinations)
@@ -522,6 +522,34 @@ bitflags! {
     }
 }
 
+/// Look up the precomputed dice-combination index for `dice`.
+///
+/// Panics if `dice` is not a valid 5-dice multiset (sum of counts != 5).
+/// In practice every caller goes through validated input —
+/// [`crate::dice_to_counts`] for external callers, or solver-internal tables
+/// keyed off `DICE_IDX_LOOKUP` itself — so this is unreachable in practice.
+fn lookup_dice_idx(dice: &DiceCounts) -> usize {
+    *DICE_IDX_LOOKUP
+        .get(dice)
+        .expect("DiceCounts is not a valid 5-dice multiset (caller must validate via dice_to_counts)")
+}
+
+/// Joker-rule fixed score for the lower-section categories.
+///
+/// Per the Yahtzee joker rule, when the Yahtzee box is already filled and the
+/// player rolls a Yahtzee whose matching upper category is also filled, the
+/// lower-section categories take guaranteed values: Full House = 25,
+/// Small Straight = 30, Large Straight = 40. Returns `None` for every other
+/// category — those score normally even under the joker rule.
+fn joker_lower_score(action: EntryAction) -> Option<u8> {
+    match action {
+        EntryAction::FULL_HOUSE => Some(25),
+        EntryAction::SMALL_STRAIGHT => Some(30),
+        EntryAction::LARGE_STRAIGHT => Some(40),
+        _ => None,
+    }
+}
+
 // The set returned is state-independent: for upper categories, joker-enabled
 // values (e.g. 25 in Fives from a Yahtzee joker) are only included if they're
 // already reachable via normal scoring, so the set may not reflect every value
@@ -546,14 +574,12 @@ pub fn achievable_scores(entry_idx: usize) -> Vec<u8> {
 }
 
 impl EntryAction {
+    /// Index into [`ENTRY_ACTIONS`] / row index into the precomputed score
+    /// tables. Each canonical [`EntryAction`] is a single bit, so its index is
+    /// the bit position. Calling this on a multi-bit set or `EntryAction::empty()`
+    /// returns a meaningless number; callers always pass canonical values.
     pub fn as_idx(self) -> usize {
-        let mut idx = 0;
-        let mut value = self.bits();
-        while value > 1 {
-            value >>= 1;
-            idx += 1;
-        }
-        idx
+        self.bits().trailing_zeros() as usize
     }
 }
 
@@ -628,19 +654,17 @@ impl State {
     }
 
     pub fn entry_score(self, action: EntryAction, dice: &DiceCounts) -> u8 {
-        let dice_idx = *DICE_IDX_LOOKUP.get(dice).unwrap();
+        let dice_idx = lookup_dice_idx(dice);
         let mut score = DICE_AND_ENTRY_SCORES[(action.as_idx(), dice_idx)];
-        if self.entries.contains(EntryAction::YAHTZEE) {
-            if let Some(yahtzee_face) = YAHTZEE_DICE[dice_idx] {
-                if self.entries.contains(yahtzee_face) {
-                    score = match action {
-                        EntryAction::FULL_HOUSE => 25,
-                        EntryAction::SMALL_STRAIGHT => 30,
-                        EntryAction::LARGE_STRAIGHT => 40,
-                        _ => score,
-                    };
-                }
-            }
+        // Joker rule: if the Yahtzee box is filled, the dice are a Yahtzee, and
+        // the matching upper category is also filled, the lower-section
+        // categories take their joker fixed scores.
+        if self.entries.contains(EntryAction::YAHTZEE)
+            && let Some(yahtzee_face) = YAHTZEE_DICE[dice_idx]
+            && self.entries.contains(yahtzee_face)
+            && let Some(joker) = joker_lower_score(action)
+        {
+            score = joker;
         }
         score
     }
@@ -663,22 +687,15 @@ impl State {
                 0_f32
             };
 
-        // joker rule
-        // yahtzee box filled
-        if self.entries.contains(EntryAction::YAHTZEE) {
-            // dice is yahtzee
-            if let Some(yahtzee_idx) = YAHTZEE_DICE[dice_idx as usize] {
-                // upper entry filled
-                if !self.is_valid_action(yahtzee_idx) {
-                    if action_idx == EntryAction::FULL_HOUSE {
-                        normal_score = 25_f32;
-                    } else if action_idx == EntryAction::SMALL_STRAIGHT {
-                        normal_score = 30_f32;
-                    } else if action_idx == EntryAction::LARGE_STRAIGHT {
-                        normal_score = 40_f32;
-                    }
-                }
-            }
+        // Joker rule: if the Yahtzee box is filled, the dice are a Yahtzee,
+        // and the matching upper category is also filled, the lower-section
+        // categories take their joker fixed scores.
+        if self.entries.contains(EntryAction::YAHTZEE)
+            && let Some(yahtzee_idx) = YAHTZEE_DICE[dice_idx as usize]
+            && !self.is_valid_action(yahtzee_idx)
+            && let Some(joker) = joker_lower_score(action_idx)
+        {
+            normal_score = f32::from(joker);
         }
 
         let score = normal_score + upper_bonus + yahtzee_bonus;
@@ -694,6 +711,11 @@ impl State {
     }
 }
 
+/// Per-state precomputed expected-value tables. Build with [`Scores::values`].
+///
+/// Internals (the `*_dice` / `*_keepers` arrays and `entry_actions`) are
+/// private; use the methods on `&self` (`first_keepers_score`,
+/// `entries_with_turn_ev`, `this_turn_ev`, …) to read them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpectedValues {
     entry_actions: Array2<f32>,
@@ -702,6 +724,8 @@ pub struct ExpectedValues {
     second_dice: Array1<f32>,
     first_keepers: Array1<f32>,
     first_dice: Array1<f32>,
+    /// Overall expected final score from this state under optimal play. State
+    /// only — independent of any current dice / roll.
     pub value: f32,
     state: State,
 }
@@ -724,7 +748,7 @@ impl Default for ExpectedValues {
 impl ExpectedValues {
     pub fn first_keepers_score(&self, dice: DiceCounts) -> Vec<(DiceCounts, f32)> {
         let mut result = Vec::new();
-        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        let dice_idx = lookup_dice_idx(&dice);
 
         for keeper_idx in 0..(NUM_KEEPERS as usize) {
             if DICE_TO_ALLOWED_KEEPERS[(dice_idx, keeper_idx)] > 0.0 {
@@ -735,13 +759,13 @@ impl ExpectedValues {
             }
         }
 
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         result
     }
 
     pub fn second_keepers_score(&self, dice: DiceCounts) -> Vec<(DiceCounts, f32)> {
         let mut result = Vec::new();
-        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        let dice_idx = lookup_dice_idx(&dice);
 
         for keeper_idx in 0..(NUM_KEEPERS as usize) {
             if DICE_TO_ALLOWED_KEEPERS[(dice_idx, keeper_idx)] > 0.0 {
@@ -750,7 +774,7 @@ impl ExpectedValues {
             }
         }
 
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         result
     }
 
@@ -759,7 +783,7 @@ impl ExpectedValues {
     /// number, assuming optimal play from here. Complements `value`, which is
     /// the EV of all remaining points (this turn + future turns).
     pub fn this_turn_ev(&self, dice: DiceCounts, roll: u8) -> f32 {
-        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        let dice_idx = lookup_dice_idx(&dice);
         match roll {
             3 => self.this_turn_roll3_dice(dice_idx),
             2 => {
@@ -834,7 +858,7 @@ impl ExpectedValues {
         &self,
         dice: DiceCounts,
     ) -> Vec<(DiceCounts, f32, f32)> {
-        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        let dice_idx = lookup_dice_idx(&dice);
         let turn_ev_roll3 = self.turn_ev_by_roll3_dice();
         let turn_ev_roll2 = self.turn_ev_by_roll2_dice(&turn_ev_roll3);
         let mut result = Vec::new();
@@ -847,7 +871,7 @@ impl ExpectedValues {
                 result.push((keeper, self.first_keepers[keeper_idx], turn_ev));
             }
         }
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         result
     }
 
@@ -856,7 +880,7 @@ impl ExpectedValues {
         &self,
         dice: DiceCounts,
     ) -> Vec<(DiceCounts, f32, f32)> {
-        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        let dice_idx = lookup_dice_idx(&dice);
         let turn_ev_roll3 = self.turn_ev_by_roll3_dice();
         let mut result = Vec::new();
         for keeper_idx in 0..(NUM_KEEPERS as usize) {
@@ -868,7 +892,7 @@ impl ExpectedValues {
                 result.push((keeper, self.second_keepers[keeper_idx], turn_ev));
             }
         }
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         result
     }
 
@@ -880,7 +904,7 @@ impl ExpectedValues {
         dice: DiceCounts,
     ) -> Vec<(EntryAction, f32, f32)> {
         let mut result = Vec::new();
-        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        let dice_idx = lookup_dice_idx(&dice);
         for (action_idx, &action) in ENTRY_ACTIONS.iter().enumerate() {
             if self.state.is_valid_action(action) {
                 let overall = self.entry_actions[(action_idx, dice_idx)];
@@ -888,7 +912,7 @@ impl ExpectedValues {
                 result.push((action, overall, turn));
             }
         }
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         result
     }
 
@@ -911,24 +935,40 @@ impl ExpectedValues {
 
     pub fn entries_score(&self, dice: DiceCounts) -> Vec<(EntryAction, f32)> {
         let mut result = Vec::new();
-        let dice_idx = *DICE_IDX_LOOKUP.get(&dice).unwrap();
+        let dice_idx = lookup_dice_idx(&dice);
         for (action_idx, &action) in ENTRY_ACTIONS.iter().enumerate() {
             if self.state.is_valid_action(action) {
                 result.push((action, self.entry_actions[(action_idx, dice_idx)]));
             }
         }
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         result
     }
 }
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
+    use std::sync::OnceLock;
+
+    /// `Scores::new()` is expensive even at `[profile.test] opt-level = 3`;
+    /// share one instance across all tests in this binary.
+    pub(crate) fn shared_scores() -> &'static Scores {
+        static SCORES: OnceLock<Scores> = OnceLock::new();
+        SCORES.get_or_init(Scores::new)
+    }
+
+    fn dc(counts: [u8; 6]) -> DiceCounts {
+        DiceCounts(counts)
+    }
+
+    fn dc_idx(counts: [u8; 6]) -> u8 {
+        lookup_dice_idx(&dc(counts)) as u8
+    }
+
     #[test]
     fn test_valid_states() {
-        let scores = Scores::new();
+        let scores = shared_scores();
         let num_valid: usize = scores
             .valid_states
             .iter()
@@ -940,8 +980,218 @@ mod tests {
     #[test]
     fn test_expected_value() {
         let default_idx: usize = State::default().into();
-        let scores = Scores::new();
+        let scores = shared_scores();
         let expected_value = scores.state_scores[default_idx];
         assert!((expected_value - 254.5896).abs() < 0.0001);
+    }
+
+    /// State for joker-rule tests: Yahtzee box filled and Threes filled, so a
+    /// rolled three-yahtzee triggers the joker rule for any lower category.
+    /// `yahtzee_bonus_eligible: false` keeps the +100 bonus out of the picture.
+    fn joker_state_threes() -> State {
+        State {
+            entries: EntryAction::YAHTZEE | EntryAction::THREE,
+            yahtzee_bonus_eligible: false,
+            upper_score_remaining: 63 - 9,
+        }
+    }
+
+    #[test]
+    fn entry_score_joker_rule_fixes_lower_section() {
+        let s = joker_state_threes();
+        let three_yahtzee = dc([0, 0, 5, 0, 0, 0]);
+        assert_eq!(s.entry_score(EntryAction::FULL_HOUSE, &three_yahtzee), 25);
+        assert_eq!(s.entry_score(EntryAction::SMALL_STRAIGHT, &three_yahtzee), 30);
+        assert_eq!(s.entry_score(EntryAction::LARGE_STRAIGHT, &three_yahtzee), 40);
+        // Categories outside the joker override score normally.
+        assert_eq!(s.entry_score(EntryAction::CHANCE, &three_yahtzee), 15);
+        assert_eq!(s.entry_score(EntryAction::FOUR_OF_A_KIND, &three_yahtzee), 15);
+    }
+
+    #[test]
+    fn entry_score_no_joker_when_dice_not_yahtzee() {
+        let s = joker_state_threes();
+        // Five distinct faces — large straight, not a yahtzee. Joker doesn't
+        // apply, so Full House falls back to its normal 0.
+        let large_straight = dc([1, 1, 1, 1, 1, 0]);
+        assert_eq!(s.entry_score(EntryAction::FULL_HOUSE, &large_straight), 0);
+        assert_eq!(s.entry_score(EntryAction::LARGE_STRAIGHT, &large_straight), 40);
+    }
+
+    #[test]
+    fn entry_score_no_joker_when_yahtzee_box_unfilled() {
+        // Yahtzee not filled → joker doesn't apply even for a yahtzee roll.
+        let s = State {
+            entries: EntryAction::THREE,
+            yahtzee_bonus_eligible: false,
+            upper_score_remaining: 63 - 9,
+        };
+        let three_yahtzee = dc([0, 0, 5, 0, 0, 0]);
+        assert_eq!(s.entry_score(EntryAction::FULL_HOUSE, &three_yahtzee), 0);
+        assert_eq!(s.entry_score(EntryAction::SMALL_STRAIGHT, &three_yahtzee), 0);
+        assert_eq!(s.entry_score(EntryAction::LARGE_STRAIGHT, &three_yahtzee), 0);
+    }
+
+    #[test]
+    fn entry_score_no_joker_when_matching_upper_unfilled() {
+        // Yahtzee filled but Threes not filled — the joker rule requires the
+        // matching upper face to also be filled.
+        let s = State {
+            entries: EntryAction::YAHTZEE,
+            yahtzee_bonus_eligible: false,
+            upper_score_remaining: 63,
+        };
+        let three_yahtzee = dc([0, 0, 5, 0, 0, 0]);
+        assert_eq!(s.entry_score(EntryAction::FULL_HOUSE, &three_yahtzee), 0);
+        assert_eq!(s.entry_score(EntryAction::SMALL_STRAIGHT, &three_yahtzee), 0);
+    }
+
+    #[test]
+    fn score_and_child_joker_rule_fixes_lower_section() {
+        let s = joker_state_threes();
+        let idx = dc_idx([0, 0, 5, 0, 0, 0]);
+        assert_eq!(s.score_and_child(EntryAction::FULL_HOUSE, idx).0, 25.0);
+        assert_eq!(s.score_and_child(EntryAction::SMALL_STRAIGHT, idx).0, 30.0);
+        assert_eq!(s.score_and_child(EntryAction::LARGE_STRAIGHT, idx).0, 40.0);
+    }
+
+    #[test]
+    fn score_and_child_upper_bonus_fires_on_completion() {
+        // 5 points away from the +35 bonus; scoring 30 sixes saturates
+        // remaining to 0 and triggers the bonus.
+        let s = State {
+            entries: EntryAction::ONE
+                | EntryAction::TWO
+                | EntryAction::THREE
+                | EntryAction::FOUR
+                | EntryAction::FIVE,
+            yahtzee_bonus_eligible: false,
+            upper_score_remaining: 5,
+        };
+        let (total, child) = s.score_and_child(EntryAction::SIX, dc_idx([0, 0, 0, 0, 0, 5]));
+        assert_eq!(total, 30.0 + 35.0);
+        assert_eq!(child.upper_score_remaining, 0);
+    }
+
+    #[test]
+    fn score_and_child_upper_bonus_does_not_double_fire() {
+        // Upper section already complete (remaining = 0). Filling another
+        // upper category must not re-award the bonus.
+        let s = State {
+            entries: EntryAction::ONE,
+            yahtzee_bonus_eligible: false,
+            upper_score_remaining: 0,
+        };
+        let (total, _) = s.score_and_child(EntryAction::SIX, dc_idx([0, 0, 0, 0, 0, 5]));
+        assert_eq!(total, 30.0);
+    }
+
+    #[test]
+    fn score_and_child_yahtzee_bonus_when_eligible() {
+        // Eligible + dice are a yahtzee → +100, regardless of category. Use
+        // CHANCE to avoid joker-rule interaction.
+        let s = State {
+            entries: EntryAction::YAHTZEE,
+            yahtzee_bonus_eligible: true,
+            upper_score_remaining: 63,
+        };
+        let (total, _) = s.score_and_child(EntryAction::CHANCE, dc_idx([0, 0, 0, 0, 5, 0]));
+        assert_eq!(total, 25.0 + 100.0);
+    }
+
+    #[test]
+    fn score_and_child_no_yahtzee_bonus_when_ineligible() {
+        let s = State {
+            entries: EntryAction::YAHTZEE,
+            yahtzee_bonus_eligible: false,
+            upper_score_remaining: 63,
+        };
+        let (total, _) = s.score_and_child(EntryAction::CHANCE, dc_idx([0, 0, 0, 0, 5, 0]));
+        assert_eq!(total, 25.0);
+    }
+
+    #[test]
+    fn score_and_child_no_yahtzee_bonus_on_non_yahtzee_dice() {
+        let s = State {
+            entries: EntryAction::YAHTZEE,
+            yahtzee_bonus_eligible: true,
+            upper_score_remaining: 63,
+        };
+        let (total, _) =
+            s.score_and_child(EntryAction::LARGE_STRAIGHT, dc_idx([1, 1, 1, 1, 1, 0]));
+        assert_eq!(total, 40.0);
+    }
+
+    #[test]
+    fn achievable_scores_includes_joker_values() {
+        // Indices match ENTRY_ACTIONS order.
+        let fh = achievable_scores(8);
+        assert!(fh.contains(&0));
+        assert!(fh.contains(&25));
+        let ss = achievable_scores(9);
+        assert!(ss.contains(&0));
+        assert!(ss.contains(&30));
+        let ls = achievable_scores(10);
+        assert!(ls.contains(&0));
+        assert!(ls.contains(&40));
+    }
+
+    #[test]
+    fn achievable_scores_upper_categories() {
+        let ones = achievable_scores(0);
+        for v in 0..=5 {
+            assert!(ones.contains(&v), "ones missing {v}: {ones:?}");
+        }
+        let sixes = achievable_scores(5);
+        for v in [0, 6, 12, 18, 24, 30] {
+            assert!(sixes.contains(&v), "sixes missing {v}: {sixes:?}");
+        }
+    }
+
+    #[test]
+    fn entries_with_turn_ev_roll3_returns_immediate_score() {
+        let scores = shared_scores();
+        let values = scores.values(State::default());
+        let dice = dice_to_counts(&[1, 2, 3, 4, 5]).unwrap();
+        let entries = values.entries_with_turn_ev(dice);
+
+        // LARGE_STRAIGHT on [1,2,3,4,5] from default state: immediate 40, no
+        // bonuses (not yahtzee_bonus_eligible, upper section still incomplete).
+        let (_, _ev, ls_turn) = entries
+            .iter()
+            .find(|(a, _, _)| *a == EntryAction::LARGE_STRAIGHT)
+            .expect("LARGE_STRAIGHT must be a valid action from default state");
+        assert_eq!(*ls_turn, 40.0);
+
+        // Every entry's turn_ev is bounded above by overall ev (turn EV is a
+        // component of total EV, and future EV is ≥ 0 for Yahtzee).
+        for (action, ev, turn) in entries {
+            assert!(turn <= ev + 1e-3, "{action:?}: turn_ev > ev: {turn} > {ev}");
+            assert!(turn >= -1e-3, "{action:?}: turn_ev < 0: {turn}");
+        }
+    }
+
+    #[test]
+    fn keepers_with_turn_ev_invariants() {
+        let scores = shared_scores();
+        let values = scores.values(State::default());
+        let dice = dice_to_counts(&[1, 2, 3, 4, 5]).unwrap();
+
+        for (k, ev, turn) in values.first_keepers_with_turn_ev(dice.clone()) {
+            assert!(turn <= ev + 1e-3, "roll 1 {k:?}: turn_ev > ev: {turn} > {ev}");
+            assert!(turn >= -1e-3, "roll 1 {k:?}: turn_ev < 0: {turn}");
+        }
+        for (k, ev, turn) in values.second_keepers_with_turn_ev(dice) {
+            assert!(turn <= ev + 1e-3, "roll 2 {k:?}: turn_ev > ev: {turn} > {ev}");
+            assert!(turn >= -1e-3, "roll 2 {k:?}: turn_ev < 0: {turn}");
+        }
+    }
+
+    #[test]
+    fn recommend_rejects_invalid_roll() {
+        let scores = shared_scores();
+        let dice = dice_to_counts(&[1, 2, 3, 4, 5]).unwrap();
+        assert!(scores.recommend(State::default(), dice.clone(), 0).is_err());
+        assert!(scores.recommend(State::default(), dice, 4).is_err());
     }
 }
