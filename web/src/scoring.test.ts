@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 import {
   cycleFace,
   formatAllowed,
+  isJokerActive,
   isYahtzee,
   keepMaskFor,
   maxYahtzeeBonuses,
@@ -11,6 +12,60 @@ import {
   type AllowedScores,
 } from './scoring';
 import { SMALL_STRAIGHT_IDX, YAHTZEE_IDX } from './constants';
+
+describe('isJokerActive', () => {
+  // Build a 13-slot scorecard with given fills. `fills` maps idx → value
+  // (use 0 for "filled with forfeit", 50 for "scored Yahtzee", etc.).
+  function scorecard(fills: Record<number, number>): (number | null)[] {
+    const s: (number | null)[] = new Array(13).fill(null);
+    for (const [k, v] of Object.entries(fills)) s[Number(k)] = v;
+    return s;
+  }
+
+  test('non-Yahtzee dice → false regardless of scorecard', () => {
+    expect(isJokerActive([1, 2, 3, 4, 5], scorecard({}))).toBe(false);
+    // Even with everything filled, dice aren't a Yahtzee.
+    expect(isJokerActive([1, 1, 1, 1, 2], scorecard({
+      0: 5, [YAHTZEE_IDX]: 50,
+    }))).toBe(false);
+  });
+
+  test('Yahtzee dice but Yahtzee box unfilled → false', () => {
+    // Rolled Yahtzee of 3s, but Yahtzee box still empty: not yet a joker
+    // (you'd score this *as* a Yahtzee for 50).
+    expect(isJokerActive([3, 3, 3, 3, 3], scorecard({ 2: 9 }))).toBe(false);
+  });
+
+  test('Yahtzee dice + Yahtzee box filled but matching upper unfilled → false', () => {
+    // Rolled Yahtzee of 4s, Yahtzee box scored, but Fours row still empty:
+    // the right move is to score this as Fours (= 20), not joker.
+    expect(isJokerActive([4, 4, 4, 4, 4], scorecard({
+      [YAHTZEE_IDX]: 50,
+    }))).toBe(false);
+  });
+
+  test('Yahtzee dice + both Yahtzee box and matching upper filled → true', () => {
+    // Rolled Yahtzee of 6s; Sixes already scored 24, Yahtzee already 50.
+    expect(isJokerActive([6, 6, 6, 6, 6], scorecard({
+      5: 24, [YAHTZEE_IDX]: 50,
+    }))).toBe(true);
+  });
+
+  test('Yahtzee box scored as 0 (forfeit) still counts as filled', () => {
+    // Forfeit Yahtzee: the rule still enables joker on subsequent Yahtzees.
+    expect(isJokerActive([2, 2, 2, 2, 2], scorecard({
+      1: 8, [YAHTZEE_IDX]: 0,
+    }))).toBe(true);
+  });
+
+  test('upper box scored as 0 still counts as filled', () => {
+    // Imagine the player crossed off the Ones row earlier. Now they roll a
+    // Yahtzee of 1s with Yahtzee already scored — joker fires.
+    expect(isJokerActive([1, 1, 1, 1, 1], scorecard({
+      0: 0, [YAHTZEE_IDX]: 50,
+    }))).toBe(true);
+  });
+});
 
 describe('isYahtzee', () => {
   test('all-same returns true', () => {

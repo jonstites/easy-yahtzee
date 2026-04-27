@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import init, { Solver, achievableScores, entryScore } from 'yahtzee-wasm';
-  import { ENTRY_LABELS, PIP_POS, YAHTZEE_IDX } from './constants';
+  import { ENTRY_LABELS, JOKER_LOWER_IDXS, PIP_POS, YAHTZEE_IDX } from './constants';
   import {
     cycleFace,
     formatAllowed,
+    isJokerActive,
     isYahtzee,
     keepMaskFor,
     maxYahtzeeBonuses as maxYahtzeeBonusesFor,
@@ -136,6 +137,10 @@
 
   $effect(() => {
     if (!solver) return;
+    // No recommendations to compute once every entry is filled — the wasm's
+    // notion of a recommendation only makes sense at non-terminal states, and
+    // the UI hides this panel behind the game-over screen anyway.
+    if (gameOver) return;
     try {
       rec = solver.recommend(stateInput, new Uint8Array(dice), roll) as Recommendation;
       recError = null;
@@ -154,19 +159,13 @@
   // already filled (any value), AND the matching upper box is already filled.
   // Lower-row categories then accept fixed joker scores (full house = 25,
   // small straight = 30, large straight = 40).
-  const jokerActive = $derived.by(() => {
-    const c = [0, 0, 0, 0, 0, 0];
-    for (const v of dice) c[v - 1]++;
-    const face = c.findIndex(x => x === 5) + 1;
-    if (face === 0) return false;
-    return scores[YAHTZEE_IDX] !== null && scores[face - 1] !== null;
-  });
+  const jokerActive = $derived(isJokerActive(dice, scores));
 
   // Highlight the joker-rule indicator only on lower-row "shaped" categories
   // (full house, small straight, large straight) — those are the ones that
   // accept the special joker score.
   function isJokerEnabled(i: number): boolean {
-    return jokerActive && (i === 8 || i === 9 || i === 10);
+    return jokerActive && (JOKER_LOWER_IDXS as readonly number[]).includes(i);
   }
 
   const choices = $derived(buildChoices(rec));
@@ -255,8 +254,19 @@
   function applyScore(idx: number) {
     if (gameOver) return;
     if (idx < 0 || idx >= 13) return;
+    let val: number;
+    try {
+      val = entryScore(stateInput, new Uint8Array(dice), idx);
+    } catch (e) {
+      // The free `entryScore` wasm function can in principle reject inputs
+      // (out-of-range entry index, malformed state). The UI only ever calls
+      // it with values it just received from `recommend`, so this should be
+      // unreachable — but surface the error rather than silently no-op'ing,
+      // and don't dirty the undo history with a half-applied turn.
+      recError = String(e);
+      return;
+    }
     pushHistory();
-    const val = entryScore(stateInput, new Uint8Array(dice), idx);
     rawInputs[idx] = String(val);
     // Auto-track Yahtzee bonuses: a fresh Yahtzee scored anywhere except the
     // Yahtzee box itself, while already eligible (= Yahtzee box holds 50),
