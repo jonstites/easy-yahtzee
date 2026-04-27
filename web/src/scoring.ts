@@ -1,11 +1,36 @@
 // Pure dice/category helpers used by the UI. Nothing here touches Svelte
 // state or the wasm — they're plain functions you can unit-test in isolation.
 
-import { SMALL_STRAIGHT_IDX } from './constants';
+import { SMALL_STRAIGHT_IDX, YAHTZEE_IDX } from './constants';
 
 /** All 5 dice the same face. */
 export function isYahtzee(dice: number[]): boolean {
   return dice.every(v => v === dice[0]);
+}
+
+/**
+ * Does the Joker rule fire for the current dice + scorecard state?
+ *
+ * Conditions (per official Yahtzee rules):
+ *   1. The dice are a Yahtzee (all 5 the same face).
+ *   2. The Yahtzee box is already filled (any value — including 0, the
+ *      forfeit case — counts).
+ *   3. The matching upper box (Ones for a Yahtzee of 1s, etc.) is already
+ *      filled.
+ *
+ * When active, the lower-row "shaped" categories (Full House / Small
+ * Straight / Large Straight) accept fixed joker scores (25 / 30 / 40).
+ *
+ * `scores` is indexed by canonical entry index (`scores[YAHTZEE_IDX]`,
+ * `scores[face - 1]` for upper rows); `null` means "not yet filled".
+ */
+export function isJokerActive(
+  dice: number[],
+  scores: readonly (number | null)[],
+): boolean {
+  if (!isYahtzee(dice)) return false;
+  const face = dice[0]; // 1..6 by construction
+  return scores[YAHTZEE_IDX] !== null && scores[face - 1] !== null;
 }
 
 /**
