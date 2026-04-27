@@ -30,6 +30,9 @@ fn bench_state_values(c: &mut Criterion) {
             black_box(v.value)
         })
     });
+    c.bench_function("Scores::state_value(default)", |b| {
+        b.iter(|| black_box(scores.state_value(black_box(state))))
+    });
 }
 
 fn bench_recommend(c: &mut Criterion) {

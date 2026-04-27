@@ -364,6 +364,39 @@ mod math {
 // Packed bitset over NUM_STATES entries (16_384 u64 words = 128 KiB).
 const VALID_STATES_WORDS: usize = (NUM_STATES as usize).div_ceil(64);
 
+/// Per-keeper expected dice-value: for each keeper `k`, sum over re-roll
+/// outcomes `d` of `P(k → d) * dice_values[d]`.
+fn keepers_from_dice(dice_values: &Array1<f32>) -> Array1<f32> {
+    let mut keepers: Array1<f32> = Array1::zeros(NUM_KEEPERS as usize);
+    Zip::from(&mut keepers)
+        .and(KEEPERS_TO_DICE_PROBABILITIES.rows())
+        .for_each(|avg, row| {
+            *avg = (&row * dice_values).sum();
+        });
+    keepers
+}
+
+/// Per-dice "best keeper" value: for each dice combo `d`, max over keepers
+/// valid for `d` of `keeper_values[k]`. (`DICE_TO_ALLOWED_KEEPERS` is an
+/// indicator matrix: 1 where the keeper is achievable from `d`, 0 elsewhere,
+/// so element-wise multiply masks the invalid keepers to 0 before the max.)
+fn dice_from_keepers(keeper_values: &Array1<f32>) -> Array1<f32> {
+    let mut dice: Array1<f32> = Array1::zeros(NUM_DICE_COMBINATIONS as usize);
+    Zip::from(&mut dice)
+        .and(DICE_TO_ALLOWED_KEEPERS.rows())
+        .for_each(|val, mask_row| {
+            *val = (&mask_row * keeper_values).fold(0_f32, |acc, elem| acc.max(*elem));
+        });
+    dice
+}
+
+/// Initial-roll distribution: row 0 of `KEEPERS_TO_DICE_PROBABILITIES` is the
+/// "kept nothing → roll 5 fresh dice" row, which is the marginal we want for
+/// turning per-dice values into the state EV.
+fn first_roll_probabilities() -> ndarray::ArrayView1<'static, f32> {
+    KEEPERS_TO_DICE_PROBABILITIES.index_axis(Axis(0), 0)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scores {
     state_scores: Array1<f32>,
@@ -401,7 +434,7 @@ impl Scores {
                     let state: State = state_idx.into();
                     let state_level = state.level();
                     if self.valid_state(state) && state_level == level as usize {
-                        *score = self.values(state).value;
+                        *score = self.state_value(state);
                     }
                 });
 
@@ -414,62 +447,40 @@ impl Scores {
         }
     }
 
+    /// Overall expected final score from `state` under optimal play. This is
+    /// the scalar the DP step (`set_scores`) needs and the same number that
+    /// [`Scores::values`] returns as `.value` — but without materializing the
+    /// per-roll intermediate arrays the recommendation API also needs. The
+    /// underlying math is identical, so the perf delta is small (skips a
+    /// struct construction); use this when you only need the EV.
+    pub fn state_value(&self, state: State) -> f32 {
+        let entry_actions = self.entry_actions_array(state);
+        let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
+        let second_keepers = keepers_from_dice(&third_dice);
+        let second_dice = dice_from_keepers(&second_keepers);
+        let first_keepers = keepers_from_dice(&second_dice);
+        let first_dice = dice_from_keepers(&first_keepers);
+        first_roll_probabilities().dot(&first_dice)
+    }
+
     pub fn values(&self, state: State) -> ExpectedValues {
         // Overall EV of each (action, final dice) pair: `score + V(child)` for
-        // valid actions, 0 for invalid. We keep this around as part of the
-        // returned `ExpectedValues` so the per-entry EV API can read it.
-        let entry_actions = Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
-            let action = EntryAction::from_bits(1 << action_idx).unwrap();
-            if state.is_valid_action(action) {
-                let (score, child) = state.score_and_child(action, dice_idx as u8);
-                let child_idx: usize = child.into();
-                score + self.state_scores[child_idx]
-            } else {
-                0_f32
-            }
-        });
+        // valid actions, 0 for invalid. Read by the per-entry EV API.
+        let entry_actions = self.entry_actions_array(state);
 
         // Value of each roll-3 dice combo: max action overall EV.
-        let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, value| acc.max(*value));
+        let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
 
-        // Value of each roll-2 keeper: P(keeper → roll3 dice) · third_dice.
-        let mut second_keepers: Array1<f32> = Array1::zeros(462);
-        Zip::from(&mut second_keepers)
-            .and(KEEPERS_TO_DICE_PROBABILITIES.rows())
-            .for_each(|avg, act| {
-                *avg = (&act * &third_dice).sum();
-            });
-
-        // Value of each roll-2 dice combo: max over k2-valid-for-d2 of
-        // second_keepers. We clone third_dice rather than move-and-overwrite
-        // so the original can flow into the returned struct.
-        let mut second_dice = third_dice.clone();
-        Zip::from(&mut second_dice)
-            .and(DICE_TO_ALLOWED_KEEPERS.rows())
-            .for_each(|val, dice_to_action| {
-                *val = (&dice_to_action * &second_keepers).fold(0_f32, |acc, elem| acc.max(*elem));
-            });
-
-        // Value of each roll-1 keeper: P(keeper → roll2 dice) · second_dice.
-        let mut first_keepers = second_keepers.clone();
-        Zip::from(&mut first_keepers)
-            .and(KEEPERS_TO_DICE_PROBABILITIES.rows())
-            .for_each(|avg, act| {
-                *avg = (&act * &second_dice).sum();
-            });
-
-        // Value of each roll-1 dice combo: max over k1-valid-for-d1 of
-        // first_keepers.
-        let mut first_dice = second_dice.clone();
-        Zip::from(&mut first_dice)
-            .and(DICE_TO_ALLOWED_KEEPERS.rows())
-            .for_each(|val, dice_to_action| {
-                *val = (&dice_to_action * &first_keepers).fold(0_f32, |acc, elem| acc.max(*elem));
-            });
+        // Value of each roll-2 keeper / roll-2 dice / roll-1 keeper / roll-1
+        // dice — alternating "max over allowed keepers" and "expectation over
+        // re-roll outcomes".
+        let second_keepers = keepers_from_dice(&third_dice);
+        let second_dice = dice_from_keepers(&second_keepers);
+        let first_keepers = keepers_from_dice(&second_dice);
+        let first_dice = dice_from_keepers(&first_keepers);
 
         // Marginal over the initial-roll distribution gives overall state EV.
-        let first_roll_probabilities = KEEPERS_TO_DICE_PROBABILITIES.index_axis(Axis(0), 0);
-        let value = first_roll_probabilities.dot(&first_dice);
+        let value = first_roll_probabilities().dot(&first_dice);
 
         ExpectedValues {
             entry_actions,
@@ -481,6 +492,19 @@ impl Scores {
             value,
             state,
         }
+    }
+
+    fn entry_actions_array(&self, state: State) -> Array2<f32> {
+        Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
+            let action = EntryAction::from_bits(1 << action_idx).unwrap();
+            if state.is_valid_action(action) {
+                let (score, child) = state.score_and_child(action, dice_idx as u8);
+                let child_idx: usize = child.into();
+                score + self.state_scores[child_idx]
+            } else {
+                0_f32
+            }
+        })
     }
 
     fn set_valid_states(&mut self) {

@@ -9,7 +9,8 @@ import { defineConfig, devices } from '@playwright/test';
 // Prerequisites for the dev server (same as `pnpm dev`):
 //   - crates/wasm/pkg/ built (run `wasm-pack build --target web --out-dir pkg`
 //     in crates/wasm if missing)
-//   - web/static/scores.bin.br present (the brotli-compressed solver tables)
+//   - crates/cli/data/scores.bin.br present (the brotli-compressed solver
+//     tables; tracked in git, regenerable via the `build` subcommand)
 export default defineConfig({
   testDir: './e2e',
   // Forbid `.only` in CI so a stray focused test can't silently skip the rest.
