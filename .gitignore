@@ -105,3 +105,6 @@ web/.playwright/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# claude development
+.devcontainer/
