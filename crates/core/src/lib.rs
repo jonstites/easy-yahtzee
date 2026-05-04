@@ -29,7 +29,6 @@ use std::fmt::Display;
 use std::sync::LazyLock;
 
 use bitflags::bitflags;
-use ndarray::Zip;
 use ndarray::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -39,6 +38,9 @@ pub use recommend::{
     build_state, counts_to_faces, dice_to_counts, recommend, EntryRec, KeeperRec, Recommendation,
     StateInput,
 };
+
+pub mod linalg;
+pub use linalg::{LinalgBackend, NdarrayBackend};
 
 #[cfg(test)]
 mod proptests;
@@ -106,8 +108,12 @@ static DICE_IDX_LOOKUP: LazyLock<HashMap<DiceCounts, usize>> = LazyLock::new(mat
 static IDX_KEEPERS_LOOKUP: LazyLock<HashMap<usize, DiceCounts>> =
     LazyLock::new(math::idx_keepers_lookup);
 static DICE_AND_ENTRY_SCORES: LazyLock<Array2<u8>> = LazyLock::new(math::dice_and_entry_scores);
-static DICE_TO_ALLOWED_KEEPERS: LazyLock<Array2<f32>> = LazyLock::new(math::dice_to_keepers);
-static KEEPERS_TO_DICE_PROBABILITIES: LazyLock<Array2<f32>> = LazyLock::new(math::keepers_to_dice);
+// `pub(crate)` so the `linalg` submodule can read them; not part of the
+// public API.
+pub(crate) static DICE_TO_ALLOWED_KEEPERS: LazyLock<Array2<f32>> =
+    LazyLock::new(math::dice_to_keepers);
+pub(crate) static KEEPERS_TO_DICE_PROBABILITIES: LazyLock<Array2<f32>> =
+    LazyLock::new(math::keepers_to_dice);
 
 mod math {
     use super::EntryAction;
@@ -370,38 +376,11 @@ mod math {
 // Packed bitset over NUM_STATES entries (16_384 u64 words = 128 KiB).
 const VALID_STATES_WORDS: usize = (NUM_STATES as usize).div_ceil(64);
 
-/// Per-keeper expected dice-value: for each keeper `k`, sum over re-roll
-/// outcomes `d` of `P(k → d) * dice_values[d]`. This is exactly the GEMV
-/// `KEEPERS_TO_DICE_PROBABILITIES (462x252) * dice_values (252)`, so we
-/// dispatch through `ndarray::Array2::dot`. With the `blas` feature off,
-/// that uses ndarray's default `matrixmultiply` backend (pure-Rust SIMD);
-/// with `blas` on, it goes to `cblas_sgemv`. Called twice per state via
-/// `Scores::values` / `Scores::state_value`, so it's the GEMV worth
-/// optimizing.
-fn keepers_from_dice(dice_values: &Array1<f32>) -> Array1<f32> {
-    KEEPERS_TO_DICE_PROBABILITIES.dot(dice_values)
-}
-
-/// Per-dice "best keeper" value: for each dice combo `d`, max over keepers
-/// valid for `d` of `keeper_values[k]`. (`DICE_TO_ALLOWED_KEEPERS` is an
-/// indicator matrix: 1 where the keeper is achievable from `d`, 0 elsewhere,
-/// so element-wise multiply masks the invalid keepers to 0 before the max.)
-fn dice_from_keepers(keeper_values: &Array1<f32>) -> Array1<f32> {
-    let mut dice: Array1<f32> = Array1::zeros(NUM_DICE_COMBINATIONS as usize);
-    Zip::from(&mut dice)
-        .and(DICE_TO_ALLOWED_KEEPERS.rows())
-        .for_each(|val, mask_row| {
-            *val = (&mask_row * keeper_values).fold(0_f32, |acc, elem| acc.max(*elem));
-        });
-    dice
-}
-
-/// Initial-roll distribution: row 0 of `KEEPERS_TO_DICE_PROBABILITIES` is the
-/// "kept nothing → roll 5 fresh dice" row, which is the marginal we want for
-/// turning per-dice values into the state EV.
-fn first_roll_probabilities() -> ndarray::ArrayView1<'static, f32> {
-    KEEPERS_TO_DICE_PROBABILITIES.index_axis(Axis(0), 0)
-}
+// The keepers_from_dice / dice_from_keepers / initial-roll-dot operations
+// previously implemented as free functions here now live on the
+// `LinalgBackend` trait in `crate::linalg`. `Scores::state_value` /
+// `Scores::values` call the default `NdarrayBackend` and behave identically;
+// the `_with` variants accept any backend for benchmarking.
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scores {
@@ -460,16 +439,29 @@ impl Scores {
     /// underlying math is identical, so the perf delta is small (skips a
     /// struct construction); use this when you only need the EV.
     pub fn state_value(&self, state: State) -> f32 {
+        self.state_value_with(state, &NdarrayBackend)
+    }
+
+    /// Like [`Scores::state_value`] but with a caller-provided
+    /// [`LinalgBackend`]. Used by benches to compare GEMV implementations
+    /// (matrixmultiply, BLAS, faer, …) without changing the rest of the
+    /// pipeline. Production callers want [`Scores::state_value`].
+    pub fn state_value_with<B: LinalgBackend>(&self, state: State, backend: &B) -> f32 {
         let entry_actions = self.entry_actions_array(state);
         let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
-        let second_keepers = keepers_from_dice(&third_dice);
-        let second_dice = dice_from_keepers(&second_keepers);
-        let first_keepers = keepers_from_dice(&second_dice);
-        let first_dice = dice_from_keepers(&first_keepers);
-        first_roll_probabilities().dot(&first_dice)
+        let second_keepers = backend.keepers_from_dice(&third_dice);
+        let second_dice = backend.dice_from_keepers(&second_keepers);
+        let first_keepers = backend.keepers_from_dice(&second_dice);
+        let first_dice = backend.dice_from_keepers(&first_keepers);
+        backend.initial_roll_ev(&first_dice)
     }
 
     pub fn values(&self, state: State) -> ExpectedValues {
+        self.values_with(state, &NdarrayBackend)
+    }
+
+    /// Like [`Scores::values`] but with a caller-provided [`LinalgBackend`].
+    pub fn values_with<B: LinalgBackend>(&self, state: State, backend: &B) -> ExpectedValues {
         // Overall EV of each (action, final dice) pair: `score + V(child)` for
         // valid actions, 0 for invalid. Read by the per-entry EV API.
         let entry_actions = self.entry_actions_array(state);
@@ -480,13 +472,13 @@ impl Scores {
         // Value of each roll-2 keeper / roll-2 dice / roll-1 keeper / roll-1
         // dice — alternating "max over allowed keepers" and "expectation over
         // re-roll outcomes".
-        let second_keepers = keepers_from_dice(&third_dice);
-        let second_dice = dice_from_keepers(&second_keepers);
-        let first_keepers = keepers_from_dice(&second_dice);
-        let first_dice = dice_from_keepers(&first_keepers);
+        let second_keepers = backend.keepers_from_dice(&third_dice);
+        let second_dice = backend.dice_from_keepers(&second_keepers);
+        let first_keepers = backend.keepers_from_dice(&second_dice);
+        let first_dice = backend.dice_from_keepers(&first_keepers);
 
         // Marginal over the initial-roll distribution gives overall state EV.
-        let value = first_roll_probabilities().dot(&first_dice);
+        let value = backend.initial_roll_ev(&first_dice);
 
         ExpectedValues {
             entry_actions,
