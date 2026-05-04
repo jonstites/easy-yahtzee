@@ -16,6 +16,12 @@
 //! callers want [`recommend::recommend`] rather than the lower-level types
 //! here.
 
+// Anchor `blas-src` so the BLAS provider's symbols (e.g. `cblas_sdot`) survive
+// `--as-needed` link-time DCE. Without this, ndarray's `.dot()` calls fail to
+// link with `--features blas`. Has no runtime effect; pure link-time glue.
+#[cfg(feature = "blas")]
+extern crate blas_src;
+
 use std::collections::HashMap;
 use std::convert::From;
 use std::fmt;

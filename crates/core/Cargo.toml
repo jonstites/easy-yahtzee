@@ -7,12 +7,23 @@ edition = "2024"
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Dispatch ndarray's `.dot()` on f32/f64 to a system BLAS (OpenBLAS via
+# pkg-config) instead of the default `matrixmultiply` backend. Currently
+# only affects the two `first_roll_probabilities().dot(&first_dice)` calls
+# in `Scores::values` / `Scores::state_value`; the keepers/dice transitions
+# are hand-rolled `Zip` loops and bypass ndarray's dot dispatch. Enable
+# with `cargo build -p yahtzee-core --features blas`.
+blas = ["ndarray/blas", "dep:blas-src", "dep:openblas-src"]
+
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
 bitflags = { version = "2", features = ["serde"] }
 ndarray = { version = "0.16", features = ["serde", "rayon"] }
 rayon = "1"
 serde = { version = "1.0", features = ["derive"] }
+blas-src = { version = "0.10", features = ["openblas"], optional = true }
+openblas-src = { version = "0.10", features = ["system"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
