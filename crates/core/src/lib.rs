@@ -371,15 +371,15 @@ mod math {
 const VALID_STATES_WORDS: usize = (NUM_STATES as usize).div_ceil(64);
 
 /// Per-keeper expected dice-value: for each keeper `k`, sum over re-roll
-/// outcomes `d` of `P(k → d) * dice_values[d]`.
+/// outcomes `d` of `P(k → d) * dice_values[d]`. This is exactly the GEMV
+/// `KEEPERS_TO_DICE_PROBABILITIES (462x252) * dice_values (252)`, so we
+/// dispatch through `ndarray::Array2::dot`. With the `blas` feature off,
+/// that uses ndarray's default `matrixmultiply` backend (pure-Rust SIMD);
+/// with `blas` on, it goes to `cblas_sgemv`. Called twice per state via
+/// `Scores::values` / `Scores::state_value`, so it's the GEMV worth
+/// optimizing.
 fn keepers_from_dice(dice_values: &Array1<f32>) -> Array1<f32> {
-    let mut keepers: Array1<f32> = Array1::zeros(NUM_KEEPERS as usize);
-    Zip::from(&mut keepers)
-        .and(KEEPERS_TO_DICE_PROBABILITIES.rows())
-        .for_each(|avg, row| {
-            *avg = (&row * dice_values).sum();
-        });
-    keepers
+    KEEPERS_TO_DICE_PROBABILITIES.dot(dice_values)
 }
 
 /// Per-dice "best keeper" value: for each dice combo `d`, max over keepers
