@@ -104,6 +104,14 @@ fn bench_backends(c: &mut Criterion) {
         });
     }
 
+    #[cfg(feature = "simd")]
+    {
+        let si = yahtzee_core::linalg::SimdBackend::new();
+        group.bench_function("simd", |b| {
+            b.iter(|| black_box(scores.state_value_with(black_box(state), &si)))
+        });
+    }
+
     group.finish();
 }
 

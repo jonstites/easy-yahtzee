@@ -1018,6 +1018,21 @@ mod tests {
         );
     }
 
+    /// Same as `test_faer_backend_matches` for the SIMD backend. Run with
+    /// `cargo test --features simd ...`.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn test_simd_backend_matches() {
+        let scores = shared_scores();
+        let state = State::default();
+        let nd = scores.state_value_with(state, &NdarrayBackend);
+        let si = scores.state_value_with(state, &linalg::SimdBackend::new());
+        assert!(
+            (nd - si).abs() < 0.001,
+            "ndarray={nd} simd={si} differ by more than 1e-3"
+        );
+    }
+
     /// State for joker-rule tests: Yahtzee box filled and Threes filled, so a
     /// rolled three-yahtzee triggers the joker rule for any lower category.
     /// `yahtzee_bonus_eligible: false` keeps the +100 bonus out of the picture.

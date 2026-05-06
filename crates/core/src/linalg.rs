@@ -88,6 +88,106 @@ impl LinalgBackend for NdarrayBackend {
 #[cfg(feature = "faer")]
 pub use faer_impl::FaerBackend;
 
+/// Hand-vectorized backend (opt-in via `--features simd`). Uses ndarray's
+/// `.dot()` for the GEMV and a `wide::f32x8`-based loop for the masked-max
+/// `dice_from_keepers`. The latter is the op BLAS / faer can't help with,
+/// so it's the only place new SIMD code can move the needle.
+///
+/// Holds a copy of `DICE_TO_ALLOWED_KEEPERS` row-padded to a multiple of 8
+/// columns so each row is a clean sequence of `f32x8` lanes.
+#[cfg(feature = "simd")]
+pub use simd_impl::SimdBackend;
+
+#[cfg(feature = "simd")]
+mod simd_impl {
+    use super::{LinalgBackend, DICE_TO_ALLOWED_KEEPERS, KEEPERS_TO_DICE_PROBABILITIES,
+        NUM_DICE_COMBINATIONS};
+    use ndarray::Array1;
+    use wide::f32x8;
+
+    const LANES: usize = 8;
+    // 462 keepers padded up to the next multiple of 8 = 464.
+    const KEEPER_LANES: usize = ((462 + LANES - 1) / LANES) * LANES;
+
+    pub struct SimdBackend {
+        // Row-major, 252 rows × KEEPER_LANES cols, padded with 0.0.
+        mask_padded: Vec<f32>,
+    }
+
+    impl SimdBackend {
+        pub fn new() -> Self {
+            let nd = &*DICE_TO_ALLOWED_KEEPERS;
+            let (n_dice, n_keepers) = nd.dim();
+            assert_eq!(n_dice, NUM_DICE_COMBINATIONS as usize);
+            let mut mask_padded = vec![0.0_f32; n_dice * KEEPER_LANES];
+            for d in 0..n_dice {
+                for k in 0..n_keepers {
+                    mask_padded[d * KEEPER_LANES + k] = nd[(d, k)];
+                }
+                // Trailing KEEPER_LANES - n_keepers slots stay 0.0.
+            }
+            Self { mask_padded }
+        }
+    }
+
+    impl Default for SimdBackend {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl LinalgBackend for SimdBackend {
+        #[inline]
+        fn keepers_from_dice(&self, dice_values: &Array1<f32>) -> Array1<f32> {
+            // Same as NdarrayBackend; SIMD doesn't add anything ndarray's
+            // GEMV doesn't already do.
+            KEEPERS_TO_DICE_PROBABILITIES.dot(dice_values)
+        }
+
+        #[inline]
+        fn dice_from_keepers(&self, keeper_values: &Array1<f32>) -> Array1<f32> {
+            let kv = keeper_values
+                .as_slice()
+                .expect("keeper_values is contiguous");
+
+            // Copy into a length-KEEPER_LANES scratch with trailing zeros so
+            // the multiply-against-mask doesn't pick up garbage in the tail.
+            // (Mask tail is already 0; any value here would survive the
+            // 0 * x = 0 max contribution. Padding still matters because we
+            // load 8 lanes regardless.)
+            let mut padded_kv = [0.0_f32; KEEPER_LANES];
+            padded_kv[..kv.len()].copy_from_slice(kv);
+
+            let mut out: Array1<f32> = Array1::zeros(NUM_DICE_COMBINATIONS as usize);
+            // SAFETY: KEEPER_LANES is divisible by LANES; both arrays are aligned f32.
+            let kv_chunks: &[[f32; LANES]] = bytemuck::cast_slice(&padded_kv);
+
+            for d in 0..NUM_DICE_COMBINATIONS as usize {
+                let row_start = d * KEEPER_LANES;
+                let mask_row = &self.mask_padded[row_start..row_start + KEEPER_LANES];
+                let mask_chunks: &[[f32; LANES]] = bytemuck::cast_slice(mask_row);
+
+                let mut acc = f32x8::splat(0.0);
+                for (m_chunk, k_chunk) in mask_chunks.iter().zip(kv_chunks.iter()) {
+                    let m = f32x8::from(*m_chunk);
+                    let k = f32x8::from(*k_chunk);
+                    acc = acc.fast_max(m * k);
+                }
+                // wide 1.3 has no horizontal max; scalar fold over 8 lanes.
+                let lanes: [f32; LANES] = acc.into();
+                out[d] = lanes.iter().copied().fold(0.0_f32, f32::max);
+            }
+            out
+        }
+
+        #[inline]
+        fn initial_roll_ev(&self, first_dice: &Array1<f32>) -> f32 {
+            // Same as NdarrayBackend.
+            KEEPERS_TO_DICE_PROBABILITIES.row(0).dot(first_dice)
+        }
+    }
+}
+
 #[cfg(feature = "faer")]
 mod faer_impl {
     use super::{LinalgBackend, DICE_TO_ALLOWED_KEEPERS, KEEPERS_TO_DICE_PROBABILITIES,
