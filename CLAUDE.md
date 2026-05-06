@@ -120,7 +120,15 @@ Private helpers `turn_ev_by_roll3_dice()` and `turn_ev_by_roll2_dice(...)` build
 
 `Scores` derives `Serialize` / `Deserialize` and is persisted with `bincode`. The CLI (`crates/cli/src/main.rs`) is `clap`-subcommand-based — see the Commands section above for the four subcommands (`solve`, `value`, `play`, `build`) and how `--scores PATH` overrides the embedded score table. The `--entries` argument used by `solve` / `value` is a 13-character `0`/`1` string aligned with `ENTRY_ACTIONS` order.
 
-Both the CLI and wasm crates currently consume `yahtzee-core` with default features only (so the table-build path uses `CpuBuildBackend` → `NdarrayBackend`). The faster CPU backends (`simd`, `faer`) are gated behind features that neither downstream crate enables today; switching the CLI's `build` subcommand to use `simd` is a 1.84× wall-clock win with no API change. `cuda` is more situational (driver libs at runtime, NVIDIA-only) but plausible as an opt-in `cuda` feature on the CLI.
+CLI feature wiring (`crates/cli/Cargo.toml`):
+
+- `default = ["simd"]` — the `build` subcommand dispatches through `CpuBuildBackendWith(SimdBackend)` (~1.84× wall-clock vs `NdarrayBackend`, no API change). The `solve` / `value` / `play` subcommands deserialize the embedded table and don't hit `Scores::new()` regardless of features, so this only affects table regeneration.
+- `cuda` (opt-in) — when compiled (`cargo build -p yahtzee-cli --release --features cuda`), `build` dispatches through `CudaBuildBackend` instead, taking precedence over `simd`. Requires `libcuda` / `libcublas` / `libnvrtc` `.so`s on the runtime host (cudarc dynamic-loads, no CUDA SDK at build time). If GPU init fails the subcommand errors out — there's no automatic CPU fallback.
+- `--no-default-features` — falls back to `Scores::new()` (`NdarrayBackend`). Useful for benching the unaccelerated path.
+
+The selection is compile-time (`cfg`-gated `build_scores()` in `crates/cli/src/main.rs`), not a runtime flag.
+
+The wasm crate intentionally consumes `yahtzee-core` with default features only. It deserializes the embedded brotli blob rather than calling `Scores::new()`, so `simd` / `faer` / `cuda` would only affect the per-state `Scores::values()` walk (~100 µs/call, single-call-per-UI-action) — not worth a feature surface or extra deps. The canonical `scores.bin.br` is regenerated through the CLI's `build` subcommand, so backend-driven build wins land via the CLI path.
 
 `crates/wasm/src/lib.rs` exposes:
 

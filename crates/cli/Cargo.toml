@@ -8,6 +8,24 @@ edition = "2024"
 name = "easy-yahtzee"
 path = "src/main.rs"
 
+[features]
+# Drive `easy-yahtzee build` through `CpuBuildBackendWith(SimdBackend)` instead
+# of the default `NdarrayBackend`. ~1.84× wall-clock win on a 16-thread Ryzen
+# (5.73s → 3.11s); no runtime deps beyond what `yahtzee-core[simd]` already
+# pulls in. Pure default-on win — disable only with `--no-default-features` if
+# you specifically want to bench the unaccelerated path.
+default = ["simd"]
+simd = ["yahtzee-core/simd"]
+
+# Opt-in: drive `easy-yahtzee build` through `CudaBuildBackend` (per-level
+# batched on an NVIDIA GPU via cudarc). ~9× over naive, ~3.3× over `simd`.
+# Situational because it needs `libcuda` / `libcublas` / `libnvrtc` `.so`s on
+# the runtime host (NVIDIA-only). When `cuda` is enabled it takes precedence
+# over `simd` in the `build` subcommand. If GPU init fails (e.g. no driver),
+# the build subcommand returns an error rather than silently falling back —
+# rebuild without `--features cuda` to use the CPU path.
+cuda = ["yahtzee-core/cuda"]
+
 [dependencies]
 yahtzee-core = { path = "../core" }
 anyhow = "1"
