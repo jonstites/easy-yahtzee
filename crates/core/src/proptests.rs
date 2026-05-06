@@ -194,4 +194,85 @@ proptest! {
             "state={state:?} dice_idx={dice_idx} opt={opt} ref={reference}",
         );
     }
+
+    /// Cross-check the action-ranking outputs across all enabled
+    /// [`LinalgBackend`]s. For any `(state, dice)`, every backend should
+    /// produce the same overall EV and the same EV at each rank in the
+    /// sorted entries / first_keepers / second_keepers lists (within float
+    /// reduction-order tolerance). Choices may swap *within* an EV-tie
+    /// bucket — that's fine; we compare EVs at each position, not choices.
+    ///
+    /// What this catches that `test_*_backend_matches` doesn't: those tests
+    /// only check the default-state scalar EV. This walks the full
+    /// recommendation surface (252 dice × ~8000 sampled states × {1,2,3}
+    /// rolls' worth of ranked choices), so a backend bug that nudges
+    /// EV-by-1e-2 on a niche state — well within the noise of the
+    /// default-state test — shows up here.
+    #[test]
+    fn linalg_backends_agree_on_action_ranking(
+        state in arb_state(),
+        dice_idx in 0u8..NUM_DICE_COMBINATIONS,
+    ) {
+        let scores = shared_scores();
+        let dice = dice_list()[dice_idx as usize].clone();
+
+        // Naive is the always-on, no-deps oracle. Other backends are
+        // feature-gated; collect a Vec<(name, ExpectedValues)> of whichever
+        // ones are compiled in and cross-check each against naive.
+        let oracle = scores.values_with(state, &NaiveBackend);
+        #[allow(unused_mut)]
+        let mut others: Vec<(&'static str, ExpectedValues)> =
+            vec![("ndarray", scores.values_with(state, &NdarrayBackend))];
+        #[cfg(feature = "faer")]
+        others.push(("faer", scores.values_with(state, &linalg::FaerBackend::new())));
+        #[cfg(feature = "simd")]
+        others.push(("simd", scores.values_with(state, &linalg::SimdBackend::new())));
+
+        for (name, candidate) in &others {
+            prop_assert!(
+                (oracle.value - candidate.value).abs() <= TOL,
+                "value: naive={} {name}={} state={state:?}",
+                oracle.value, candidate.value,
+            );
+
+            // Roll 3: ranked entries (immediate score for each action).
+            let oe = oracle.entries_score(dice.clone());
+            let ce = candidate.entries_score(dice.clone());
+            prop_assert_eq!(
+                oe.len(), ce.len(),
+                "entries len differs for {}", name,
+            );
+            for (i, (a, b)) in oe.iter().zip(ce.iter()).enumerate() {
+                prop_assert!(
+                    (a.1 - b.1).abs() <= TOL,
+                    "entries rank {i}: naive={} {name}={} \
+                     state={state:?} dice_idx={dice_idx}",
+                    a.1, b.1,
+                );
+            }
+
+            // Rolls 1 & 2: ranked keepers.
+            for (label, oa, ca) in [
+                ("first_keepers",
+                    oracle.first_keepers_score(dice.clone()),
+                    candidate.first_keepers_score(dice.clone())),
+                ("second_keepers",
+                    oracle.second_keepers_score(dice.clone()),
+                    candidate.second_keepers_score(dice.clone())),
+            ] {
+                prop_assert_eq!(
+                    oa.len(), ca.len(),
+                    "{} len differs for {}", label, name,
+                );
+                for (i, (a, b)) in oa.iter().zip(ca.iter()).enumerate() {
+                    prop_assert!(
+                        (a.1 - b.1).abs() <= TOL,
+                        "{label} rank {i}: naive={} {name}={} \
+                         state={state:?} dice_idx={dice_idx}",
+                        a.1, b.1,
+                    );
+                }
+            }
+        }
+    }
 }

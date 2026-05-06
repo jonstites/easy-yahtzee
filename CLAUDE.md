@@ -48,6 +48,8 @@ A `State` is `(entries: EntryAction bitflags, yahtzee_bonus_eligible: bool, uppe
 
 `Scores::new_with<B: BuildBackend>(backend: &B) -> Result<Self, B::Error>` is the generic constructor; `Scores::new()` calls it with `&CpuBuildBackend` and unwraps the `Infallible` result. Use `new_with` directly to opt into a non-default backend (e.g. `&CudaBuildBackend::new()?` under the `cuda` feature).
 
+`Scores::new_with_unvalidated<B>` is the sibling that skips the BFS-reachability filter in the per-level batch enumeration: every structurally possible state at each level enters the DP, including the ~512k that no real game reaches. ~2× build wall-clock vs `new_with`. Used (a) as a soundness oracle for the BFS — `test_unvalidated_matches_validated` (gated `#[ignore]`) cross-checks that the validated and unvalidated tables agree on every reachable state's EV, and (b) as the substrate for any future fast path that wants regular per-level batch shapes (outer-loop SIMD across states, level-specialized GPU kernels). Today the validated path is what `Scores::new` uses; the unvalidated one is opt-in.
+
 `Scores::values(state)` returns an `ExpectedValues` by walking the three-roll decision tree in reverse, dispatching the linalg ops through a [`LinalgBackend`](#linalg-and-build-backends):
 
 1. `entry_actions[action, dice]` = immediate score of taking `action` on `dice` + stored EV of the resulting child state (via `State::score_and_child`, which handles upper bonus, Yahtzee bonus, and the joker rule).
@@ -97,7 +99,7 @@ For external comparison: the `timpalpant/yahtzee` Go reference takes ~45 s for t
 Helpful entry points:
 - **Examples**: `crates/core/examples/time_build.rs` (default), `time_build_naive.rs`, `cuda_smoke.rs`.
 - **Benches**: `crates/core/benches/recommend.rs` — see the `bench_backends` (per-state) and `bench_build_backends` (full builds) groups.
-- **Cross-check test**: `test_naive_backend_matches` asserts naive and ndarray agree on default-state EV within 1e-3.
+- **Cross-check tests**: `test_naive_backend_matches` asserts naive and ndarray agree on the default-state EV within 1e-3 (single scalar tripwire). `proptests::linalg_backends_agree_on_action_ranking` is the broader cousin: for `arb_state() × dice_idx`, every enabled `LinalgBackend` (naive, ndarray, optionally faer/simd) must produce the same overall EV *and* the same EV at each rank in the sorted entries / first_keepers / second_keepers lists, within 5e-3. This catches structural backend bugs that nudge EVs by ~1e-2 on niche states — well below the default-state test's noise floor. `test_unvalidated_matches_validated` (gated `#[ignore]`, run with `cargo test -p yahtzee-core --release -- --ignored`) compares `Scores::new_with` against `Scores::new_with_unvalidated` across every reachable state — i.e. cross-checks the BFS soundness as a side effect.
 
 ### Scoring helpers
 
