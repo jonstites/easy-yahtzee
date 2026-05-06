@@ -77,3 +77,83 @@ impl LinalgBackend for NdarrayBackend {
         KEEPERS_TO_DICE_PROBABILITIES.row(0).dot(first_dice)
     }
 }
+
+/// faer-based backend (opt-in via `--features faer`). Uses faer's GEMV for
+/// `keepers_from_dice` and scalar dot for `initial_roll_ev`. The masked-max
+/// in `dice_from_keepers` isn't a linear op so faer doesn't help — we reuse
+/// the same Zip-based implementation as `NdarrayBackend`.
+///
+/// Holds preprocessed `faer::Mat` / `faer::Col` copies of the static
+/// probability tables, built once at `FaerBackend::new()` time.
+#[cfg(feature = "faer")]
+pub use faer_impl::FaerBackend;
+
+#[cfg(feature = "faer")]
+mod faer_impl {
+    use super::{LinalgBackend, DICE_TO_ALLOWED_KEEPERS, KEEPERS_TO_DICE_PROBABILITIES,
+        NUM_DICE_COMBINATIONS};
+    use faer::{Col, Mat};
+    use ndarray::{Array1, Zip};
+
+    pub struct FaerBackend {
+        // (462, 252) preprocessed copy of KEEPERS_TO_DICE_PROBABILITIES.
+        keepers_to_dice: Mat<f32>,
+        // Length-252 row-0 of the same matrix (initial-roll distribution).
+        first_roll: Col<f32>,
+    }
+
+    impl FaerBackend {
+        pub fn new() -> Self {
+            let nd = &*KEEPERS_TO_DICE_PROBABILITIES;
+            let (rows, cols) = nd.dim();
+            let keepers_to_dice = Mat::from_fn(rows, cols, |i, j| nd[(i, j)]);
+            let first_roll = Col::from_fn(cols, |j| nd[(0, j)]);
+            Self {
+                keepers_to_dice,
+                first_roll,
+            }
+        }
+    }
+
+    impl Default for FaerBackend {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl LinalgBackend for FaerBackend {
+        #[inline]
+        fn keepers_from_dice(&self, dice_values: &Array1<f32>) -> Array1<f32> {
+            // Borrow ndarray slice as a faer column without copying.
+            let slice = dice_values.as_slice().expect("dice_values contiguous");
+            let dice_col = faer::ColRef::from_slice(slice);
+
+            // GEMV via faer's Mul overload (Mat * Col -> Col).
+            let out: Col<f32> = &self.keepers_to_dice * dice_col;
+
+            // Convert faer Col -> ndarray Array1 (one allocation; same shape as
+            // ndarray's `.dot()` path, which also returns an owned Array1).
+            Array1::from_iter(out.iter().copied())
+        }
+
+        #[inline]
+        fn dice_from_keepers(&self, keeper_values: &Array1<f32>) -> Array1<f32> {
+            // Masked max-reduction; faer doesn't help. Identical to NdarrayBackend.
+            let mut dice: Array1<f32> = Array1::zeros(NUM_DICE_COMBINATIONS as usize);
+            Zip::from(&mut dice)
+                .and(DICE_TO_ALLOWED_KEEPERS.rows())
+                .for_each(|val, mask_row| {
+                    *val = (&mask_row * keeper_values).fold(0_f32, |acc, elem| acc.max(*elem));
+                });
+            dice
+        }
+
+        #[inline]
+        fn initial_roll_ev(&self, first_dice: &Array1<f32>) -> f32 {
+            let slice = first_dice.as_slice().expect("first_dice contiguous");
+            let v = faer::ColRef::from_slice(slice);
+            // Inner product via faer's column-vs-column dot.
+            (0..v.nrows()).map(|i| self.first_roll[i] * v[i]).sum()
+        }
+    }
+}

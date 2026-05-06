@@ -17,7 +17,9 @@ use std::hint::black_box;
 use std::sync::LazyLock;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use yahtzee_core::{dice_to_counts, recommend, Scores, State, StateInput};
+use yahtzee_core::{
+    dice_to_counts, recommend, NdarrayBackend, Scores, State, StateInput,
+};
 
 static SHARED_SCORES: LazyLock<Scores> = LazyLock::new(Scores::new);
 
@@ -78,5 +80,38 @@ fn bench_with_turn_ev(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_state_values, bench_recommend, bench_with_turn_ev);
+/// Side-by-side comparison of `LinalgBackend` impls on the same per-state
+/// EV path. NdarrayBackend is the default; whether it dispatches GEMV through
+/// `matrixmultiply` or OpenBLAS is a Cargo-feature decision (`--features blas`),
+/// so this group really compares "current ndarray build vs. faer". Run with
+/// `cargo bench -p yahtzee-core --features faer` to include FaerBackend.
+fn bench_backends(c: &mut Criterion) {
+    let scores = &*SHARED_SCORES;
+    let state = State::default();
+
+    let mut group = c.benchmark_group("state_value/backends");
+
+    let nd = NdarrayBackend;
+    group.bench_function("ndarray", |b| {
+        b.iter(|| black_box(scores.state_value_with(black_box(state), &nd)))
+    });
+
+    #[cfg(feature = "faer")]
+    {
+        let fa = yahtzee_core::linalg::FaerBackend::new();
+        group.bench_function("faer", |b| {
+            b.iter(|| black_box(scores.state_value_with(black_box(state), &fa)))
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_state_values,
+    bench_recommend,
+    bench_with_turn_ev,
+    bench_backends,
+);
 criterion_main!(benches);

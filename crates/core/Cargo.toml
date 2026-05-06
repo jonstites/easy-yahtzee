@@ -9,12 +9,16 @@ path = "src/lib.rs"
 
 [features]
 # Dispatch ndarray's `.dot()` on f32/f64 to a system BLAS (OpenBLAS via
-# pkg-config) instead of the default `matrixmultiply` backend. Currently
-# only affects the two `first_roll_probabilities().dot(&first_dice)` calls
-# in `Scores::values` / `Scores::state_value`; the keepers/dice transitions
-# are hand-rolled `Zip` loops and bypass ndarray's dot dispatch. Enable
-# with `cargo build -p yahtzee-core --features blas`.
+# pkg-config) instead of the default `matrixmultiply` backend. Affects the
+# GEMV inside `NdarrayBackend::keepers_from_dice` and the scalar dot in
+# `NdarrayBackend::initial_roll_ev`. Enable with `--features blas`.
 blas = ["ndarray/blas", "dep:blas-src", "dep:openblas-src"]
+
+# Compile a `linalg::FaerBackend` impl of `LinalgBackend` that uses the
+# `faer` crate for the GEMV step. Off by default; opt-in for benchmarking.
+# (`dice_from_keepers` is a masked max-reduction and is unaffected -- the
+# faer impl reuses the same Zip-based code as NdarrayBackend.)
+faer = ["dep:faer"]
 
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
@@ -24,6 +28,7 @@ rayon = "1"
 serde = { version = "1.0", features = ["derive"] }
 blas-src = { version = "0.10", features = ["openblas"], optional = true }
 openblas-src = { version = "0.10", features = ["system"], optional = true }
+faer = { version = "0.24", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

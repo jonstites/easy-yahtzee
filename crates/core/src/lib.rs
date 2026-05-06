@@ -1001,6 +1001,23 @@ mod tests {
         assert!((expected_value - 254.5896).abs() < 0.0001);
     }
 
+    /// FaerBackend should produce the same default-state EV as NdarrayBackend
+    /// (the default), modulo float reordering. Uses the precomputed `state_scores`
+    /// table (built via the default backend) as the substrate, and only swaps
+    /// the per-state EV computation. Run with `cargo test --features faer ...`.
+    #[cfg(feature = "faer")]
+    #[test]
+    fn test_faer_backend_matches() {
+        let scores = shared_scores();
+        let state = State::default();
+        let nd = scores.state_value_with(state, &NdarrayBackend);
+        let fa = scores.state_value_with(state, &linalg::FaerBackend::new());
+        assert!(
+            (nd - fa).abs() < 0.001,
+            "ndarray={nd} faer={fa} differ by more than 1e-3"
+        );
+    }
+
     /// State for joker-rule tests: Yahtzee box filled and Threes filled, so a
     /// rolled three-yahtzee triggers the joker rule for any lower category.
     /// `yahtzee_bonus_eligible: false` keeps the +100 bonus out of the picture.
