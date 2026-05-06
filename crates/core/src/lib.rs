@@ -40,7 +40,10 @@ pub use recommend::{
 };
 
 pub mod linalg;
-pub use linalg::{BuildBackend, CpuBuildBackend, LinalgBackend, NdarrayBackend};
+pub use linalg::{
+    BuildBackend, CpuBuildBackend, CpuBuildBackendWith, LinalgBackend, NaiveBackend,
+    NdarrayBackend,
+};
 
 #[cfg(test)]
 mod proptests;
@@ -1076,6 +1079,23 @@ mod tests {
         let scores = shared_scores();
         let expected_value = scores.state_scores[default_idx];
         assert!((expected_value - 254.5896).abs() < 0.0001);
+    }
+
+    /// NaiveBackend (scalar `for` loops, no ndarray ops) should produce the
+    /// same default-state EV as NdarrayBackend (matrixmultiply-backed
+    /// `.dot()`), modulo float reordering. This is the most independent
+    /// cross-check we have, since the other backends share matrix
+    /// machinery; if these two disagree something is wrong.
+    #[test]
+    fn test_naive_backend_matches() {
+        let scores = shared_scores();
+        let state = State::default();
+        let nd = scores.state_value_with(state, &NdarrayBackend);
+        let nv = scores.state_value_with(state, &NaiveBackend);
+        assert!(
+            (nd - nv).abs() < 0.001,
+            "ndarray={nd} naive={nv} differ by more than 1e-3"
+        );
     }
 
     /// FaerBackend should produce the same default-state EV as NdarrayBackend

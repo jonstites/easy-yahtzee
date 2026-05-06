@@ -25,6 +25,13 @@
 //! feature) are typically only reached via `Scores::state_value_with` /
 //! `Scores::values_with`, which the benches use to compare apples-to-apples.
 //!
+//! `NaiveBackend` is a bonus: a scalar-`for`-loop reference impl that reads
+//! exactly like the math in the trait docstrings. No ndarray, BLAS, faer or
+//! SIMD machinery. Useful as a meaningfully-independent oracle for tests
+//! (it shares no code with the optimized backends) and as a "honest"
+//! baseline so other backends' speedups can be quoted relative to a clear
+//! reference rather than to each other.
+//!
 //! There is a second, coarser-grained trait in this module: [`BuildBackend`].
 //! `LinalgBackend` is the *per-state* abstraction (one state, three GEMV/max
 //! ops). `BuildBackend` is the *per-level* abstraction: given a batch of
@@ -39,8 +46,8 @@ use ndarray::{Array1, Zip};
 use rayon::prelude::*;
 
 use crate::{
-    state_value_with, DICE_TO_ALLOWED_KEEPERS, KEEPERS_TO_DICE_PROBABILITIES,
-    NUM_DICE_COMBINATIONS, State,
+    state_value_with, DICE_TO_ALLOWED_KEEPERS, KEEPERS_TO_DICE_PROBABILITIES, NUM_DICE_COMBINATIONS,
+    NUM_KEEPERS, State,
 };
 
 /// The three swappable linear-algebra steps in the per-state EV pipeline.
@@ -89,6 +96,91 @@ impl LinalgBackend for NdarrayBackend {
         // Row 0 = "kept nothing" = initial-roll distribution over the 252
         // five-dice combos.
         KEEPERS_TO_DICE_PROBABILITIES.row(0).dot(first_dice)
+    }
+}
+
+/// Reference impl: nested scalar `for` loops over `&[f32]` slices, no
+/// ndarray ops, no SIMD, no BLAS, no faer. Reads exactly like the math in
+/// the trait docstrings.
+///
+/// Two purposes:
+///
+/// 1. **Cross-check oracle.** The other backends all share some flavor of
+///    the same matrix machinery (ndarray's `.dot()`, with optional BLAS or
+///    SIMD speedups, or faer's GEMV) — none are *meaningfully* independent.
+///    A naive scalar loop is independent code; if it disagrees with the
+///    others by more than fp tolerance, something's wrong with one of them.
+///
+/// 2. **Calibration baseline.** Every other backend's speedup is "vs. some
+///    optimized baseline." The naive backend is the "if you'd just written
+///    the math" baseline, so the speedups can be quoted relative to *that*.
+///    At our small problem sizes (252×462 and 462×252) the constant
+///    overhead in matrixmultiply / BLAS / faer can eat their asymptotic
+///    advantage, so the gap may be smaller than you'd expect.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NaiveBackend;
+
+impl LinalgBackend for NaiveBackend {
+    #[inline]
+    fn keepers_from_dice(&self, dice_values: &Array1<f32>) -> Array1<f32> {
+        // out[k] = Σ_d KEEPERS_TO_DICE_PROBABILITIES[k, d] * dice_values[d]
+        let probs = KEEPERS_TO_DICE_PROBABILITIES
+            .as_slice()
+            .expect("KEEPERS_TO_DICE_PROBABILITIES is contiguous");
+        let dice = dice_values.as_slice().expect("dice_values is contiguous");
+        let n_d = NUM_DICE_COMBINATIONS as usize;
+        let mut out = vec![0.0_f32; NUM_KEEPERS as usize];
+        for k in 0..NUM_KEEPERS as usize {
+            let row = &probs[k * n_d..(k + 1) * n_d];
+            let mut acc = 0.0_f32;
+            for d in 0..n_d {
+                acc += row[d] * dice[d];
+            }
+            out[k] = acc;
+        }
+        Array1::from_vec(out)
+    }
+
+    #[inline]
+    fn dice_from_keepers(&self, keeper_values: &Array1<f32>) -> Array1<f32> {
+        // out[d] = max over keepers k where DICE_TO_ALLOWED_KEEPERS[d, k] != 0
+        //          of keeper_values[k]
+        let mask = DICE_TO_ALLOWED_KEEPERS
+            .as_slice()
+            .expect("DICE_TO_ALLOWED_KEEPERS is contiguous");
+        let kv = keeper_values
+            .as_slice()
+            .expect("keeper_values is contiguous");
+        let n_d = NUM_DICE_COMBINATIONS as usize;
+        let n_k = NUM_KEEPERS as usize;
+        let mut out = vec![0.0_f32; n_d];
+        for d in 0..n_d {
+            let row = &mask[d * n_k..(d + 1) * n_k];
+            let mut best = 0.0_f32;
+            for k in 0..n_k {
+                if row[k] != 0.0 && kv[k] > best {
+                    best = kv[k];
+                }
+            }
+            out[d] = best;
+        }
+        Array1::from_vec(out)
+    }
+
+    #[inline]
+    fn initial_roll_ev(&self, first_dice: &Array1<f32>) -> f32 {
+        // out = Σ_d KEEPERS_TO_DICE_PROBABILITIES[0, d] * first_dice[d]
+        let probs = KEEPERS_TO_DICE_PROBABILITIES
+            .as_slice()
+            .expect("KEEPERS_TO_DICE_PROBABILITIES is contiguous");
+        let n_d = NUM_DICE_COMBINATIONS as usize;
+        let row0 = &probs[..n_d];
+        let fd = first_dice.as_slice().expect("first_dice is contiguous");
+        let mut acc = 0.0_f32;
+        for d in 0..n_d {
+            acc += row0[d] * fd[d];
+        }
+        acc
     }
 }
 
@@ -151,6 +243,32 @@ impl BuildBackend for CpuBuildBackend {
         Ok(states
             .par_iter()
             .map(|state| state_value_with(*state, state_scores, &backend))
+            .collect())
+    }
+}
+
+/// Like [`CpuBuildBackend`], but parameterized over the [`LinalgBackend`]
+/// used inside the per-state walk. Lets benches and external callers
+/// drive a full table build through a non-default linear-algebra
+/// implementation (e.g. [`NaiveBackend`], `SimdBackend`, `FaerBackend`)
+/// without copy-pasting the rayon scaffolding.
+///
+/// `CpuBuildBackend` is exactly `CpuBuildBackendWith(NdarrayBackend)` plus
+/// a shorter name; both are kept for API ergonomics.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CpuBuildBackendWith<L: LinalgBackend>(pub L);
+
+impl<L: LinalgBackend> BuildBackend for CpuBuildBackendWith<L> {
+    type Error = std::convert::Infallible;
+
+    fn compute_level(
+        &self,
+        states: &[State],
+        state_scores: &[f32],
+    ) -> Result<Vec<f32>, Self::Error> {
+        Ok(states
+            .par_iter()
+            .map(|state| state_value_with(*state, state_scores, &self.0))
             .collect())
     }
 }
