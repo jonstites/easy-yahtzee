@@ -19,6 +19,9 @@ Cargo workspace (`Cargo.toml` lists members; the root is not a crate):
 - CLI: `cargo run -p yahtzee-cli --release -- --help`. Subcommands are `solve`, `value`, `play`, and `build`. The CLI binary embeds a brotli-compressed score table at compile time (canonical artifact: `crates/cli/data/scores.bin.br`, ~1 MiB, tracked in git), so `solve` / `value` / `play` work out of the box with no `--scores` flag. `--scores PATH` overrides the embed with a raw bincode file from disk — useful when iterating on `crates/core` without rebuilding the CLI. `play` is an interactive game loop; pass `--auto --seed N` for a deterministic solver-vs-itself game (used by `tests/play_auto.rs`), `--manual-dice` for a real-game coach. `build` regenerates the table; the web bundle uses `build --output crates/cli/data/scores.bin --brotli`, which also writes the `.br` and a `MANIFEST` and updates the embed source for the next CLI rebuild.
 - Rebuild wasm after touching `crates/core` or `crates/wasm`: `cd crates/wasm && wasm-pack build --target web --out-dir pkg`. The Svelte dev server picks up the new `pkg/` automatically.
 - Web dev: `cd web && npx vite` (or `pnpm run dev` if pnpm is available). Type check: `npx svelte-check --tsconfig ./tsconfig.json`. Production build: `npx vite build`.
+- Time `Scores::new()` ad-hoc (rayon scaling, perf experiments): `RAYON_NUM_THREADS=N cargo run -p yahtzee-core --release --example time_build` (default ndarray backend), or `... --example time_build_naive` (naive scalar backend), or `... --example cuda_smoke --features cuda` (GPU). All print one-line timings; `cuda_smoke` also asserts the default-state EV.
+- Per-level DP-build trace: set `YAHTZEE_TRACE_LEVELS=1` on any of the above to print `level=N batch=B collect=…ms compute=…ms write=…ms` for each of the 13 DP levels. Useful when comparing backends at finer-than-total-wall-time granularity.
+- Criterion benches: `cargo bench -p yahtzee-core --bench recommend [--features cuda,faer,simd] -- "Scores::new_with|state_value/backends"` runs the head-to-head across naive / ndarray / faer / simd / cuda. The full-build group has `sample_size=10` and `measurement_time=60s`, so it can run for ~5 min with all features enabled — that's expected. Other bench groups (`Scores::values`, `recommend(default,[1..5])`, `*_with_turn_ev`) are quick.
 
 The web app expects `scores.bin.br` (brotli-compressed `Scores`) at `crates/cli/data/scores.bin.br` — the same file the CLI embeds. The dev-server middleware in `web/vite.config.ts` reads from there and streams it at `/scores.bin` with `Content-Encoding: br`. There is no longer a separate `web/static/scores.bin.br`.
 
@@ -41,9 +44,11 @@ A `State` is `(entries: EntryAction bitflags, yahtzee_bonus_eligible: bool, uppe
 
 ### Solver (`Scores`)
 
-`Scores::new()` allocates `state_scores: Array1<f32>` of length `NUM_STATES` and fills it level-by-level from 13 filled entries down to 0 (`set_scores`). Each level is parallelized with `rayon` (`par_iter_mut`); correctness of the parallelism depends on processing strictly higher levels first, since a state only depends on states with more entries filled.
+`Scores::new()` allocates `state_scores: Array1<f32>` of length `NUM_STATES` and fills it level-by-level from 13 filled entries down to 0 (`set_scores`). Within a level all states are independent (a state only reads entries of `state_scores` at strictly higher levels), and that's the parallelism dispatched through the [`BuildBackend`](#linalg-and-build-backends) trait — by default `CpuBuildBackend` does it as a rayon `par_iter` over the per-state walk; the GPU backend does the whole batch in one custom-kernel + cuBLAS pipeline per level.
 
-`Scores::values(state)` returns an `ExpectedValues` by walking the three-roll decision tree in reverse:
+`Scores::new_with<B: BuildBackend>(backend: &B) -> Result<Self, B::Error>` is the generic constructor; `Scores::new()` calls it with `&CpuBuildBackend` and unwraps the `Infallible` result. Use `new_with` directly to opt into a non-default backend (e.g. `&CudaBuildBackend::new()?` under the `cuda` feature).
+
+`Scores::values(state)` returns an `ExpectedValues` by walking the three-roll decision tree in reverse, dispatching the linalg ops through a [`LinalgBackend`](#linalg-and-build-backends):
 
 1. `entry_actions[action, dice]` = immediate score of taking `action` on `dice` + stored EV of the resulting child state (via `State::score_and_child`, which handles upper bonus, Yahtzee bonus, and the joker rule).
 2. `third_dice[dice] = max_action entry_actions[action, dice]` (best entry to pick on the final roll).
@@ -51,6 +56,48 @@ A `State` is `(entries: EntryAction bitflags, yahtzee_bonus_eligible: bool, uppe
 4. Overall EV = initial-roll distribution (row 0 of `KEEPERS_TO_DICE_PROBABILITIES`) · `first_dice`.
 
 The expected value from the default state is ~254.5896 (asserted in `test_expected_value`).
+
+Both per-state primitives also exist as **free functions** in the crate root: `pub fn state_value_with(state, state_scores: &[f32], &impl LinalgBackend) -> f32` and `pub fn values_with(...)`. The `Scores::*_with` methods are 1-line wrappers; the free-function form is what `BuildBackend` impls call so they don't need a `Scores` value.
+
+### Linalg and build backends
+
+There are **two** swappable abstractions, at different granularities:
+
+`LinalgBackend` — *per-state* primitives. Three ops: `keepers_from_dice` (252→462 GEMV), `dice_from_keepers` (462→252 masked-max reduction), `initial_roll_ev` (252-dim dot). Implementations live in `crates/core/src/linalg.rs`:
+
+| Backend | Cargo feature | What it does |
+|---|---|---|
+| `NaiveBackend` | (always-on, no deps) | Reference impl: nested scalar `for` loops over `&[f32]`. No ndarray ops. Independent of the others' code paths, so it doubles as the cross-check oracle (`test_naive_backend_matches`). |
+| `NdarrayBackend` | (default) | GEMV via `ndarray::Array2::dot` (which is `matrixmultiply` by default; `cblas_sgemv` under `--features blas`). Masked-max via a hand-rolled `Zip`. **What `Scores::new()` and `Scores::values()` use by default.** |
+| `FaerBackend` | `--features faer` | GEMV via faer's `Mat * Col`. Holds a preprocessed `faer::Mat` of `KEEPERS_TO_DICE_PROBABILITIES`. Reuses ndarray's masked-max (faer can't help with that). |
+| `SimdBackend` | `--features simd` | Hand-vectorized masked-max via `wide::f32x8`. GEMV stays on ndarray's `.dot()`. The masked-max acceleration is the single biggest CPU win — see perf table below. |
+
+`BuildBackend` — *per-level* batched. One method, `compute_level(states: &[State], state_scores: &[f32]) -> Result<Vec<f32>, Self::Error>`, with associated error type. CPU impls just dispatch the per-state walk in a rayon `par_iter`; the GPU impl owns the whole batched pipeline (uploads, NVRTC kernels, cuBLAS gemms, scatter back to device-resident state_scores).
+
+| Backend | Cargo feature | What it does |
+|---|---|---|
+| `CpuBuildBackend` | (always-on) | Convenience unit-struct: rayon `par_iter` over the per-state walk using `NdarrayBackend`. What `Scores::new()` uses. `Error = Infallible`. |
+| `CpuBuildBackendWith<L: LinalgBackend>(pub L)` | (always-on) | Generic over the per-state linalg, so benches and external callers can drive a full table build through any `LinalgBackend` (e.g. `CpuBuildBackendWith(NaiveBackend)`, `CpuBuildBackendWith(SimdBackend)`). `Error = Infallible`. |
+| `CudaBuildBackend` | `--features cuda` | Full GPU pipeline. Lives in `crates/core/src/linalg/cuda.rs`. Uses `cudarc` (driver API + cuBLAS + NVRTC), dynamic-loaded — no `nvcc` or CUDA headers needed at build time, only `libcuda` / `libcublas` / `libnvrtc` `.so`s on the runtime host. Three custom NVRTC kernels (`build_third_dice`, `masked_max`, `initial_roll_ev`) plus two cuBLAS sgemm calls per level for the two `keepers_from_dice` GEMVs. State_scores is allocated **once** on device and updated in place via a `scatter_results` kernel — no per-level H→D upload of the host buffer. Per-level intermediates are persistent and lazily grown to the largest batch seen. `Error = CudaError`. |
+
+Performance picture (Ryzen 9 9800X3D + RTX 5070 Ti, criterion `Scores::new_with`, 16 threads):
+
+| Backend | Build time | vs naive | Notes |
+|---|---|---|---|
+| `naive` | 8.69 s | 1.00× | The honest baseline. |
+| `ndarray` | 5.73 s | 1.52× | Default. matrixmultiply earns ~1.5× at our problem size. |
+| `faer` | 4.72 s | 1.84× | Quietly the best CPU GEMV at 252×462. |
+| `simd` | 3.11 s | 2.79× | Best CPU. Masked-max is the bottleneck SIMD attacks. |
+| `cuda` | 944 ms | 9.20× | Per-level batched on GPU; mostly architectural win, not "GPU linalg is 9× better." |
+
+Per-state (`state_value/backends`, default state, single thread): naive 162 µs → ndarray 116 µs → faer 99 µs → simd 53 µs. The CPU optimization machinery spans **2.79× over naive**; the GPU adds another 3.3× on top of that for ~9.2× end-to-end vs naive.
+
+For external comparison: the `timpalpant/yahtzee` Go reference takes ~45 s for the same table on the same hardware (16 threads). Our naive Rust is 5.2× faster than that, default Rust 7.9×, simd 14.6×, CUDA 48×. (Note: their start-state EV converges to 254.49, ours to 254.5896 — likely a small game-rule difference, possibly their `Max score is: 1500` cap on accumulated yahtzee bonuses; not investigated further.)
+
+Helpful entry points:
+- **Examples**: `crates/core/examples/time_build.rs` (default), `time_build_naive.rs`, `cuda_smoke.rs`.
+- **Benches**: `crates/core/benches/recommend.rs` — see the `bench_backends` (per-state) and `bench_build_backends` (full builds) groups.
+- **Cross-check test**: `test_naive_backend_matches` asserts naive and ndarray agree on default-state EV within 1e-3.
 
 ### Scoring helpers
 
@@ -71,12 +118,16 @@ Private helpers `turn_ev_by_roll3_dice()` and `turn_ev_by_roll2_dice(...)` build
 
 ## Serialization, CLI, wasm
 
-`Scores` derives `Serialize` / `Deserialize` and is persisted with `bincode`. The CLI (`crates/cli/src/main.rs`) either regenerates scores (`-o`) or loads them (`-i`), then for `--roll 1|2|3` prints ranked keepers / entries by EV. The `--entries` argument is a 13-character `0`/`1` string aligned with `ENTRY_ACTIONS` order.
+`Scores` derives `Serialize` / `Deserialize` and is persisted with `bincode`. The CLI (`crates/cli/src/main.rs`) is `clap`-subcommand-based — see the Commands section above for the four subcommands (`solve`, `value`, `play`, `build`) and how `--scores PATH` overrides the embedded score table. The `--entries` argument used by `solve` / `value` is a 13-character `0`/`1` string aligned with `ENTRY_ACTIONS` order.
+
+Both the CLI and wasm crates currently consume `yahtzee-core` with default features only (so the table-build path uses `CpuBuildBackend` → `NdarrayBackend`). The faster CPU backends (`simd`, `faer`) are gated behind features that neither downstream crate enables today; switching the CLI's `build` subcommand to use `simd` is a 1.84× wall-clock win with no API change. `cuda` is more situational (driver libs at runtime, NVIDIA-only) but plausible as an opt-in `cuda` feature on the CLI.
 
 `crates/wasm/src/lib.rs` exposes:
 
 - `class Solver` — `new(bytes)` deserializes a `scores.bin`. Methods: `recommend(state, dice, roll)` returns `{ value, keepers?, entries? }` where keeper/entry rows carry both `ev` (overall) and `turn_ev` (this turn), plus `best_entry` on keepers that have all 5 dice kept (= "stop rolling and score here"). `stateValue(state)` and `thisTurnEv(state, dice, roll)` are thin passthroughs.
 - Free functions `entryScore(state, dice, entry_idx) -> u8` and `achievableScores(entry_idx) -> Uint8Array` for UI scoring / validation without needing a `Solver` instance.
+
+Wasm doesn't *build* score tables at runtime (it deserializes the embedded brotli blob), so backend choice only affects the canonical `scores.bin.br` regeneration path that runs through the CLI's `build` subcommand. Whether to enable `simd` for wasm anyway (e.g. for any future runtime computation) is a separate question — `wide::f32x8` falls back to scalar on wasm targets without `wasm-simd128`, so it's safe to enable but a no-op without the wasm-simd128 target feature.
 
 ## Web app
 
