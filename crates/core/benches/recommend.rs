@@ -15,10 +15,11 @@
 
 use std::hint::black_box;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use yahtzee_core::{
-    dice_to_counts, recommend, NdarrayBackend, Scores, State, StateInput,
+    dice_to_counts, recommend, CpuBuildBackend, NdarrayBackend, Scores, State, StateInput,
 };
 
 static SHARED_SCORES: LazyLock<Scores> = LazyLock::new(Scores::new);
@@ -115,11 +116,53 @@ fn bench_backends(c: &mut Criterion) {
     group.finish();
 }
 
+/// End-to-end `Scores::new_with(&backend)` head-to-head. Each iteration runs
+/// the full DP table build (set_valid_states + 13-level DP fill), so we
+/// override Criterion's defaults: sample_size = 10 (otherwise ~100 s per
+/// backend) and a generous measurement time. The CUDA backend is constructed
+/// once via `LazyLock` outside the timing loop — context init + NVRTC compile
+/// + static-table upload (~200 ms) is one-time setup, not per-build cost.
+fn bench_build_backends(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Scores::new_with");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(60));
+
+    let cpu = CpuBuildBackend;
+    group.bench_function("cpu", |b| {
+        b.iter(|| {
+            let s = Scores::new_with(black_box(&cpu));
+            black_box(s.state_value(State::default()))
+        })
+    });
+
+    #[cfg(feature = "cuda")]
+    {
+        // One CUDA backend reused across all iterations so we time only the
+        // per-build work (kernel launches + per-level uploads), not context
+        // init + PTX compile.
+        static CUDA_BACKEND: LazyLock<yahtzee_core::linalg::cuda::CudaBuildBackend> =
+            LazyLock::new(|| {
+                yahtzee_core::linalg::cuda::CudaBuildBackend::new()
+                    .expect("CUDA backend init failed")
+            });
+        let cuda = &*CUDA_BACKEND;
+        group.bench_function("cuda", |b| {
+            b.iter(|| {
+                let s = Scores::new_with(black_box(cuda));
+                black_box(s.state_value(State::default()))
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_state_values,
     bench_recommend,
     bench_with_turn_ev,
     bench_backends,
+    bench_build_backends,
 );
 criterion_main!(benches);
