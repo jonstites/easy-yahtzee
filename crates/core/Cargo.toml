@@ -25,6 +25,14 @@ faer = ["dep:faer"]
 # `wide::f32x8`. Uses ndarray's `.dot()` for the GEMV. Off by default.
 simd = ["dep:wide", "dep:bytemuck"]
 
+# Compile a `linalg::cuda::CudaBuildBackend` that runs the level-batched DP
+# fill on an NVIDIA GPU via cudarc (driver API + cuBLAS + NVRTC-compiled
+# custom kernels). This is a `BuildBackend` rather than a `LinalgBackend`:
+# the per-state `state_value*` paths stay on CPU, but `Scores::new_with`
+# dispatches each level's batch to the GPU. Off by default — opt in with
+# `--features cuda` and `Scores::new_with(&CudaBuildBackend::new()?)`.
+cuda = ["dep:cudarc"]
+
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
 bitflags = { version = "2", features = ["serde"] }
@@ -36,6 +44,11 @@ openblas-src = { version = "0.10", features = ["system"], optional = true }
 faer = { version = "0.24", default-features = false, features = ["std"], optional = true }
 wide = { version = "1.3", optional = true }
 bytemuck = { version = "1.25", optional = true }
+# cudarc dynamic-loads libcuda / libcublas / libnvrtc at runtime via
+# `fallback-dynamic-loading`, so we don't need CUDA headers or `nvcc` at
+# build time — just the runtime `.so`s on `LD_LIBRARY_PATH` (or registered
+# with ldconfig). Driver API + cuBLAS + NVRTC are the bits we use.
+cudarc = { version = "0.19", default-features = false, features = ["cuda-12050", "driver", "cublas", "nvrtc", "std", "fallback-dynamic-loading"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

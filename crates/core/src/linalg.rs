@@ -24,10 +24,24 @@
 //! `Scores::values` use. Other backends (e.g. `FaerBackend` under the `faer`
 //! feature) are typically only reached via `Scores::state_value_with` /
 //! `Scores::values_with`, which the benches use to compare apples-to-apples.
+//!
+//! There is a second, coarser-grained trait in this module: [`BuildBackend`].
+//! `LinalgBackend` is the *per-state* abstraction (one state, three GEMV/max
+//! ops). `BuildBackend` is the *per-level* abstraction: given a batch of
+//! states at the same DP level and the read-only state-scores buffer, return
+//! the EV of every state in the batch. The CPU implementation
+//! ([`CpuBuildBackend`]) is a thin rayon `par_iter` wrapper over the per-state
+//! path, so it costs nothing relative to the previous in-line loop. The
+//! coarser granularity exists so a future GPU backend can amortize kernel
+//! launches across a whole level instead of paying launch overhead per state.
 
 use ndarray::{Array1, Zip};
+use rayon::prelude::*;
 
-use crate::{DICE_TO_ALLOWED_KEEPERS, KEEPERS_TO_DICE_PROBABILITIES, NUM_DICE_COMBINATIONS};
+use crate::{
+    state_value_with, DICE_TO_ALLOWED_KEEPERS, KEEPERS_TO_DICE_PROBABILITIES,
+    NUM_DICE_COMBINATIONS, State,
+};
 
 /// The three swappable linear-algebra steps in the per-state EV pipeline.
 /// Implementations should be cheap to construct (`Default::default()` is
@@ -78,6 +92,44 @@ impl LinalgBackend for NdarrayBackend {
     }
 }
 
+/// Coarser-grained "given a level's worth of states, return their EVs" trait.
+/// Used by [`crate::Scores::new_with`] to drive the level-by-level DP fill.
+///
+/// The CPU implementation ([`CpuBuildBackend`]) is a rayon `par_iter` over
+/// the existing per-state pipeline; it's morally identical to the in-line
+/// loop the DP previously used.
+///
+/// A future GPU implementation lives behind the `cuda` Cargo feature and
+/// owns the full batched pipeline internally (custom kernels +
+/// cuBLAS sgemm), so it can amortize kernel-launch overhead across all
+/// states at a level instead of paying it per state.
+pub trait BuildBackend: Send + Sync {
+    /// Compute the overall EV of every state in `states`. The returned
+    /// vector is in the same order as the input. `state_scores` is the
+    /// (read-only) DP buffer holding EVs for already-computed levels —
+    /// every state in `states` is at the same level, and the only entries
+    /// of `state_scores` they read are at strictly higher levels (more
+    /// entries filled), so the contents at the level-being-computed don't
+    /// matter.
+    fn compute_level(&self, states: &[State], state_scores: &[f32]) -> Vec<f32>;
+}
+
+/// Default [`BuildBackend`] impl: rayon `par_iter` over the per-state EV
+/// path using [`NdarrayBackend`]. Behaves identically to the in-line loop
+/// `Scores::set_scores` used before the trait was extracted.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CpuBuildBackend;
+
+impl BuildBackend for CpuBuildBackend {
+    fn compute_level(&self, states: &[State], state_scores: &[f32]) -> Vec<f32> {
+        let backend = NdarrayBackend;
+        states
+            .par_iter()
+            .map(|state| state_value_with(*state, state_scores, &backend))
+            .collect()
+    }
+}
+
 /// faer-based backend (opt-in via `--features faer`). Uses faer's GEMV for
 /// `keepers_from_dice` and scalar dot for `initial_roll_ev`. The masked-max
 /// in `dice_from_keepers` isn't a linear op so faer doesn't help — we reuse
@@ -97,6 +149,14 @@ pub use faer_impl::FaerBackend;
 /// columns so each row is a clean sequence of `f32x8` lanes.
 #[cfg(feature = "simd")]
 pub use simd_impl::SimdBackend;
+
+/// CUDA backend (opt-in via `--features cuda`). Implements [`BuildBackend`]
+/// (per-level batched), not [`LinalgBackend`] (per-state). See
+/// [`cuda::CudaBuildBackend`] for the gory details.
+#[cfg(feature = "cuda")]
+pub mod cuda;
+#[cfg(feature = "cuda")]
+pub use cuda::CudaBuildBackend;
 
 #[cfg(feature = "simd")]
 mod simd_impl {

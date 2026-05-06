@@ -40,7 +40,7 @@ pub use recommend::{
 };
 
 pub mod linalg;
-pub use linalg::{LinalgBackend, NdarrayBackend};
+pub use linalg::{BuildBackend, CpuBuildBackend, LinalgBackend, NdarrayBackend};
 
 #[cfg(test)]
 mod proptests;
@@ -388,6 +388,71 @@ pub struct Scores {
     valid_states: Box<[u64]>,
 }
 
+/// Per-state entry-actions table: `(13, 252)` of `score + V(child)` for valid
+/// `(action, final_dice)` pairs, 0 otherwise. The first thing the per-state
+/// EV walk computes; what `state_value_with` / `values_with` fold over to get
+/// `third_dice`. Free function over a raw `&[f32]` state-scores buffer so it
+/// can be called from a [`BuildBackend`] impl that doesn't hold a `Scores`.
+pub fn entry_actions_array(state: State, state_scores: &[f32]) -> Array2<f32> {
+    Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
+        let action = EntryAction::from_bits(1 << action_idx).unwrap();
+        if state.is_valid_action(action) {
+            let (score, child) = state.score_and_child(action, dice_idx as u8);
+            let child_idx: usize = child.into();
+            score + state_scores[child_idx]
+        } else {
+            0_f32
+        }
+    })
+}
+
+/// Overall expected final score from `state` under optimal play, given the
+/// `state_scores` DP buffer. Free-function form of [`Scores::state_value_with`]:
+/// the per-state pipeline that [`BuildBackend`] impls call from inside their
+/// `compute_level`.
+pub fn state_value_with<B: LinalgBackend>(
+    state: State,
+    state_scores: &[f32],
+    backend: &B,
+) -> f32 {
+    let entry_actions = entry_actions_array(state, state_scores);
+    let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
+    let second_keepers = backend.keepers_from_dice(&third_dice);
+    let second_dice = backend.dice_from_keepers(&second_keepers);
+    let first_keepers = backend.keepers_from_dice(&second_dice);
+    let first_dice = backend.dice_from_keepers(&first_keepers);
+    backend.initial_roll_ev(&first_dice)
+}
+
+/// Materialize an [`ExpectedValues`] for `state` against the `state_scores`
+/// DP buffer. Free-function form of [`Scores::values_with`]; same math as
+/// [`state_value_with`] but keeps the per-roll intermediate arrays the
+/// recommendation API needs.
+pub fn values_with<B: LinalgBackend>(
+    state: State,
+    state_scores: &[f32],
+    backend: &B,
+) -> ExpectedValues {
+    let entry_actions = entry_actions_array(state, state_scores);
+    let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
+    let second_keepers = backend.keepers_from_dice(&third_dice);
+    let second_dice = backend.dice_from_keepers(&second_keepers);
+    let first_keepers = backend.keepers_from_dice(&second_dice);
+    let first_dice = backend.dice_from_keepers(&first_keepers);
+    let value = backend.initial_roll_ev(&first_dice);
+
+    ExpectedValues {
+        entry_actions,
+        third_dice,
+        second_keepers,
+        second_dice,
+        first_keepers,
+        first_dice,
+        value,
+        state,
+    }
+}
+
 impl Scores {
     // `Default::default()` traditionally implies a cheap construction;
     // `Scores::new()` runs the entire DP and takes ~22s in tests / minutes at
@@ -396,6 +461,15 @@ impl Scores {
     // startup; only the `build` subcommand and tests instantiate fresh.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Scores {
+        Scores::new_with(&CpuBuildBackend)
+    }
+
+    /// Build a [`Scores`] table using a caller-provided [`BuildBackend`].
+    ///
+    /// `Scores::new()` calls this with [`CpuBuildBackend`] (rayon over the
+    /// per-state pipeline). To use the GPU, build with the `cuda` feature
+    /// and pass `&linalg::cuda::CudaBuildBackend::new()?` here.
+    pub fn new_with<B: BuildBackend>(backend: &B) -> Scores {
         let state_scores = Array1::zeros(NUM_STATES as usize);
         let valid_states = vec![0_u64; VALID_STATES_WORDS].into_boxed_slice();
         let mut scores = Scores {
@@ -403,33 +477,72 @@ impl Scores {
             valid_states,
         };
         scores.set_valid_states();
-        scores.set_scores();
+        scores.set_scores(backend);
         scores
     }
 
-    fn set_scores(&mut self) {
-        // We go level-by-level, bottom to top, for correctness when multiprocessing
+    fn set_scores<B: BuildBackend>(&mut self, backend: &B) {
+        // Bottom-up by level (most filled entries first) so each level only
+        // reads strictly-higher-level state scores. Within a level, all
+        // states are independent — that's the parallelism the BuildBackend
+        // exploits (rayon on CPU, kernel batch on GPU).
+        let trace = std::env::var("YAHTZEE_TRACE_LEVELS").ok().is_some();
         for level in (0..NUM_ENTRY_ACTIONS).rev() {
-            let mut new_scores = vec![0_f32; NUM_STATES as usize];
+            let t_collect = std::time::Instant::now();
+            let states = self.collect_states_at_level(level as usize);
+            let collect_ms = t_collect.elapsed().as_secs_f64() * 1000.0;
+            if states.is_empty() {
+                continue;
+            }
 
-            new_scores
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(state_idx, score)| {
-                    let state: State = state_idx.into();
-                    let state_level = state.level();
-                    if self.valid_state(state) && state_level == level as usize {
-                        *score = self.state_value(state);
-                    }
-                });
+            let t_compute = std::time::Instant::now();
+            let evs = backend.compute_level(&states, self.state_scores_slice());
+            let compute_ms = t_compute.elapsed().as_secs_f64() * 1000.0;
 
-            // write this level's scores
-            for (score_idx, score) in new_scores.into_iter().enumerate() {
-                if score > 0_f32 {
-                    self.state_scores[score_idx] = score;
-                }
+            // Write this level's EVs back into the DP buffer. Subsequent
+            // (lower) levels read these.
+            let t_write = std::time::Instant::now();
+            for (state, ev) in states.iter().zip(evs.iter()) {
+                self.state_scores[usize::from(*state)] = *ev;
+            }
+            let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
+
+            if trace {
+                eprintln!(
+                    "level={level:>2} batch={:>6} collect={collect_ms:>6.1}ms compute={compute_ms:>7.1}ms write={write_ms:>5.1}ms",
+                    states.len()
+                );
             }
         }
+    }
+
+    /// All valid states at exactly the given DP level (`level` = number of
+    /// entries filled). Returned in `usize`-encoded ascending order; the
+    /// `BuildBackend` doesn't depend on the order, but a stable order makes
+    /// debugging easier.
+    fn collect_states_at_level(&self, level: usize) -> Vec<State> {
+        // Parallel filter is cheap (tens of ms across all 13 levels) and not
+        // worth optimizing further; the inner DP per state dominates.
+        (0..NUM_STATES as usize)
+            .into_par_iter()
+            .filter_map(|idx| {
+                let state: State = idx.into();
+                if self.valid_state(state) && state.level() == level {
+                    Some(state)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Read-only view of the DP buffer. The CPU build backend hands this to
+    /// each per-state worker; the CUDA backend uploads it to device memory
+    /// once per level.
+    pub fn state_scores_slice(&self) -> &[f32] {
+        self.state_scores
+            .as_slice()
+            .expect("state_scores is contiguous")
     }
 
     /// Overall expected final score from `state` under optimal play. This is
@@ -447,13 +560,7 @@ impl Scores {
     /// (matrixmultiply, BLAS, faer, …) without changing the rest of the
     /// pipeline. Production callers want [`Scores::state_value`].
     pub fn state_value_with<B: LinalgBackend>(&self, state: State, backend: &B) -> f32 {
-        let entry_actions = self.entry_actions_array(state);
-        let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
-        let second_keepers = backend.keepers_from_dice(&third_dice);
-        let second_dice = backend.dice_from_keepers(&second_keepers);
-        let first_keepers = backend.keepers_from_dice(&second_dice);
-        let first_dice = backend.dice_from_keepers(&first_keepers);
-        backend.initial_roll_ev(&first_dice)
+        state_value_with(state, self.state_scores_slice(), backend)
     }
 
     pub fn values(&self, state: State) -> ExpectedValues {
@@ -462,47 +569,7 @@ impl Scores {
 
     /// Like [`Scores::values`] but with a caller-provided [`LinalgBackend`].
     pub fn values_with<B: LinalgBackend>(&self, state: State, backend: &B) -> ExpectedValues {
-        // Overall EV of each (action, final dice) pair: `score + V(child)` for
-        // valid actions, 0 for invalid. Read by the per-entry EV API.
-        let entry_actions = self.entry_actions_array(state);
-
-        // Value of each roll-3 dice combo: max action overall EV.
-        let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
-
-        // Value of each roll-2 keeper / roll-2 dice / roll-1 keeper / roll-1
-        // dice — alternating "max over allowed keepers" and "expectation over
-        // re-roll outcomes".
-        let second_keepers = backend.keepers_from_dice(&third_dice);
-        let second_dice = backend.dice_from_keepers(&second_keepers);
-        let first_keepers = backend.keepers_from_dice(&second_dice);
-        let first_dice = backend.dice_from_keepers(&first_keepers);
-
-        // Marginal over the initial-roll distribution gives overall state EV.
-        let value = backend.initial_roll_ev(&first_dice);
-
-        ExpectedValues {
-            entry_actions,
-            third_dice,
-            second_keepers,
-            second_dice,
-            first_keepers,
-            first_dice,
-            value,
-            state,
-        }
-    }
-
-    fn entry_actions_array(&self, state: State) -> Array2<f32> {
-        Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
-            let action = EntryAction::from_bits(1 << action_idx).unwrap();
-            if state.is_valid_action(action) {
-                let (score, child) = state.score_and_child(action, dice_idx as u8);
-                let child_idx: usize = child.into();
-                score + self.state_scores[child_idx]
-            } else {
-                0_f32
-            }
-        })
+        values_with(state, self.state_scores_slice(), backend)
     }
 
     fn set_valid_states(&mut self) {
