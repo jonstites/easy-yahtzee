@@ -27,7 +27,7 @@
 //! `fallback-dynamic-loading` feature). No CUDA headers or `nvcc` are
 //! required at build time, only the runtime `.so`s at run time.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::cublas::{sys::cublasOperation_t, CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{
@@ -273,6 +273,24 @@ extern "C" __global__ void initial_roll_ev(
         out[state_b] = sdata[0];
     }
 }
+
+// Scatter the per-state EVs we just computed into the device-resident
+// `state_scores` buffer at the indices `state_indices[b]`. This is what
+// lets us keep `state_scores` on the GPU across `compute_level` calls,
+// rather than re-uploading the host buffer (which has the same values)
+// every level.
+//
+// One thread per batch element, flat 1D launch. Trivial.
+extern "C" __global__ void scatter_results(
+    const unsigned int *state_indices,  // [B]
+    const float *result,                 // [B]
+    float *state_scores,                 // [NUM_STATES]
+    int batch_size
+) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch_size) return;
+    state_scores[state_indices[b]] = result[b];
+}
 "#;
 
 const NUM_DICE_F: usize = 252;
@@ -286,9 +304,49 @@ const REDUCE_BLOCK_DIM: u32 = 64;
 /// combos in one block per state, with 4 idle threads at the tail.
 const ENTRY_BLOCK_DIM: u32 = 256;
 
+/// Mutable, lazily-allocated device-side buffers that persist across
+/// `compute_level` calls.
+///
+/// `state_scores` is allocated once at backend construction (NUM_STATES f32s
+/// = 4 MiB), zero-initialized, and updated in place by the `scatter_results`
+/// kernel after each level so the next level's `build_third_dice` can read
+/// it directly from device memory — no per-level H→D upload of the host
+/// state_scores buffer needed.
+///
+/// The five intermediate buffers (`third_dice`, `second_keepers`,
+/// `second_dice`, `first_keepers`, `first_dice`) and the per-state `result`
+/// scale with batch size and are lazily grown to the largest batch we've
+/// seen (with a small headroom). We never shrink — once allocated, the
+/// buffers live until the backend drops.
+struct DeviceState {
+    /// 4 MiB = NUM_STATES × f32. Persistent across all `compute_level`
+    /// calls (and across multiple `Scores::new_with` builds — see comment
+    /// in `compute_level_inner` about why that's safe given deterministic
+    /// per-state EVs).
+    state_scores: CudaSlice<f32>,
+
+    // Per-call intermediates, sized to `capacity_batch`. None until the
+    // first `compute_level` call grows them.
+    third_dice: Option<CudaSlice<f32>>,
+    second_keepers: Option<CudaSlice<f32>>,
+    second_dice: Option<CudaSlice<f32>>,
+    first_keepers: Option<CudaSlice<f32>>,
+    first_dice: Option<CudaSlice<f32>>,
+    result: Option<CudaSlice<f32>>,
+    /// Number of states the buffers above can currently hold. 0 means
+    /// uninitialized.
+    capacity_batch: usize,
+
+    /// Per-call upload of state indices: lazily grown like the
+    /// intermediates. The host-side state_indices Vec<u32> is rebuilt per
+    /// call; only the device buffer reuses memory.
+    state_indices: Option<CudaSlice<u32>>,
+}
+
 /// GPU-resident [`BuildBackend`]. Construct once with [`CudaBuildBackend::new`]
-/// and reuse across multiple `Scores::new_with` calls (each call makes its own
-/// per-level uploads but reuses the static tables already on device).
+/// and reuse across multiple `Scores::new_with` calls (each call makes its
+/// own per-level scatter; the static tables, kernels, cuBLAS handle, and
+/// device buffers are all reused).
 pub struct CudaBuildBackend {
     /// CUDA context — keeps the device alive and the loaded module / cuBLAS
     /// handle valid. Held as an `Arc` so the stream and module references
@@ -307,6 +365,7 @@ pub struct CudaBuildBackend {
     f_build_third_dice: CudaFunction,
     f_masked_max: CudaFunction,
     f_initial_roll_ev: CudaFunction,
+    f_scatter_results: CudaFunction,
 
     // Device-resident static tables, uploaded once.
     /// 462 × 252 row-major. cuBLAS reads it as a 252×462 column-major view of
@@ -323,12 +382,18 @@ pub struct CudaBuildBackend {
     /// EntryAction index (`EntryAction::ONE.as_idx() == 0`, …,
     /// `EntryAction::SIX.as_idx() == 5`).
     yahtzee_dice: CudaSlice<i8>,
+
+    /// Lazily-grown per-call device buffers. Mutex (rather than
+    /// `RefCell`) so `BuildBackend: Sync` holds; in practice
+    /// `Scores::new_with` calls `compute_level` serially.
+    device_state: Mutex<DeviceState>,
 }
 
 impl CudaBuildBackend {
     /// Initialize the CUDA backend on device 0: load the driver, allocate a
-    /// stream, compile and load the custom kernels, and upload the static
-    /// tables.
+    /// stream, compile and load the custom kernels, upload the static
+    /// tables, and zero-allocate the persistent device-side state_scores
+    /// buffer.
     pub fn new() -> Result<Self, CudaError> {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
@@ -341,6 +406,7 @@ impl CudaBuildBackend {
         let f_build_third_dice = module.load_function("build_third_dice")?;
         let f_masked_max = module.load_function("masked_max")?;
         let f_initial_roll_ev = module.load_function("initial_roll_ev")?;
+        let f_scatter_results = module.load_function("scatter_results")?;
 
         // Upload static tables.
         let kt = crate::KEEPERS_TO_DICE_PROBABILITIES
@@ -367,6 +433,10 @@ impl CudaBuildBackend {
         let dice_to_keepers = stream.clone_htod(dk)?;
         let dice_and_entry_scores = stream.clone_htod(&des)?;
         let yahtzee_dice = stream.clone_htod(&yd)?;
+
+        // Persistent state_scores: NUM_STATES f32 = 4 MiB, zero-initialized.
+        // Lives until the backend drops.
+        let state_scores = stream.alloc_zeros::<f32>(NUM_STATES as usize)?;
         stream.synchronize()?;
 
         Ok(Self {
@@ -376,45 +446,107 @@ impl CudaBuildBackend {
             f_build_third_dice,
             f_masked_max,
             f_initial_roll_ev,
+            f_scatter_results,
             keepers_to_dice,
             dice_to_keepers,
             dice_and_entry_scores,
             yahtzee_dice,
+            device_state: Mutex::new(DeviceState {
+                state_scores,
+                third_dice: None,
+                second_keepers: None,
+                second_dice: None,
+                first_keepers: None,
+                first_dice: None,
+                result: None,
+                capacity_batch: 0,
+                state_indices: None,
+            }),
         })
     }
 
+    /// Ensure the per-call device buffers can hold at least `batch` states.
+    /// Grows by reallocating to `batch` exactly the first time we hit a new
+    /// max; subsequent calls with smaller batches reuse the existing
+    /// allocation. We never shrink.
+    fn ensure_capacity(
+        &self,
+        batch: usize,
+        ds: &mut DeviceState,
+    ) -> Result<(), CudaError> {
+        if batch <= ds.capacity_batch {
+            return Ok(());
+        }
+        let stream = &self.stream;
+        ds.third_dice = Some(stream.alloc_zeros::<f32>(batch * NUM_DICE_F)?);
+        ds.second_keepers = Some(stream.alloc_zeros::<f32>(batch * NUM_KEEPERS_F)?);
+        ds.second_dice = Some(stream.alloc_zeros::<f32>(batch * NUM_DICE_F)?);
+        ds.first_keepers = Some(stream.alloc_zeros::<f32>(batch * NUM_KEEPERS_F)?);
+        ds.first_dice = Some(stream.alloc_zeros::<f32>(batch * NUM_DICE_F)?);
+        ds.result = Some(stream.alloc_zeros::<f32>(batch)?);
+        ds.state_indices = Some(stream.alloc_zeros::<u32>(batch)?);
+        ds.capacity_batch = batch;
+        Ok(())
+    }
+
     /// The kernel-and-cuBLAS pipeline for a single level. Returns the EV per
-    /// state in `states`. `state_scores` must be the up-to-date DP buffer
-    /// after all higher levels have been computed.
+    /// state in `states`. `_state_scores` is unused — the device-resident
+    /// `device_state.state_scores` is kept in sync via the `scatter_results`
+    /// kernel, so we don't re-upload the host buffer every level.
+    ///
+    /// Note on multi-build reuse: the device-side `state_scores` carries
+    /// values from prior `Scores::new_with` calls. That's safe because the
+    /// per-state EV is deterministic — any state's child indices read at
+    /// the level the kernel cares about hold the same values either way.
+    /// Indices BELOW the current level may hold stale (final-EV) values,
+    /// but the kernel never reads them: `build_third_dice` only reads
+    /// state_scores at child indices, which are at strictly higher levels.
     fn compute_level_inner(
         &self,
         states: &[State],
-        state_scores: &[f32],
+        _state_scores: &[f32],
     ) -> Result<Vec<f32>, CudaError> {
         let stream = &self.stream;
         let batch = states.len();
         let batch_i32 = batch as i32;
 
-        // ------- H→D uploads ----------------------------------------------
-        // State indices: pack each State to its u32 index (matches the
-        // `From<State> for usize` encoding in lib.rs). The kernel unpacks.
-        let state_indices_h: Vec<u32> = states
-            .iter()
-            .map(|s| usize::from(*s) as u32)
-            .collect();
-        let state_indices_d = stream.clone_htod(&state_indices_h)?;
+        let mut ds = self
+            .device_state
+            .lock()
+            .expect("CudaBuildBackend mutex poisoned");
 
-        debug_assert_eq!(state_scores.len(), NUM_STATES as usize);
-        let state_scores_d = stream.clone_htod(state_scores)?;
+        // Lazy-grow the per-call buffers if this batch is the largest yet.
+        self.ensure_capacity(batch, &mut ds)?;
 
-        // ------- Device buffers for intermediates -------------------------
-        let mut third_dice: CudaSlice<f32> = stream.alloc_zeros::<f32>(batch * NUM_DICE_F)?;
-        let mut second_keepers: CudaSlice<f32> =
-            stream.alloc_zeros::<f32>(batch * NUM_KEEPERS_F)?;
-        let mut second_dice: CudaSlice<f32> = stream.alloc_zeros::<f32>(batch * NUM_DICE_F)?;
-        let mut first_keepers: CudaSlice<f32> = stream.alloc_zeros::<f32>(batch * NUM_KEEPERS_F)?;
-        let mut first_dice: CudaSlice<f32> = stream.alloc_zeros::<f32>(batch * NUM_DICE_F)?;
-        let mut result: CudaSlice<f32> = stream.alloc_zeros::<f32>(batch)?;
+        // Split-borrow the persistent buffers into disjoint mutable
+        // references. Without this we can't both read one buffer and write
+        // another in the same statement (the borrow checker treats methods
+        // on the same `MutexGuard` as overlapping borrows).
+        let DeviceState {
+            ref mut state_scores,
+            ref mut third_dice,
+            ref mut second_keepers,
+            ref mut second_dice,
+            ref mut first_keepers,
+            ref mut first_dice,
+            ref mut result,
+            ref mut state_indices,
+            ..
+        } = *ds;
+        let third_dice = third_dice.as_mut().expect("ensured");
+        let second_keepers = second_keepers.as_mut().expect("ensured");
+        let second_dice = second_dice.as_mut().expect("ensured");
+        let first_keepers = first_keepers.as_mut().expect("ensured");
+        let first_dice = first_dice.as_mut().expect("ensured");
+        let result = result.as_mut().expect("ensured");
+        let state_indices = state_indices.as_mut().expect("ensured");
+
+        // ------- H→D upload of state indices ------------------------------
+        // Pack each State to its u32 index (matches `From<State> for usize`
+        // in lib.rs). The kernel unpacks. Reuses the persistent device
+        // buffer; only the first `batch` elements are written.
+        let state_indices_h: Vec<u32> = states.iter().map(|s| usize::from(*s) as u32).collect();
+        stream.memcpy_htod(&state_indices_h, state_indices)?;
 
         // ------- Step 1: build_third_dice ---------------------------------
         // Grid: (batch, 1, 1) blocks of (256, 1, 1) threads. batch on x to
@@ -428,11 +560,11 @@ impl CudaBuildBackend {
         unsafe {
             stream
                 .launch_builder(&self.f_build_third_dice)
-                .arg(&state_indices_d)
-                .arg(&state_scores_d)
+                .arg(&*state_indices)
+                .arg(&*state_scores)
                 .arg(&self.dice_and_entry_scores)
                 .arg(&self.yahtzee_dice)
-                .arg(&mut third_dice)
+                .arg(&mut *third_dice)
                 .arg(&batch_i32)
                 .launch(cfg_entry)?;
         }
@@ -471,8 +603,8 @@ impl CudaBuildBackend {
             self.blas.gemm(
                 gemm_cfg,
                 &self.keepers_to_dice,
-                &third_dice,
-                &mut second_keepers,
+                &*third_dice,
+                &mut *second_keepers,
             )?;
         }
 
@@ -487,9 +619,9 @@ impl CudaBuildBackend {
         unsafe {
             stream
                 .launch_builder(&self.f_masked_max)
-                .arg(&second_keepers)
+                .arg(&*second_keepers)
                 .arg(&self.dice_to_keepers)
-                .arg(&mut second_dice)
+                .arg(&mut *second_dice)
                 .arg(&batch_i32)
                 .launch(cfg_reduce)?;
         }
@@ -499,8 +631,8 @@ impl CudaBuildBackend {
             self.blas.gemm(
                 gemm_cfg,
                 &self.keepers_to_dice,
-                &second_dice,
-                &mut first_keepers,
+                &*second_dice,
+                &mut *first_keepers,
             )?;
         }
 
@@ -508,9 +640,9 @@ impl CudaBuildBackend {
         unsafe {
             stream
                 .launch_builder(&self.f_masked_max)
-                .arg(&first_keepers)
+                .arg(&*first_keepers)
                 .arg(&self.dice_to_keepers)
-                .arg(&mut first_dice)
+                .arg(&mut *first_dice)
                 .arg(&batch_i32)
                 .launch(cfg_reduce)?;
         }
@@ -527,15 +659,44 @@ impl CudaBuildBackend {
         unsafe {
             stream
                 .launch_builder(&self.f_initial_roll_ev)
-                .arg(&first_dice)
+                .arg(&*first_dice)
                 .arg(&self.keepers_to_dice)
-                .arg(&mut result)
+                .arg(&mut *result)
                 .arg(&batch_i32)
                 .launch(cfg_marg)?;
         }
 
-        // ------- D→H result -----------------------------------------------
-        let host_result = stream.clone_dtoh(&result)?;
+        // ------- Step 7: scatter result into device state_scores ----------
+        // After this, the next level's `build_third_dice` can read its
+        // children's EVs directly from device memory; no host round trip.
+        const SCATTER_BLOCK: u32 = 256;
+        let scatter_blocks = ((batch as u32) + SCATTER_BLOCK - 1) / SCATTER_BLOCK;
+        let cfg_scatter = LaunchConfig {
+            grid_dim: (scatter_blocks, 1, 1),
+            block_dim: (SCATTER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&self.f_scatter_results)
+                .arg(&*state_indices)
+                .arg(&*result)
+                .arg(&mut *state_scores)
+                .arg(&batch_i32)
+                .launch(cfg_scatter)?;
+        }
+
+        // ------- D→H of just the per-state result -------------------------
+        // The trait still wants Vec<f32>; the host-side `Scores::set_scores`
+        // also writes these into its own state_scores Array1. (That host-
+        // side write is now redundant work for the CUDA path, but keeping
+        // the trait shape lets `Scores` remain backend-agnostic and the
+        // CPU path keep its straight-line read of `state_scores: &[f32]`.)
+        //
+        // The persistent `result` buffer may be larger than `batch`; copy
+        // only the first `batch` floats out.
+        let mut host_result = vec![0.0_f32; batch];
+        stream.memcpy_dtoh(&result.slice(0..batch), &mut host_result)?;
         stream.synchronize()?;
         Ok(host_result)
     }
