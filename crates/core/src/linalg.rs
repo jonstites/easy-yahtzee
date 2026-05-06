@@ -99,11 +99,22 @@ impl LinalgBackend for NdarrayBackend {
 /// the existing per-state pipeline; it's morally identical to the in-line
 /// loop the DP previously used.
 ///
-/// A future GPU implementation lives behind the `cuda` Cargo feature and
-/// owns the full batched pipeline internally (custom kernels +
-/// cuBLAS sgemm), so it can amortize kernel-launch overhead across all
-/// states at a level instead of paying it per state.
+/// The CUDA implementation lives behind the `cuda` Cargo feature and owns
+/// the full batched pipeline internally (custom kernels + cuBLAS sgemm),
+/// so it can amortize kernel-launch overhead across all states at a level
+/// instead of paying it per state.
+///
+/// `compute_level` is fallible because GPU backends can fail mid-build
+/// (out-of-memory, driver disconnect, kernel launch error, etc.). The
+/// associated [`Self::Error`] type is `std::convert::Infallible` for CPU
+/// backends and a richer error enum for GPU backends.
 pub trait BuildBackend: Send + Sync {
+    /// Errors a `compute_level` call can raise. CPU backends typically use
+    /// `std::convert::Infallible` (which lets callers `.unwrap()` knowing
+    /// the call cannot fail at runtime); GPU backends use a richer enum
+    /// surfacing driver / cuBLAS / kernel errors.
+    type Error: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static;
+
     /// Compute the overall EV of every state in `states`. The returned
     /// vector is in the same order as the input. `state_scores` is the
     /// (read-only) DP buffer holding EVs for already-computed levels —
@@ -111,7 +122,11 @@ pub trait BuildBackend: Send + Sync {
     /// of `state_scores` they read are at strictly higher levels (more
     /// entries filled), so the contents at the level-being-computed don't
     /// matter.
-    fn compute_level(&self, states: &[State], state_scores: &[f32]) -> Vec<f32>;
+    fn compute_level(
+        &self,
+        states: &[State],
+        state_scores: &[f32],
+    ) -> Result<Vec<f32>, Self::Error>;
 }
 
 /// Default [`BuildBackend`] impl: rayon `par_iter` over the per-state EV
@@ -121,12 +136,22 @@ pub trait BuildBackend: Send + Sync {
 pub struct CpuBuildBackend;
 
 impl BuildBackend for CpuBuildBackend {
-    fn compute_level(&self, states: &[State], state_scores: &[f32]) -> Vec<f32> {
+    // Pure-CPU rayon work: no I/O, no allocation that can fail in any way
+    // we'd want to recover from. `Infallible` lets `Scores::new()` (which
+    // calls `Scores::new_with(&CpuBuildBackend)`) stay infallible without
+    // any `Result`-flavored noise at the public API.
+    type Error = std::convert::Infallible;
+
+    fn compute_level(
+        &self,
+        states: &[State],
+        state_scores: &[f32],
+    ) -> Result<Vec<f32>, Self::Error> {
         let backend = NdarrayBackend;
-        states
+        Ok(states
             .par_iter()
             .map(|state| state_value_with(*state, state_scores, &backend))
-            .collect()
+            .collect())
     }
 }
 

@@ -17,7 +17,7 @@ fn main() {
     println!("CUDA context + table upload: {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
     let t1 = Instant::now();
-    let scores = Scores::new_with(&backend);
+    let scores = Scores::new_with(&backend).expect("CUDA build failed");
     let elapsed = t1.elapsed();
     let ev = scores.state_value(State::default());
     println!(

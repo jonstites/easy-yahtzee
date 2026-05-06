@@ -130,7 +130,8 @@ fn bench_build_backends(c: &mut Criterion) {
     let cpu = CpuBuildBackend;
     group.bench_function("cpu", |b| {
         b.iter(|| {
-            let s = Scores::new_with(black_box(&cpu));
+            // CpuBuildBackend's Error is Infallible; unwrap is statically safe.
+            let s = Scores::new_with(black_box(&cpu)).unwrap();
             black_box(s.state_value(State::default()))
         })
     });
@@ -148,7 +149,7 @@ fn bench_build_backends(c: &mut Criterion) {
         let cuda = &*CUDA_BACKEND;
         group.bench_function("cuda", |b| {
             b.iter(|| {
-                let s = Scores::new_with(black_box(cuda));
+                let s = Scores::new_with(black_box(cuda)).expect("CUDA build failed");
                 black_box(s.state_value(State::default()))
             })
         });

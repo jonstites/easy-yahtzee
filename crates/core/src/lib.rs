@@ -461,15 +461,24 @@ impl Scores {
     // startup; only the `build` subcommand and tests instantiate fresh.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Scores {
-        Scores::new_with(&CpuBuildBackend)
+        // CpuBuildBackend's Error type is `Infallible`, so the unwrap is
+        // statically guaranteed not to panic. We can't write a literal
+        // `match {}` because `Infallible` has no inhabitants and the match
+        // would still need to satisfy the return type.
+        match Scores::new_with(&CpuBuildBackend) {
+            Ok(s) => s,
+            Err(e) => match e {},
+        }
     }
 
     /// Build a [`Scores`] table using a caller-provided [`BuildBackend`].
     ///
     /// `Scores::new()` calls this with [`CpuBuildBackend`] (rayon over the
-    /// per-state pipeline). To use the GPU, build with the `cuda` feature
-    /// and pass `&linalg::cuda::CudaBuildBackend::new()?` here.
-    pub fn new_with<B: BuildBackend>(backend: &B) -> Scores {
+    /// per-state pipeline) and unwraps the `Infallible` result. GPU
+    /// backends can fail (driver errors, out-of-memory, kernel launch
+    /// failure) — call this directly with `&CudaBuildBackend` and handle
+    /// the error.
+    pub fn new_with<B: BuildBackend>(backend: &B) -> Result<Scores, B::Error> {
         let state_scores = Array1::zeros(NUM_STATES as usize);
         let valid_states = vec![0_u64; VALID_STATES_WORDS].into_boxed_slice();
         let mut scores = Scores {
@@ -477,11 +486,11 @@ impl Scores {
             valid_states,
         };
         scores.set_valid_states();
-        scores.set_scores(backend);
-        scores
+        scores.set_scores(backend)?;
+        Ok(scores)
     }
 
-    fn set_scores<B: BuildBackend>(&mut self, backend: &B) {
+    fn set_scores<B: BuildBackend>(&mut self, backend: &B) -> Result<(), B::Error> {
         // Bottom-up by level (most filled entries first) so each level only
         // reads strictly-higher-level state scores. Within a level, all
         // states are independent — that's the parallelism the BuildBackend
@@ -496,7 +505,7 @@ impl Scores {
             }
 
             let t_compute = std::time::Instant::now();
-            let evs = backend.compute_level(&states, self.state_scores_slice());
+            let evs = backend.compute_level(&states, self.state_scores_slice())?;
             let compute_ms = t_compute.elapsed().as_secs_f64() * 1000.0;
 
             // Write this level's EVs back into the DP buffer. Subsequent
@@ -514,6 +523,7 @@ impl Scores {
                 );
             }
         }
+        Ok(())
     }
 
     /// All valid states at exactly the given DP level (`level` = number of

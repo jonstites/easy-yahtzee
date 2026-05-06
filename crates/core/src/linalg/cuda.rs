@@ -37,46 +37,48 @@ use cudarc::nvrtc::compile_ptx;
 
 use crate::{BuildBackend, State, NUM_STATES};
 
-/// Errors that can prevent the CUDA backend from initializing or running.
+/// Errors raised by the CUDA backend during construction (`new`) or per-level
+/// compute (`compute_level`).
 #[derive(Debug)]
-pub enum CudaInitError {
-    /// Failed to load libcuda.so / libnvrtc.so / libcublas.so, or the GPU
-    /// is unreachable. The string is the cudarc driver-API error message.
+pub enum CudaError {
+    /// Failed to load libcuda.so / libnvrtc.so / libcublas.so, the GPU is
+    /// unreachable, an allocation failed, a kernel launch returned a CUDA
+    /// error, etc. The string is the cudarc driver-API error message.
     Driver(String),
     /// NVRTC failed to compile a kernel. Almost always a code bug in this
     /// crate's kernel sources rather than something the user can fix.
     Compile(String),
-    /// cuBLAS initialization failed.
+    /// cuBLAS initialization or sgemm call failed.
     Cublas(String),
 }
 
-impl std::fmt::Display for CudaInitError {
+impl std::fmt::Display for CudaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CudaInitError::Driver(msg) => write!(f, "CUDA driver error: {msg}"),
-            CudaInitError::Compile(msg) => write!(f, "NVRTC compile error: {msg}"),
-            CudaInitError::Cublas(msg) => write!(f, "cuBLAS error: {msg}"),
+            CudaError::Driver(msg) => write!(f, "CUDA driver error: {msg}"),
+            CudaError::Compile(msg) => write!(f, "NVRTC compile error: {msg}"),
+            CudaError::Cublas(msg) => write!(f, "cuBLAS error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for CudaInitError {}
+impl std::error::Error for CudaError {}
 
-impl From<cudarc::driver::DriverError> for CudaInitError {
+impl From<cudarc::driver::DriverError> for CudaError {
     fn from(err: cudarc::driver::DriverError) -> Self {
-        CudaInitError::Driver(format!("{err:?}"))
+        CudaError::Driver(format!("{err:?}"))
     }
 }
 
-impl From<cudarc::nvrtc::CompileError> for CudaInitError {
+impl From<cudarc::nvrtc::CompileError> for CudaError {
     fn from(err: cudarc::nvrtc::CompileError) -> Self {
-        CudaInitError::Compile(format!("{err:?}"))
+        CudaError::Compile(format!("{err:?}"))
     }
 }
 
-impl From<cudarc::cublas::result::CublasError> for CudaInitError {
+impl From<cudarc::cublas::result::CublasError> for CudaError {
     fn from(err: cudarc::cublas::result::CublasError) -> Self {
-        CudaInitError::Cublas(format!("{err:?}"))
+        CudaError::Cublas(format!("{err:?}"))
     }
 }
 
@@ -327,7 +329,7 @@ impl CudaBuildBackend {
     /// Initialize the CUDA backend on device 0: load the driver, allocate a
     /// stream, compile and load the custom kernels, and upload the static
     /// tables.
-    pub fn new() -> Result<Self, CudaInitError> {
+    pub fn new() -> Result<Self, CudaError> {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone())?;
@@ -388,7 +390,7 @@ impl CudaBuildBackend {
         &self,
         states: &[State],
         state_scores: &[f32],
-    ) -> Result<Vec<f32>, CudaInitError> {
+    ) -> Result<Vec<f32>, CudaError> {
         let stream = &self.stream;
         let batch = states.len();
         let batch_i32 = batch as i32;
@@ -540,16 +542,19 @@ impl CudaBuildBackend {
 }
 
 impl BuildBackend for CudaBuildBackend {
-    fn compute_level(&self, states: &[State], state_scores: &[f32]) -> Vec<f32> {
+    type Error = CudaError;
+
+    fn compute_level(
+        &self,
+        states: &[State],
+        state_scores: &[f32],
+    ) -> Result<Vec<f32>, Self::Error> {
         if states.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        // BuildBackend is infallible from the caller's perspective; CUDA
-        // failure mid-build is fatal (the DP table would be wrong) so we
-        // panic with the underlying error rather than silently returning
-        // bad data. There's no recovery path: the host-side `Scores::new_with`
-        // doesn't have a way to retry on a different backend.
+        // Errors propagate to `Scores::new_with`'s caller; mid-build CUDA
+        // failure leaves the partial DP buffer in an inconsistent state but
+        // the `Scores` value is dropped so it's never observed.
         self.compute_level_inner(states, state_scores)
-            .expect("CUDA compute_level failed")
     }
 }
