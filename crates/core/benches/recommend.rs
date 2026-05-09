@@ -177,6 +177,14 @@ fn bench_build_backends(c: &mut Criterion) {
                 black_box(s.state_value(State::default()))
             })
         });
+
+        let simd_batch = yahtzee_core::linalg::SimdBatchBuildBackend;
+        group.bench_function("simd_batch", |b| {
+            b.iter(|| {
+                let s = Scores::new_with(black_box(&simd_batch)).unwrap();
+                black_box(s.state_value(State::default()))
+            })
+        });
     }
 
     #[cfg(feature = "cuda")]
@@ -198,6 +206,93 @@ fn bench_build_backends(c: &mut Criterion) {
     group.finish();
 }
 
+/// Phase-level micro-benches for the `SimdBatchBuildBackend` pipeline. Each
+/// 8-state batch in `compute_lanes` is four phases: the entry-actions fuse
+/// (steps 1+2), two GEMVs (steps 3 & 5), two masked-maxes (steps 4 & 6),
+/// and a final dot (step 7). This group times each in isolation against
+/// realistic pre-filled scratch, so we can attribute end-to-end CPU build
+/// cost to specific phases — and measure the win when sparsity / fusion
+/// optimizations land. Reproducer:
+///
+///     cargo bench -p yahtzee-core --features simd -- "simd_batch_phases"
+///
+/// See `crates/core/PERFORMANCE.md` for current numbers.
+#[cfg(feature = "simd")]
+fn bench_simd_batch_phases(c: &mut Criterion) {
+    use wide::f32x8;
+    use yahtzee_core::linalg::simd_batch::{
+        phase_entry_actions_fuse, phase_final_dot, phase_gemv, phase_masked_max,
+    };
+
+    const N_DICE: usize = 252;
+    const N_KEEPERS: usize = 462;
+
+    let scores = &*SHARED_SCORES;
+    let state_scores = scores.state_scores_slice();
+
+    // Eight copies of the default state. Default-state has 13 valid actions,
+    // so this is a worst-case bound for `phase_entry_actions_fuse` (most
+    // action-loop iterations do real work). The other three phases are
+    // state-independent — they only see the f32x8 scratch — so the choice of
+    // state doesn't affect their timings.
+    let states: [State; 8] = [State::default(); 8];
+
+    // Pre-fill scratch by running the pipeline once. Subsequent bench
+    // iterations reuse these buffers as realistic inputs (post-step-1+2 for
+    // gemv, post-step-3 for masked_max, post-step-6 for final_dot).
+    let mut third_dice = vec![f32x8::splat(0.0); N_DICE];
+    let mut second_keepers = vec![f32x8::splat(0.0); N_KEEPERS];
+    let mut second_dice = vec![f32x8::splat(0.0); N_DICE];
+    let mut first_keepers = vec![f32x8::splat(0.0); N_KEEPERS];
+    let mut first_dice = vec![f32x8::splat(0.0); N_DICE];
+    phase_entry_actions_fuse(&states, state_scores, &mut third_dice);
+    phase_gemv(&mut second_keepers, &third_dice);
+    phase_masked_max(&mut second_dice, &second_keepers);
+    phase_gemv(&mut first_keepers, &second_dice);
+    phase_masked_max(&mut first_dice, &first_keepers);
+
+    let mut group = c.benchmark_group("simd_batch_phases");
+
+    group.bench_function("entry_actions_fuse", |b| {
+        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        b.iter(|| {
+            phase_entry_actions_fuse(
+                black_box(&states),
+                black_box(state_scores),
+                black_box(&mut out),
+            );
+        })
+    });
+
+    group.bench_function("gemv", |b| {
+        let mut out = vec![f32x8::splat(0.0); N_KEEPERS];
+        b.iter(|| {
+            phase_gemv(black_box(&mut out), black_box(&third_dice));
+        })
+    });
+
+    group.bench_function("masked_max", |b| {
+        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        b.iter(|| {
+            phase_masked_max(black_box(&mut out), black_box(&second_keepers));
+        })
+    });
+
+    group.bench_function("final_dot", |b| {
+        b.iter(|| {
+            black_box(phase_final_dot(black_box(&first_dice)));
+        })
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "simd"))]
+fn bench_simd_batch_phases(_c: &mut Criterion) {
+    // No-op when simd is not enabled. The phase functions live in the simd
+    // module; without the feature, there's nothing to bench in isolation.
+}
+
 criterion_group!(
     benches,
     bench_state_values,
@@ -205,5 +300,6 @@ criterion_group!(
     bench_with_turn_ev,
     bench_backends,
     bench_build_backends,
+    bench_simd_batch_phases,
 );
 criterion_main!(benches);

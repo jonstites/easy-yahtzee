@@ -85,24 +85,11 @@ There are **two** swappable abstractions, at different granularities:
 | `SimdBatchBuildBackend` | `--features simd` | Outer-loop SIMD: vectorizes the per-state pipeline *across* 8 states with `wide::f32x8`, where each lane is a different state and the matrices/masks are broadcast scalar across lanes. Lives in `crates/core/src/linalg/simd_batch.rs`. Pairs `par_chunks(8)` for thread-level parallelism with thread-local scratch via `map_init`; tail (<8 states) falls back to the per-state `SimdBackend`. ~1.36× over `CpuBuildBackendWith(SimdBackend)` end-to-end on the validated path; ~2.7× faster on the heaviest level (L=7) before BFS / write / low-level dilution. `Error = Infallible`. |
 | `CudaBuildBackend` | `--features cuda` | Full GPU pipeline. Lives in `crates/core/src/linalg/cuda.rs`. Uses `cudarc` (driver API + cuBLAS + NVRTC), dynamic-loaded — no `nvcc` or CUDA headers needed at build time, only `libcuda` / `libcublas` / `libnvrtc` `.so`s on the runtime host. Three custom NVRTC kernels (`build_third_dice`, `masked_max`, `initial_roll_ev`) plus two cuBLAS sgemm calls per level for the two `keepers_from_dice` GEMVs. State_scores is allocated **once** on device and updated in place via a `scatter_results` kernel — no per-level H→D upload of the host buffer. Per-level intermediates are persistent and lazily grown to the largest batch seen. `Error = CudaError`. |
 
-Performance picture (Ryzen 9 9800X3D + RTX 5070 Ti, criterion `Scores::new_with`, 16 threads):
-
-| Backend | Build time | vs naive | Notes |
-|---|---|---|---|
-| `naive` | 8.69 s | 1.00× | The honest baseline. |
-| `ndarray` | 5.73 s | 1.52× | matrixmultiply earns ~1.5× at our problem size. |
-| `faer` | 4.72 s | 1.84× | Quietly the best CPU GEMV at 252×462. |
-| `simd` | 3.11 s | 2.79× | Per-state intra-state SIMD on the masked-max. |
-| `simd_batch` | 2.30 s | 3.78× | **Best CPU.** Outer-loop SIMD across 8 states. What `Scores::new_with(&SimdBatchBuildBackend)` and the CLI default use. |
-| `cuda` | 944 ms | 9.20× | Per-level batched on GPU; mostly architectural win. |
-
-Per-state (`state_value/backends`, default state, single thread): naive 162 µs → ndarray 116 µs → faer 99 µs → simd 53 µs. (No per-state entry for `simd_batch` — it's a `BuildBackend`, not a `LinalgBackend`; vectorizes across states, so single-state-per-call is meaningless.) The CPU optimization machinery spans **3.78× over naive**; the GPU adds another 2.4× on top of that for ~9.2× end-to-end vs naive.
-
-For external comparison: the `timpalpant/yahtzee` Go reference takes ~45 s for the same table on the same hardware (16 threads). Our naive Rust is 5.2× faster than that, default Rust 7.9×, simd 14.6×, CUDA 48×. (Note: their start-state EV converges to 254.49, ours to 254.5896 — likely a small game-rule difference, possibly their `Max score is: 1500` cap on accumulated yahtzee bonuses; not investigated further.)
+**Performance numbers, per-level breakdowns, per-stage micro-benches, and the structural-sparsity facts behind upcoming optimizations live in [`crates/core/PERFORMANCE.md`](crates/core/PERFORMANCE.md).** That doc is the canonical home — when build wall-clock or backend ordering changes, update it, not this file. As a one-line summary at time of writing: on Ryzen 9 9800X3D + RTX 5070 Ti (16 threads), `Scores::new_with` is **8.82 s naive → 2.29 s simd_batch → 950 ms cuda** (3.85× CPU and 9.28× GPU over the naive baseline).
 
 Helpful entry points:
 - **Examples**: `crates/core/examples/time_build.rs` (default), `time_build_naive.rs`, `cuda_smoke.rs`.
-- **Benches**: `crates/core/benches/recommend.rs` — see the `bench_backends` (per-state) and `bench_build_backends` (full builds) groups.
+- **Benches**: `crates/core/benches/recommend.rs` — see the `bench_backends` (per-state), `bench_build_backends` (full builds), and `bench_simd_batch_phases` (per-stage micro-benches that time each of `entry_actions_fuse` / `gemv` / `masked_max` / `final_dot` in isolation against pre-filled scratch) groups. The phase fns are exposed `#[doc(hidden)] pub` from `simd_batch.rs` for that purpose.
 - **Cross-check tests**: `test_naive_backend_matches` asserts naive and ndarray agree on the default-state EV within 1e-3 (single scalar tripwire). `proptests::linalg_backends_agree_on_action_ranking` is the broader cousin: for `arb_state() × dice_idx`, every enabled `LinalgBackend` (naive, ndarray, optionally faer/simd) must produce the same overall EV *and* the same EV at each rank in the sorted entries / first_keepers / second_keepers lists, within 5e-3. This catches structural backend bugs that nudge EVs by ~1e-2 on niche states — well below the default-state test's noise floor. `test_unvalidated_matches_validated` (gated `#[ignore]`) compares `Scores::new_with` against `Scores::new_with_unvalidated` across every reachable state — cross-checks the BFS soundness as a side effect. `test_simd_batch_matches` (gated `#[ignore]`, `--features simd`) compares `SimdBatchBuildBackend` against `CpuBuildBackend` across every reachable state, catching structural bugs in the outer-loop pipeline that the per-state `LinalgBackend` proptest can't see. Both ignored tests run with `cargo test -p yahtzee-core --release --features simd -- --ignored`.
 
 ### Scoring helpers

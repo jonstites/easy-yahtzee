@@ -105,14 +105,59 @@ impl BuildBackend for SimdBatchBuildBackend {
 /// `entry_actions` lookup) is fused with step 2 (max-over-actions reduce):
 /// we never materialize the 13 × 252 × 8 intermediate, just stream into
 /// `third_dice` directly. Saves 105 KiB of working set per chunk.
+///
+/// The four phases are factored into [`phase_entry_actions_fuse`],
+/// [`phase_gemv`], [`phase_masked_max`], and [`phase_final_dot`] so the
+/// criterion `simd_batch_phases` group can time them in isolation. Inlining
+/// is preserved at the function-call boundary via `#[inline]`, so the
+/// production path is bit-identical to the previous monolithic body.
 fn compute_lanes(
     states: &[State; LANES],
     state_scores: &[f32],
     scratch: &mut Scratch,
 ) -> [f32; LANES] {
-    // Steps 1+2 fused: third_dice[d] = max over action of entry_actions[action, d]
-    // where entry_actions[action, d] = if valid_action then score + V(child) else 0.
-    // Per-state work (is_valid_action, score_and_child, state_scores read) is scalar.
+    // Steps 1+2 fused into third_dice.
+    phase_entry_actions_fuse(states, state_scores, &mut scratch.third_dice);
+
+    // Step 3: second_keepers[k] = sum over d of M[k, d] * third_dice[d].
+    // M = KEEPERS_TO_DICE_PROBABILITIES, shape (462, 252).
+    phase_gemv(&mut scratch.second_keepers, &scratch.third_dice);
+
+    // Step 4: second_dice[d] = max over k of mask[d, k] * second_keepers[k].
+    // Multiplication trick for the masked-max: 0-mask zeros the contribution,
+    // and second_keepers is non-negative (sum of probabilities × non-negative
+    // EVs), so 0 is the correct floor of the max.
+    phase_masked_max(&mut scratch.second_dice, &scratch.second_keepers);
+
+    // Steps 5 & 6: same shape as 3 & 4 but starting from second_dice.
+    phase_gemv(&mut scratch.first_keepers, &scratch.second_dice);
+    phase_masked_max(&mut scratch.first_dice, &scratch.first_keepers);
+
+    // Step 7: ev = sum over d of initial_dist[d] * first_dice[d].
+    phase_final_dot(&scratch.first_dice)
+}
+
+/// Steps 1+2 of the per-level pipeline: fill `out_third_dice[d]` with the
+/// max over actions of `entry_score(action, d) + state_scores[child(d, action)]`,
+/// where each `f32x8` lane corresponds to one of the 8 input states.
+///
+/// Per-state work (`is_valid_action`, `score_and_child`, `state_scores[child_idx]`)
+/// is scalar — the lane axis is purely outer-loop SIMD over states. Invalid
+/// actions contribute 0.0 to their lane, matching `entry_actions_array`'s
+/// semantics; the max reduction picks them up only if every action is
+/// invalid (terminal state), which can't happen in `compute_level` since
+/// `set_scores` never hits level 13.
+///
+/// Exposed as `#[doc(hidden)] pub` so the criterion `simd_batch_phases`
+/// group can call it directly. Not part of the stable API.
+#[doc(hidden)]
+#[inline]
+pub fn phase_entry_actions_fuse(
+    states: &[State; LANES],
+    state_scores: &[f32],
+    out_third_dice: &mut [f32x8],
+) {
+    debug_assert_eq!(out_third_dice.len(), N_DICE);
     for d in 0..N_DICE {
         let mut acc = f32x8::splat(0.0);
         for action_idx in 0..N_ACTIONS {
@@ -125,58 +170,20 @@ fn compute_lanes(
                     let child_idx: usize = child.into();
                     lanes[s] = score + state_scores[child_idx];
                 }
-                // Else: lanes[s] stays 0.0, matching `entry_actions_array`'s
-                // semantics for invalid actions. The max reduction will pick
-                // it up only if every action is invalid (terminal state),
-                // which can't happen in compute_level (set_scores never hits
-                // level 13).
             }
             acc = acc.fast_max(f32x8::from(lanes));
         }
-        scratch.third_dice[d] = acc;
+        out_third_dice[d] = acc;
     }
-
-    // Step 3: second_keepers[k] = sum over d of M[k, d] * third_dice[d].
-    // M = KEEPERS_TO_DICE_PROBABILITIES, shape (462, 252).
-    gemv(
-        &mut scratch.second_keepers,
-        &scratch.third_dice,
-    );
-
-    // Step 4: second_dice[d] = max over k of mask[d, k] * second_keepers[k].
-    // Multiplication trick for the masked-max: 0-mask zeros the contribution,
-    // and second_keepers is non-negative (sum of probabilities × non-negative
-    // EVs), so 0 is the correct floor of the max.
-    masked_max(
-        &mut scratch.second_dice,
-        &scratch.second_keepers,
-    );
-
-    // Steps 5 & 6: same shape as 3 & 4 but starting from second_dice.
-    gemv(
-        &mut scratch.first_keepers,
-        &scratch.second_dice,
-    );
-    masked_max(
-        &mut scratch.first_dice,
-        &scratch.first_keepers,
-    );
-
-    // Step 7: ev = sum over d of initial_dist[d] * first_dice[d].
-    // initial_dist = row 0 of KEEPERS_TO_DICE_PROBABILITIES (the
-    // "kept-nothing → roll 5 fresh dice" distribution).
-    let m = &*KEEPERS_TO_DICE_PROBABILITIES;
-    let mut ev = f32x8::splat(0.0);
-    for d in 0..N_DICE {
-        ev += f32x8::splat(m[(0, d)]) * scratch.first_dice[d];
-    }
-    ev.into()
 }
 
 /// Batched GEMV: `out[k] = sum_d M[k, d] * input[d]`, with `M =
 /// KEEPERS_TO_DICE_PROBABILITIES` and the lane dimension being states.
+///
+/// Exposed as `#[doc(hidden)] pub` for the criterion phase benches.
+#[doc(hidden)]
 #[inline]
-fn gemv(out: &mut [f32x8], input: &[f32x8]) {
+pub fn phase_gemv(out: &mut [f32x8], input: &[f32x8]) {
     debug_assert_eq!(out.len(), N_KEEPERS);
     debug_assert_eq!(input.len(), N_DICE);
     let m = &*KEEPERS_TO_DICE_PROBABILITIES;
@@ -192,8 +199,11 @@ fn gemv(out: &mut [f32x8], input: &[f32x8]) {
 /// Batched masked-max: `out[d] = max over k where mask[d, k] > 0 of input[k]`.
 /// Uses the multiplication trick (0-mask contributes 0, which is the correct
 /// floor for our non-negative EVs).
+///
+/// Exposed as `#[doc(hidden)] pub` for the criterion phase benches.
+#[doc(hidden)]
 #[inline]
-fn masked_max(out: &mut [f32x8], input: &[f32x8]) {
+pub fn phase_masked_max(out: &mut [f32x8], input: &[f32x8]) {
     debug_assert_eq!(out.len(), N_DICE);
     debug_assert_eq!(input.len(), N_KEEPERS);
     let mask = &*DICE_TO_ALLOWED_KEEPERS;
@@ -204,4 +214,21 @@ fn masked_max(out: &mut [f32x8], input: &[f32x8]) {
         }
         out[d] = acc;
     }
+}
+
+/// Step 7: `ev[s] = sum over d of initial_dist[d] * first_dice[d][s]` for
+/// each lane `s`. `initial_dist` is row 0 of `KEEPERS_TO_DICE_PROBABILITIES`
+/// (the "kept-nothing → roll 5 fresh dice" distribution).
+///
+/// Exposed as `#[doc(hidden)] pub` for the criterion phase benches.
+#[doc(hidden)]
+#[inline]
+pub fn phase_final_dot(first_dice: &[f32x8]) -> [f32; LANES] {
+    debug_assert_eq!(first_dice.len(), N_DICE);
+    let m = &*KEEPERS_TO_DICE_PROBABILITIES;
+    let mut ev = f32x8::splat(0.0);
+    for d in 0..N_DICE {
+        ev += f32x8::splat(m[(0, d)]) * first_dice[d];
+    }
+    ev.into()
 }
