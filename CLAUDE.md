@@ -48,7 +48,9 @@ A `State` is `(entries: EntryAction bitflags, yahtzee_bonus_eligible: bool, uppe
 
 `Scores::new_with<B: BuildBackend>(backend: &B) -> Result<Self, B::Error>` is the generic constructor; `Scores::new()` calls it with `&CpuBuildBackend` and unwraps the `Infallible` result. Use `new_with` directly to opt into a non-default backend (e.g. `&CudaBuildBackend::new()?` under the `cuda` feature).
 
-`Scores::new_with_unvalidated<B>` is the sibling that skips the BFS-reachability filter in the per-level batch enumeration: every structurally possible state at each level enters the DP, including the ~512k that no real game reaches. ~2× build wall-clock vs `new_with`. Used (a) as a soundness oracle for the BFS — `test_unvalidated_matches_validated` (gated `#[ignore]`) cross-checks that the validated and unvalidated tables agree on every reachable state's EV, and (b) as the substrate for any future fast path that wants regular per-level batch shapes (outer-loop SIMD across states, level-specialized GPU kernels). Today the validated path is what `Scores::new` uses; the unvalidated one is opt-in.
+`Scores::new_with_unvalidated<B>` is the sibling that skips the BFS-reachability filter in the per-level batch enumeration: every structurally possible state at each level enters the DP, including the ~512k that no real game reaches. ~1.9× build wall-clock vs `new_with`, uniformly across all backends (naive, ndarray, faer, simd, simd_batch). The original hypothesis — that the regular `C(13,L) × 128` batch shape would unlock outer-loop SIMD wins beyond what semi-regular validated batches give — turned out empirically false: `simd_batch` already extracts most of the outer-loop win on validated batches (peak L=7 = 126k states is plenty for `par_chunks(8)` saturation), and the unvalidated path is ~1.88× slower than validated for `simd_batch` too. So validation pays its way and stays the default.
+
+The unvalidated constructor is kept around for (a) BFS soundness — `test_unvalidated_matches_validated` (gated `#[ignore]`) cross-checks that the validated and unvalidated tables agree on every reachable state's EV (today: 0 mismatches across 536,448 reachable states), and (b) future experiments. The first round (outer-loop SIMD) didn't recover the 1.88× cost, but other directions could — different state encodings that change reachability density, alternate DP orderings, GPU kernels that benefit from the regular `C(13,L)×128` shape in ways the CPU SIMD path didn't. The path is opt-in and adds no cost to the default builds, so it stays until either a follow-on experiment lands a win or we conclude the design space has been exhausted.
 
 `Scores::values(state)` returns an `ExpectedValues` by walking the three-roll decision tree in reverse, dispatching the linalg ops through a [`LinalgBackend`](#linalg-and-build-backends):
 
@@ -80,6 +82,7 @@ There are **two** swappable abstractions, at different granularities:
 |---|---|---|
 | `CpuBuildBackend` | (always-on) | Convenience unit-struct: rayon `par_iter` over the per-state walk using `NdarrayBackend`. What `Scores::new()` uses. `Error = Infallible`. |
 | `CpuBuildBackendWith<L: LinalgBackend>(pub L)` | (always-on) | Generic over the per-state linalg, so benches and external callers can drive a full table build through any `LinalgBackend` (e.g. `CpuBuildBackendWith(NaiveBackend)`, `CpuBuildBackendWith(SimdBackend)`). `Error = Infallible`. |
+| `SimdBatchBuildBackend` | `--features simd` | Outer-loop SIMD: vectorizes the per-state pipeline *across* 8 states with `wide::f32x8`, where each lane is a different state and the matrices/masks are broadcast scalar across lanes. Lives in `crates/core/src/linalg/simd_batch.rs`. Pairs `par_chunks(8)` for thread-level parallelism with thread-local scratch via `map_init`; tail (<8 states) falls back to the per-state `SimdBackend`. ~1.36× over `CpuBuildBackendWith(SimdBackend)` end-to-end on the validated path; ~2.7× faster on the heaviest level (L=7) before BFS / write / low-level dilution. `Error = Infallible`. |
 | `CudaBuildBackend` | `--features cuda` | Full GPU pipeline. Lives in `crates/core/src/linalg/cuda.rs`. Uses `cudarc` (driver API + cuBLAS + NVRTC), dynamic-loaded — no `nvcc` or CUDA headers needed at build time, only `libcuda` / `libcublas` / `libnvrtc` `.so`s on the runtime host. Three custom NVRTC kernels (`build_third_dice`, `masked_max`, `initial_roll_ev`) plus two cuBLAS sgemm calls per level for the two `keepers_from_dice` GEMVs. State_scores is allocated **once** on device and updated in place via a `scatter_results` kernel — no per-level H→D upload of the host buffer. Per-level intermediates are persistent and lazily grown to the largest batch seen. `Error = CudaError`. |
 
 Performance picture (Ryzen 9 9800X3D + RTX 5070 Ti, criterion `Scores::new_with`, 16 threads):
@@ -87,19 +90,20 @@ Performance picture (Ryzen 9 9800X3D + RTX 5070 Ti, criterion `Scores::new_with`
 | Backend | Build time | vs naive | Notes |
 |---|---|---|---|
 | `naive` | 8.69 s | 1.00× | The honest baseline. |
-| `ndarray` | 5.73 s | 1.52× | Default. matrixmultiply earns ~1.5× at our problem size. |
+| `ndarray` | 5.73 s | 1.52× | matrixmultiply earns ~1.5× at our problem size. |
 | `faer` | 4.72 s | 1.84× | Quietly the best CPU GEMV at 252×462. |
-| `simd` | 3.11 s | 2.79× | Best CPU. Masked-max is the bottleneck SIMD attacks. |
-| `cuda` | 944 ms | 9.20× | Per-level batched on GPU; mostly architectural win, not "GPU linalg is 9× better." |
+| `simd` | 3.11 s | 2.79× | Per-state intra-state SIMD on the masked-max. |
+| `simd_batch` | 2.30 s | 3.78× | **Best CPU.** Outer-loop SIMD across 8 states. What `Scores::new_with(&SimdBatchBuildBackend)` and the CLI default use. |
+| `cuda` | 944 ms | 9.20× | Per-level batched on GPU; mostly architectural win. |
 
-Per-state (`state_value/backends`, default state, single thread): naive 162 µs → ndarray 116 µs → faer 99 µs → simd 53 µs. The CPU optimization machinery spans **2.79× over naive**; the GPU adds another 3.3× on top of that for ~9.2× end-to-end vs naive.
+Per-state (`state_value/backends`, default state, single thread): naive 162 µs → ndarray 116 µs → faer 99 µs → simd 53 µs. (No per-state entry for `simd_batch` — it's a `BuildBackend`, not a `LinalgBackend`; vectorizes across states, so single-state-per-call is meaningless.) The CPU optimization machinery spans **3.78× over naive**; the GPU adds another 2.4× on top of that for ~9.2× end-to-end vs naive.
 
 For external comparison: the `timpalpant/yahtzee` Go reference takes ~45 s for the same table on the same hardware (16 threads). Our naive Rust is 5.2× faster than that, default Rust 7.9×, simd 14.6×, CUDA 48×. (Note: their start-state EV converges to 254.49, ours to 254.5896 — likely a small game-rule difference, possibly their `Max score is: 1500` cap on accumulated yahtzee bonuses; not investigated further.)
 
 Helpful entry points:
 - **Examples**: `crates/core/examples/time_build.rs` (default), `time_build_naive.rs`, `cuda_smoke.rs`.
 - **Benches**: `crates/core/benches/recommend.rs` — see the `bench_backends` (per-state) and `bench_build_backends` (full builds) groups.
-- **Cross-check tests**: `test_naive_backend_matches` asserts naive and ndarray agree on the default-state EV within 1e-3 (single scalar tripwire). `proptests::linalg_backends_agree_on_action_ranking` is the broader cousin: for `arb_state() × dice_idx`, every enabled `LinalgBackend` (naive, ndarray, optionally faer/simd) must produce the same overall EV *and* the same EV at each rank in the sorted entries / first_keepers / second_keepers lists, within 5e-3. This catches structural backend bugs that nudge EVs by ~1e-2 on niche states — well below the default-state test's noise floor. `test_unvalidated_matches_validated` (gated `#[ignore]`, run with `cargo test -p yahtzee-core --release -- --ignored`) compares `Scores::new_with` against `Scores::new_with_unvalidated` across every reachable state — i.e. cross-checks the BFS soundness as a side effect.
+- **Cross-check tests**: `test_naive_backend_matches` asserts naive and ndarray agree on the default-state EV within 1e-3 (single scalar tripwire). `proptests::linalg_backends_agree_on_action_ranking` is the broader cousin: for `arb_state() × dice_idx`, every enabled `LinalgBackend` (naive, ndarray, optionally faer/simd) must produce the same overall EV *and* the same EV at each rank in the sorted entries / first_keepers / second_keepers lists, within 5e-3. This catches structural backend bugs that nudge EVs by ~1e-2 on niche states — well below the default-state test's noise floor. `test_unvalidated_matches_validated` (gated `#[ignore]`) compares `Scores::new_with` against `Scores::new_with_unvalidated` across every reachable state — cross-checks the BFS soundness as a side effect. `test_simd_batch_matches` (gated `#[ignore]`, `--features simd`) compares `SimdBatchBuildBackend` against `CpuBuildBackend` across every reachable state, catching structural bugs in the outer-loop pipeline that the per-state `LinalgBackend` proptest can't see. Both ignored tests run with `cargo test -p yahtzee-core --release --features simd -- --ignored`.
 
 ### Scoring helpers
 
@@ -124,7 +128,7 @@ Private helpers `turn_ev_by_roll3_dice()` and `turn_ev_by_roll2_dice(...)` build
 
 CLI feature wiring (`crates/cli/Cargo.toml`):
 
-- `default = ["simd"]` — the `build` subcommand dispatches through `CpuBuildBackendWith(SimdBackend)` (~1.84× wall-clock vs `NdarrayBackend`, no API change). The `solve` / `value` / `play` subcommands deserialize the embedded table and don't hit `Scores::new()` regardless of features, so this only affects table regeneration.
+- `default = ["simd"]` — the `build` subcommand dispatches through `SimdBatchBuildBackend` (outer-loop SIMD across 8 states; ~2.5× wall-clock vs `NdarrayBackend`, no API change). The `solve` / `value` / `play` subcommands deserialize the embedded table and don't hit `Scores::new()` regardless of features, so this only affects table regeneration.
 - `cuda` (opt-in) — when compiled (`cargo build -p yahtzee-cli --release --features cuda`), `build` dispatches through `CudaBuildBackend` instead, taking precedence over `simd`. Requires `libcuda` / `libcublas` / `libnvrtc` `.so`s on the runtime host (cudarc dynamic-loads, no CUDA SDK at build time). If GPU init fails the subcommand errors out — there's no automatic CPU fallback.
 - `--no-default-features` — falls back to `Scores::new()` (`NdarrayBackend`). Useful for benching the unaccelerated path.
 

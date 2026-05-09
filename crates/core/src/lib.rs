@@ -1196,6 +1196,54 @@ mod tests {
         );
     }
 
+    /// Cross-check `SimdBatchBuildBackend` (8-states-per-`f32x8`-lane outer-
+    /// loop SIMD) against the default `CpuBuildBackend` for every reachable
+    /// state's EV. Catches structural bugs in the batched pipeline (wrong
+    /// transpose, masked-max sign error, GEMV row vs column flip) — the
+    /// per-state ranking proptest doesn't exercise BuildBackend at all, only
+    /// LinalgBackend.
+    ///
+    /// `#[ignore]` because it builds a second `Scores` table (~doubles test
+    /// wall-clock). Run explicitly:
+    /// `cargo test -p yahtzee-core --release --features simd -- --ignored
+    /// test_simd_batch_matches`.
+    #[cfg(feature = "simd")]
+    #[test]
+    #[ignore]
+    fn test_simd_batch_matches() {
+        use crate::linalg::SimdBatchBuildBackend;
+
+        let baseline = shared_scores();
+        let candidate = Scores::new_with(&SimdBatchBuildBackend).unwrap();
+
+        let b = baseline.state_scores_slice();
+        let c = candidate.state_scores_slice();
+        assert_eq!(b.len(), c.len());
+
+        let mut mismatches = 0_usize;
+        let mut max_abs_diff = 0.0_f32;
+
+        for idx in 0..(NUM_STATES as usize) {
+            let state: State = idx.into();
+            if !baseline.valid_state(state) {
+                continue;
+            }
+            let diff = (b[idx] - c[idx]).abs();
+            if diff > 1e-3 {
+                mismatches += 1;
+                if diff > max_abs_diff {
+                    max_abs_diff = diff;
+                }
+            }
+        }
+
+        assert_eq!(
+            mismatches, 0,
+            "CpuBuildBackend and SimdBatchBuildBackend disagree on {mismatches} \
+             reachable states; max |Δ| = {max_abs_diff}",
+        );
+    }
+
     /// NaiveBackend (scalar `for` loops, no ndarray ops) should produce the
     /// same default-state EV as NdarrayBackend (matrixmultiply-backed
     /// `.dot()`), modulo float reordering. This is the most independent

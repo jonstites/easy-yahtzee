@@ -293,6 +293,16 @@ pub use faer_impl::FaerBackend;
 #[cfg(feature = "simd")]
 pub use simd_impl::SimdBackend;
 
+/// Batched-across-states SIMD `BuildBackend` (8 states per `f32x8` lane group).
+/// Companion to [`SimdBackend`] (which vectorizes within a single state's
+/// masked-max). See [`simd_batch::SimdBatchBuildBackend`] for the design;
+/// pairs with [`crate::Scores::new_with_unvalidated`] for regular per-level
+/// batches.
+#[cfg(feature = "simd")]
+pub mod simd_batch;
+#[cfg(feature = "simd")]
+pub use simd_batch::SimdBatchBuildBackend;
+
 /// CUDA backend (opt-in via `--features cuda`). Implements [`BuildBackend`]
 /// (per-level batched), not [`LinalgBackend`] (per-state). See
 /// [`cuda::CudaBuildBackend`] for the gory details.

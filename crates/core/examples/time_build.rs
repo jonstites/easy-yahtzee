@@ -11,9 +11,12 @@
 //! (skips the BFS-reachability filter; ~2× build wall-clock; correctness-
 //! identical for reachable states).
 //!
-//! Set `YAHTZEE_BACKEND=ndarray|naive|simd|faer` to swap the per-state
-//! `LinalgBackend` driving the build (`ndarray` is the default; `simd` and
-//! `faer` require their respective Cargo features). The 2×2 matrix:
+//! Set `YAHTZEE_BACKEND=ndarray|naive|simd|simd_batch|faer` to swap the
+//! `BuildBackend` driving the build. `ndarray` (default), `naive`, `simd`,
+//! and `faer` are per-state `LinalgBackend`s wrapped in
+//! `CpuBuildBackendWith`; `simd_batch` is the outer-loop SIMD across-states
+//! `BuildBackend`. `simd`, `simd_batch`, and `faer` require their
+//! respective Cargo features.
 //!
 //!     cargo run -p yahtzee-core --release --features simd --example time_build
 //!     YAHTZEE_UNVALIDATED=1 cargo run -p yahtzee-core --release --features simd --example time_build
@@ -40,6 +43,11 @@ fn main() {
         #[cfg(feature = "simd")]
         "simd" => run(
             &CpuBuildBackendWith(yahtzee_core::linalg::SimdBackend::new()),
+            unvalidated,
+        ),
+        #[cfg(feature = "simd")]
+        "simd_batch" => run(
+            &yahtzee_core::linalg::SimdBatchBuildBackend,
             unvalidated,
         ),
         #[cfg(feature = "faer")]
