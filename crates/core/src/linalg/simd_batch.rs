@@ -1,19 +1,30 @@
 //! Outer-loop SIMD: vectorize the per-state EV pipeline *across* states
 //! rather than within a single state's masked-max, plus a sparse-fused
 //! keeper round that merges each GEMV→masked_max pair into one CSR walk,
-//! plus a vectorized `score_and_child` that computes all 8 lanes' scores
+//! plus a vectorized `score_and_child` that computes all 16 lanes' scores
 //! and child indices in one SIMD pass per `(action, dice)` cell.
 //!
 //! [`SimdBackend`] (in the parent module) is the per-state intra-state
 //! vectorizer: `wide::f32x8` lanes are the 8 keepers being max-reduced for
-//! one state. [`SimdBatchBuildBackend`] flips the axis: `f32x8` lanes are 8
-//! *different states* at the same DP level, and the same matrix /
+//! one state. [`SimdBatchBuildBackend`] flips the axis: `f32x16` lanes are
+//! 16 *different states* at the same DP level, and the same matrix /
 //! probability tables are broadcast scalar across lanes. This works because
 //! the per-state pipeline's structure is identical state-to-state — the
 //! only state-dependent inputs are (a) which entry actions are legal, (b)
 //! the per-action `(score, child)` look-up, and (c) the resulting
 //! `state_scores[child]` reads. Everything downstream (the GEMVs, the
 //! masked-maxes, the final dot) sees the matrices as constants.
+//!
+//! R8 (most recent) widened the batch from 8 to 16 states via
+//! `wide::f32x16` — which lowers to `__m512` ops + `vmulps zmm` /
+//! `vaddps zmm` when `target_feature="avx512f"` is set (already on via the
+//! workspace `.cargo/config.toml` `target-cpu=native` rustflag on Zen 5).
+//! Per-lane operation order is bit-identical to the f32x8 version — the
+//! `simd_batch_matches` cross-check passes without tolerance changes.
+//! `wide`'s `Add` and `Mul` don't auto-fuse into FMA (they emit `vmulps`
+//! followed by `vaddps`, not `vfmadd*ps`), which is the property that
+//! keeps results bit-identical; explicit `.mul_add()` calls would change
+//! both bit pattern and rounding.
 //!
 //! On top of that outer-loop SIMD, [`phase_fused_keeper_round`] exploits the
 //! 3.75% structural sparsity of `KEEPERS_TO_DICE_PROBABILITIES` (4,368 of
@@ -22,28 +33,27 @@
 //! both the GEMV (sum over `d` in supp(K2D[k, ·])) and the masked-max
 //! (max over compatible `d`s) in one walk, scatter-maxing the dot-product
 //! result directly into `out_dice` without ever materializing the 462-wide
-//! `second_keepers` / `first_keepers` intermediate. End-to-end this is
-//! ~2.9× over the dense outer-loop SIMD path, and the fused phase alone is
-//! 26.3× vs the dense `phase_gemv` + `phase_masked_max` pair (matching the
-//! 1/0.0375 = 26.7× theoretical density-ratio ceiling).
+//! `second_keepers` / `first_keepers` intermediate.
 //!
 //! This backend works on both [`Scores::new_with`](crate::Scores::new_with)
 //! (validated) and [`Scores::new_with_unvalidated`](crate::Scores::new_with_unvalidated):
 //! the unvalidated per-level batches are exactly `C(13, L) × 128` states,
-//! all divisible by 8, so no scalar tail handling is needed; the validated
-//! path's tail (<8 states) falls back to the per-state [`SimdBackend`].
+//! all divisible by 16, so no scalar tail handling is needed; the validated
+//! path's tail (<16 states) falls back to the per-state [`SimdBackend`].
 //!
 //! Allocations live in a per-thread [`Scratch`] reused across chunks via
-//! rayon's `map_init`. Working set is ~24 KiB per thread (three 252-wide
-//! `f32x8` buffers); the sparse-fused round eliminated the 462-wide
-//! intermediates that previously pushed it to ~50 KiB.
+//! rayon's `map_init`. Working set is ~48 KiB per thread (three 252-wide
+//! `f32x16` buffers, 2× larger than the f32x8 version); plus the 210 KiB
+//! `entry_actions_table` scratch (13 actions × 252 dice × 64 bytes per
+//! cell). The sparse-fused round eliminated the 462-wide intermediates
+//! that previously pushed total scratch to ~100 KiB.
 
 use std::convert::Infallible;
 use std::sync::LazyLock;
 
 use bytemuck::cast;
 use rayon::prelude::*;
-use wide::{f32x8, i32x8, CmpEq, CmpGt};
+use wide::{f32x16, i32x16};
 
 use super::{BuildBackend, SimdBackend};
 use crate::{
@@ -51,7 +61,13 @@ use crate::{
     KEEPERS_TO_DICE_PROBABILITIES, NUM_DICE_COMBINATIONS, NUM_KEEPERS, State,
 };
 
-const LANES: usize = 8;
+// R8 — batch size widened 8 → 16 to exploit Zen 5's full 512-bit datapaths.
+// `wide::f32x16` lowers to `__m512` + `fused_mul_add_m512` when
+// `target_feature="avx512f","fma"` are set (both already on via the
+// workspace's `.cargo/config.toml` `target-cpu=native` rustflag on x86_64
+// hosts). Per-lane operation order is unchanged from f32x16 — bit-identical
+// EVs in the cross-check.
+const LANES: usize = 16;
 const N_DICE: usize = NUM_DICE_COMBINATIONS as usize; // 252
 const N_KEEPERS: usize = NUM_KEEPERS as usize; // 462
 const N_ACTIONS: usize = 13;
@@ -126,7 +142,7 @@ static SPARSE_K2D: LazyLock<SparseK2D> = LazyLock::new(|| {
 /// **6 distinct child states** per parent: `child.upper_score_remaining =
 /// max(parent_upper - v * count, 0)`, where `count ∈ {0..=5}`. So
 /// `state_scores[child_idx]` for action `a` and dice `d` reduces to one of
-/// 6 precomputed `f32x8` values, indexed by `COUNT_LUT[a.as_idx()][d]`.
+/// 6 precomputed `f32x16` values, indexed by `COUNT_LUT[a.as_idx()][d]`.
 static COUNT_LUT: LazyLock<[[u8; N_DICE]; 6]> = LazyLock::new(|| {
     let scores = &*crate::DICE_AND_ENTRY_SCORES;
     let mut lut = [[0_u8; N_DICE]; 6];
@@ -146,7 +162,7 @@ static COUNT_LUT: LazyLock<[[u8; N_DICE]; 6]> = LazyLock::new(|| {
 /// `entry_actions_table` is the precomputed `(score + state_scores[child])`
 /// table consumed by [`phase_entry_actions_precomputed`]. Layout is
 /// action-major, dice-inner: cell `(a, d)` is at index `a * N_DICE + d`.
-/// Each `f32x8` cell holds the resolved values across all 8 lanes (one per
+/// Each `f32x16` cell holds the resolved values across all 16 lanes (one per
 /// state). 13 × 252 × 32 = 105 KiB per thread; fits in L2 (1 MiB on Zen 5).
 ///
 /// The other three 252-wide buffers carry the dice-axis intermediates
@@ -154,25 +170,25 @@ static COUNT_LUT: LazyLock<[[u8; N_DICE]; 6]> = LazyLock::new(|| {
 /// eliminated by [`phase_fused_keeper_round`].
 struct Scratch {
     /// Precomputed `score + state_scores[child]` table for the entry-actions
-    /// phase. Layout `[f32x8; N_ACTIONS * N_DICE]`, indexed `a * N_DICE + d`.
-    entry_actions_table: Vec<f32x8>,
-    third_dice: Vec<f32x8>,  // length N_DICE
-    second_dice: Vec<f32x8>, // length N_DICE
-    first_dice: Vec<f32x8>,  // length N_DICE
+    /// phase. Layout `[f32x16; N_ACTIONS * N_DICE]`, indexed `a * N_DICE + d`.
+    entry_actions_table: Vec<f32x16>,
+    third_dice: Vec<f32x16>,  // length N_DICE
+    second_dice: Vec<f32x16>, // length N_DICE
+    first_dice: Vec<f32x16>,  // length N_DICE
 }
 
 impl Scratch {
     fn new() -> Self {
         Self {
-            entry_actions_table: vec![f32x8::splat(0.0); N_ACTIONS * N_DICE],
-            third_dice: vec![f32x8::splat(0.0); N_DICE],
-            second_dice: vec![f32x8::splat(0.0); N_DICE],
-            first_dice: vec![f32x8::splat(0.0); N_DICE],
+            entry_actions_table: vec![f32x16::splat(0.0); N_ACTIONS * N_DICE],
+            third_dice: vec![f32x16::splat(0.0); N_DICE],
+            second_dice: vec![f32x16::splat(0.0); N_DICE],
+            first_dice: vec![f32x16::splat(0.0); N_DICE],
         }
     }
 }
 
-/// `BuildBackend` that processes 8 states per `f32x8` lane group through the
+/// `BuildBackend` that processes 16 states per `f32x16` lane group through the
 /// full per-state EV pipeline. Drives `Scores::new_with_unvalidated` at
 /// per-thread parallelism via `par_chunks(8)`. Falls back to the per-state
 /// `SimdBackend` for any tail `< 8` (only relevant on the validated path;
@@ -262,9 +278,9 @@ fn process_bucket<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
 
 /// The 8-wide pipeline. Returns the EV of each of the 8 input states.
 ///
-/// Each `f32x8` lane is one of the 8 input states. Steps 1+2 use a
+/// Each `f32x16` lane is one of the 8 input states. Steps 1+2 use a
 /// precomputed `(score + state_scores[child])` table whose cells are
-/// computed by [`phase_entry_actions_vectorized`] — all 8 lanes are
+/// computed by [`phase_entry_actions_vectorized`] — all 16 lanes are
 /// computed in parallel via SIMD per `(action, dice)` cell. The table
 /// then feeds a branchless SIMD max-reduce over actions. Steps 3+4 (and
 /// 5+6) fuse via [`phase_fused_keeper_round`]: sparse CSR over `K2D` lets
@@ -350,12 +366,12 @@ fn compute_lanes<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
 ///   catches it easily.
 ///
 /// **Phase B's win.** Pure branchless SIMD: 13 `fast_max` ops per d on
-/// pre-resolved `f32x8` cells. No scalar work, no random gather, no
+/// pre-resolved `f32x16` cells. No scalar work, no random gather, no
 /// validity branch. The compiler emits the optimal reduce-max pattern.
 ///
 /// **Layout.** Action-major, dice-inner: cell `(a, d)` lives at table index
 /// `a * N_DICE + d`. Phase A writes one lane at a time via `as_mut_array()`
-/// (stride-32 across 252 cells per (s, a)); Phase B reads whole `f32x8`
+/// (stride-32 across 252 cells per (s, a)); Phase B reads whole `f32x16`
 /// cells. 13 × 252 × 32 = 105 KiB scratch per thread.
 ///
 /// **Invalid actions.** Phase A unconditionally writes every `(s, a, d)`
@@ -370,8 +386,8 @@ fn compute_lanes<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
 pub fn phase_entry_actions_precomputed(
     states: &[State; LANES],
     state_scores: &[f32],
-    table: &mut [f32x8],
-    out_third_dice: &mut [f32x8],
+    table: &mut [f32x16],
+    out_third_dice: &mut [f32x16],
 ) {
     debug_assert_eq!(table.len(), N_ACTIONS * N_DICE);
     debug_assert_eq!(out_third_dice.len(), N_DICE);
@@ -450,7 +466,7 @@ const YAHTZEE_BIT: i32 = EntryAction::YAHTZEE.bits() as i32;
 ///   max(parent_upper - v × c, 0)`. Also precompute the upper-bonus blend
 ///   per count (depends only on whether `new_upper` reached 0). Inside the
 ///   d-loop, look up `c = COUNT_LUT[face_idx][d]` and read both precomputed
-///   `f32x8`s — no per-d gather, no per-d upper-bonus computation. The
+///   `f32x16`s — no per-d gather, no per-d upper-bonus computation. The
 ///   yahtzee-bonus blend stays per-d because `dice_is_yahtzee` doesn't
 ///   correlate with `count` cleanly (e.g., `count=0` includes both the 5
 ///   other-face yahtzees and 247 non-yahtzee d's).
@@ -477,8 +493,8 @@ const YAHTZEE_BIT: i32 = EntryAction::YAHTZEE.bits() as i32;
 pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
     states: &[State; LANES],
     state_scores: &[f32],
-    table: &mut [f32x8],
-    out_third_dice: &mut [f32x8],
+    table: &mut [f32x16],
+    out_third_dice: &mut [f32x16],
 ) {
     if ALL_NOT_YAHTZEE_ELIGIBLE {
         debug_assert!(
@@ -490,20 +506,20 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
     debug_assert_eq!(out_third_dice.len(), N_DICE);
 
     // Per-batch state-only quantities (same as `_hoisted`).
-    let entries_v = i32x8::new(std::array::from_fn(|s| states[s].entries.bits() as i32));
+    let entries_v = i32x16::new(std::array::from_fn(|s| states[s].entries.bits() as i32));
     let upper_remaining_v =
-        i32x8::new(std::array::from_fn(|s| states[s].upper_score_remaining as i32));
-    let yahtzee_eligible_v = i32x8::new(std::array::from_fn(|s| {
+        i32x16::new(std::array::from_fn(|s| states[s].upper_score_remaining as i32));
+    let yahtzee_eligible_v = i32x16::new(std::array::from_fn(|s| {
         if states[s].yahtzee_bonus_eligible {
             1
         } else {
             0
         }
     }));
-    let upper_complete_mask = upper_remaining_v.simd_eq(i32x8::splat(0));
+    let upper_complete_mask = upper_remaining_v.simd_eq(i32x16::splat(0));
     let contains_yahtzee_mask =
-        (entries_v & i32x8::splat(YAHTZEE_BIT)).simd_gt(i32x8::splat(0));
-    let yahtzee_eligible_mask = yahtzee_eligible_v.simd_gt(i32x8::splat(0));
+        (entries_v & i32x16::splat(YAHTZEE_BIT)).simd_gt(i32x16::splat(0));
+    let yahtzee_eligible_mask = yahtzee_eligible_v.simd_gt(i32x16::splat(0));
 
     let dice_and_entry_scores = &*crate::DICE_AND_ENTRY_SCORES;
     let yahtzee_dice = &*crate::YAHTZEE_DICE;
@@ -522,11 +538,11 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
         };
 
         let valid_int_mask =
-            (entries_v & i32x8::splat(action_bits)).simd_eq(i32x8::splat(0));
-        let valid_mask_f: f32x8 =
-            cast::<i32x8, f32x8>(valid_int_mask).blend(f32x8::splat(1.0), f32x8::splat(0.0));
+            (entries_v & i32x16::splat(action_bits)).simd_eq(i32x16::splat(0));
+        let valid_mask_f: f32x16 =
+            cast::<i32x16, f32x16>(valid_int_mask).blend(f32x16::splat(1.0), f32x16::splat(0.0));
 
-        let entries_with_action_v = entries_v | i32x8::splat(action_bits);
+        let entries_with_action_v = entries_v | i32x16::splat(action_bits);
 
         let row = &mut table[action_idx * N_DICE..(action_idx + 1) * N_DICE];
         let scores_row = &dice_and_entry_scores[action_idx];
@@ -538,33 +554,26 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
             let face_value = (action_idx + 1) as i32;
             let counts_for_face = &count_lut[action_idx];
 
-            let mut child_evs_per_count = [f32x8::splat(0.0); 6];
+            let mut child_evs_per_count = [f32x16::splat(0.0); 6];
             // upper_bonus_per_count[c] = 35.0 in lanes where bonus would fire,
             // 0.0 elsewhere. !upper_complete && (new_upper == 0).
-            let mut upper_bonus_per_count = [f32x8::splat(0.0); 6];
+            let mut upper_bonus_per_count = [f32x16::splat(0.0); 6];
             for c in 0..6 {
                 let s_for_c = face_value * (c as i32);
                 let new_upper =
-                    (upper_remaining_v - i32x8::splat(s_for_c)).max(i32x8::splat(0));
-                let child_idx_v: i32x8 = (entries_with_action_v << 7_u32)
+                    (upper_remaining_v - i32x16::splat(s_for_c)).max(i32x16::splat(0));
+                let child_idx_v: i32x16 = (entries_with_action_v << 7_u32)
                     | (yahtzee_eligible_v << 6_u32)
                     | new_upper;
                 let idx_arr = child_idx_v.to_array();
-                child_evs_per_count[c] = f32x8::new([
-                    state_scores[idx_arr[0] as usize],
-                    state_scores[idx_arr[1] as usize],
-                    state_scores[idx_arr[2] as usize],
-                    state_scores[idx_arr[3] as usize],
-                    state_scores[idx_arr[4] as usize],
-                    state_scores[idx_arr[5] as usize],
-                    state_scores[idx_arr[6] as usize],
-                    state_scores[idx_arr[7] as usize],
-                ]);
+                child_evs_per_count[c] = f32x16::new(std::array::from_fn(|s| {
+                    state_scores[idx_arr[s] as usize]
+                }));
 
-                let new_upper_zero_mask = new_upper.simd_eq(i32x8::splat(0));
+                let new_upper_zero_mask = new_upper.simd_eq(i32x16::splat(0));
                 let upper_fires_mask = !upper_complete_mask & new_upper_zero_mask;
-                upper_bonus_per_count[c] = cast::<i32x8, f32x8>(upper_fires_mask)
-                    .blend(f32x8::splat(35.0), f32x8::splat(0.0));
+                upper_bonus_per_count[c] = cast::<i32x16, f32x16>(upper_fires_mask)
+                    .blend(f32x16::splat(35.0), f32x16::splat(0.0));
             }
 
             // joker_score is None for upper actions; suppress the unused
@@ -574,7 +583,7 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
 
             for d in 0..N_DICE {
                 let raw_score_i = scores_row[d] as i32;
-                let raw_score_f = f32x8::splat(raw_score_i as f32);
+                let raw_score_f = f32x16::splat(raw_score_i as f32);
                 let c = counts_for_face[d] as usize;
                 debug_assert_eq!(raw_score_i, face_value * (c as i32));
 
@@ -585,12 +594,12 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
                 // is all-zeros so the +100 blend is identically 0 — the
                 // entire add is dead. The const generic DCE's it.
                 let yahtzee_bonus_f = if ALL_NOT_YAHTZEE_ELIGIBLE {
-                    f32x8::splat(0.0)
+                    f32x16::splat(0.0)
                 } else if dice_is_yahtzee {
-                    cast::<i32x8, f32x8>(yahtzee_eligible_mask)
-                        .blend(f32x8::splat(100.0), f32x8::splat(0.0))
+                    cast::<i32x16, f32x16>(yahtzee_eligible_mask)
+                        .blend(f32x16::splat(100.0), f32x16::splat(0.0))
                 } else {
-                    f32x8::splat(0.0)
+                    f32x16::splat(0.0)
                 };
 
                 let total_f = raw_score_f
@@ -603,60 +612,46 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
             // Yahtzee arm: 2 distinct child states. `dice_is_yahtzee` flips
             // `yahtzee_bonus_eligible` in `child`; `upper_score_remaining`
             // doesn't change (YAHTZEE isn't an upper action).
-            let child_idx_off: i32x8 = (entries_with_action_v << 7_u32)
+            let child_idx_off: i32x16 = (entries_with_action_v << 7_u32)
                 | (yahtzee_eligible_v << 6_u32)
                 | upper_remaining_v;
             let idx_off = child_idx_off.to_array();
-            let child_evs_off = f32x8::new([
-                state_scores[idx_off[0] as usize],
-                state_scores[idx_off[1] as usize],
-                state_scores[idx_off[2] as usize],
-                state_scores[idx_off[3] as usize],
-                state_scores[idx_off[4] as usize],
-                state_scores[idx_off[5] as usize],
-                state_scores[idx_off[6] as usize],
-                state_scores[idx_off[7] as usize],
-            ]);
+            let child_evs_off = f32x16::new(std::array::from_fn(|s| {
+                state_scores[idx_off[s] as usize]
+            }));
 
-            let new_yahtzee_eligible_on_v = yahtzee_eligible_v | i32x8::splat(1);
-            let child_idx_on: i32x8 = (entries_with_action_v << 7_u32)
+            let new_yahtzee_eligible_on_v = yahtzee_eligible_v | i32x16::splat(1);
+            let child_idx_on: i32x16 = (entries_with_action_v << 7_u32)
                 | (new_yahtzee_eligible_on_v << 6_u32)
                 | upper_remaining_v;
             let idx_on = child_idx_on.to_array();
-            let child_evs_on = f32x8::new([
-                state_scores[idx_on[0] as usize],
-                state_scores[idx_on[1] as usize],
-                state_scores[idx_on[2] as usize],
-                state_scores[idx_on[3] as usize],
-                state_scores[idx_on[4] as usize],
-                state_scores[idx_on[5] as usize],
-                state_scores[idx_on[6] as usize],
-                state_scores[idx_on[7] as usize],
-            ]);
+            let child_evs_on = f32x16::new(std::array::from_fn(|s| {
+                state_scores[idx_on[s] as usize]
+            }));
 
             // Yahtzee bonus when dice is yahtzee (per-lane gated on parent
             // eligible). Hoists out of the d-loop. R6.5: when
             // ALL_NOT_YAHTZEE_ELIGIBLE, this is identically 0 and the
             // const generic DCE's the add.
             let yahtzee_bonus_when_yahtzee = if ALL_NOT_YAHTZEE_ELIGIBLE {
-                f32x8::splat(0.0)
+                f32x16::splat(0.0)
             } else {
-                cast::<i32x8, f32x8>(yahtzee_eligible_mask)
-                    .blend(f32x8::splat(100.0), f32x8::splat(0.0))
+                cast::<i32x16, f32x16>(yahtzee_eligible_mask)
+                    .blend(f32x16::splat(100.0), f32x16::splat(0.0))
             };
 
             let _ = joker_score;
 
             for d in 0..N_DICE {
                 let raw_score_i = scores_row[d] as i32;
-                let raw_score_f = f32x8::splat(raw_score_i as f32);
+                let raw_score_f = f32x16::splat(raw_score_i as f32);
 
                 let dice_is_yahtzee = yahtzee_dice[d].is_some();
 
                 let (child_evs_f, yahtzee_bonus_f) = if dice_is_yahtzee {
                     (child_evs_on, yahtzee_bonus_when_yahtzee)
                 } else {
-                    (child_evs_off, f32x8::splat(0.0))
+                    (child_evs_off, f32x16::splat(0.0))
                 };
 
                 // Upper bonus can't fire here (YAHTZEE isn't an upper action,
@@ -666,24 +661,17 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
             }
         } else {
             // Fast arm: child is d-independent. Same as `_hoisted`.
-            let child_idx_v: i32x8 = (entries_with_action_v << 7_u32)
+            let child_idx_v: i32x16 = (entries_with_action_v << 7_u32)
                 | (yahtzee_eligible_v << 6_u32)
                 | upper_remaining_v;
             let idx_arr = child_idx_v.to_array();
-            let child_evs_f = f32x8::new([
-                state_scores[idx_arr[0] as usize],
-                state_scores[idx_arr[1] as usize],
-                state_scores[idx_arr[2] as usize],
-                state_scores[idx_arr[3] as usize],
-                state_scores[idx_arr[4] as usize],
-                state_scores[idx_arr[5] as usize],
-                state_scores[idx_arr[6] as usize],
-                state_scores[idx_arr[7] as usize],
-            ]);
+            let child_evs_f = f32x16::new(std::array::from_fn(|s| {
+                state_scores[idx_arr[s] as usize]
+            }));
 
             for d in 0..N_DICE {
                 let raw_score_i = scores_row[d] as i32;
-                let raw_score_f = f32x8::splat(raw_score_i as f32);
+                let raw_score_f = f32x16::splat(raw_score_i as f32);
 
                 let yahtzee_face_opt = yahtzee_dice[d];
                 let dice_is_yahtzee = yahtzee_face_opt.is_some();
@@ -694,23 +682,23 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
                     let yahtzee_face_bits =
                         yahtzee_face_opt.map(|f| f.bits() as i32).unwrap_or(0);
                     let entries_have_face_mask = (entries_v
-                        & i32x8::splat(yahtzee_face_bits))
-                        .simd_gt(i32x8::splat(0));
+                        & i32x16::splat(yahtzee_face_bits))
+                        .simd_gt(i32x16::splat(0));
                     let joker_lane_mask = contains_yahtzee_mask & entries_have_face_mask;
-                    cast::<i32x8, f32x8>(joker_lane_mask)
-                        .blend(f32x8::splat(joker_val as f32), raw_score_f)
+                    cast::<i32x16, f32x16>(joker_lane_mask)
+                        .blend(f32x16::splat(joker_val as f32), raw_score_f)
                 } else {
                     raw_score_f
                 };
 
                 // R6.5 DCE-via-const-generic, same as upper arm above.
                 let yahtzee_bonus_f = if ALL_NOT_YAHTZEE_ELIGIBLE {
-                    f32x8::splat(0.0)
+                    f32x16::splat(0.0)
                 } else if dice_is_yahtzee {
-                    cast::<i32x8, f32x8>(yahtzee_eligible_mask)
-                        .blend(f32x8::splat(100.0), f32x8::splat(0.0))
+                    cast::<i32x16, f32x16>(yahtzee_eligible_mask)
+                        .blend(f32x16::splat(100.0), f32x16::splat(0.0))
                 } else {
-                    f32x8::splat(0.0)
+                    f32x16::splat(0.0)
                 };
 
                 let total_f = normal_score_f + yahtzee_bonus_f + child_evs_f;
@@ -752,10 +740,10 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
 /// 14,160 vs 26,208 — **46% fewer gathers**.
 ///
 /// **Why R3's compiler didn't already hoist.** With `state_scores: &[f32]`
-/// (immutable) and `row: &mut [f32x8]` (mutable, written in d-loop), Rust's
+/// (immutable) and `row: &mut [f32x16]` (mutable, written in d-loop), Rust's
 /// noalias *should* let LLVM hoist a loop-invariant gather. In practice
 /// LLVM's alias analysis is conservative around the `child_idx_v` integer
-/// computation; `cast::<i32x8, f32x8>` and `blend` patterns inhibit the
+/// computation; `cast::<i32x16, f32x16>` and `blend` patterns inhibit the
 /// loop-invariant-code-motion pass on the dependent loads. Explicit hoisting
 /// in source guarantees it.
 ///
@@ -778,28 +766,28 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
 pub fn phase_entry_actions_hoisted(
     states: &[State; LANES],
     state_scores: &[f32],
-    table: &mut [f32x8],
-    out_third_dice: &mut [f32x8],
+    table: &mut [f32x16],
+    out_third_dice: &mut [f32x16],
 ) {
     debug_assert_eq!(table.len(), N_ACTIONS * N_DICE);
     debug_assert_eq!(out_third_dice.len(), N_DICE);
 
-    // Hoist per-batch state-only quantities into i32x8 SoA. (Same as
+    // Hoist per-batch state-only quantities into i32x16 SoA. (Same as
     // phase_entry_actions_vectorized.)
-    let entries_v = i32x8::new(std::array::from_fn(|s| states[s].entries.bits() as i32));
+    let entries_v = i32x16::new(std::array::from_fn(|s| states[s].entries.bits() as i32));
     let upper_remaining_v =
-        i32x8::new(std::array::from_fn(|s| states[s].upper_score_remaining as i32));
-    let yahtzee_eligible_v = i32x8::new(std::array::from_fn(|s| {
+        i32x16::new(std::array::from_fn(|s| states[s].upper_score_remaining as i32));
+    let yahtzee_eligible_v = i32x16::new(std::array::from_fn(|s| {
         if states[s].yahtzee_bonus_eligible {
             1
         } else {
             0
         }
     }));
-    let upper_complete_mask = upper_remaining_v.simd_eq(i32x8::splat(0));
+    let upper_complete_mask = upper_remaining_v.simd_eq(i32x16::splat(0));
     let contains_yahtzee_mask =
-        (entries_v & i32x8::splat(YAHTZEE_BIT)).simd_gt(i32x8::splat(0));
-    let yahtzee_eligible_mask = yahtzee_eligible_v.simd_gt(i32x8::splat(0));
+        (entries_v & i32x16::splat(YAHTZEE_BIT)).simd_gt(i32x16::splat(0));
+    let yahtzee_eligible_mask = yahtzee_eligible_v.simd_gt(i32x16::splat(0));
 
     let dice_and_entry_scores = &*crate::DICE_AND_ENTRY_SCORES;
     let yahtzee_dice = &*crate::YAHTZEE_DICE;
@@ -817,11 +805,11 @@ pub fn phase_entry_actions_hoisted(
         };
 
         let valid_int_mask =
-            (entries_v & i32x8::splat(action_bits)).simd_eq(i32x8::splat(0));
-        let valid_mask_f: f32x8 =
-            cast::<i32x8, f32x8>(valid_int_mask).blend(f32x8::splat(1.0), f32x8::splat(0.0));
+            (entries_v & i32x16::splat(action_bits)).simd_eq(i32x16::splat(0));
+        let valid_mask_f: f32x16 =
+            cast::<i32x16, f32x16>(valid_int_mask).blend(f32x16::splat(1.0), f32x16::splat(0.0));
 
-        let entries_with_action_v = entries_v | i32x8::splat(action_bits);
+        let entries_with_action_v = entries_v | i32x16::splat(action_bits);
 
         let row = &mut table[action_idx * N_DICE..(action_idx + 1) * N_DICE];
         let scores_row = &dice_and_entry_scores[action_idx];
@@ -829,24 +817,17 @@ pub fn phase_entry_actions_hoisted(
         if !is_upper_action && !is_yahtzee_action {
             // Fast arm: child is d-independent. Gather state_scores once,
             // skip upper-bonus path entirely.
-            let child_idx_v: i32x8 = (entries_with_action_v << 7_u32)
+            let child_idx_v: i32x16 = (entries_with_action_v << 7_u32)
                 | (yahtzee_eligible_v << 6_u32)
                 | upper_remaining_v;
             let idx_arr = child_idx_v.to_array();
-            let child_evs_f = f32x8::new([
-                state_scores[idx_arr[0] as usize],
-                state_scores[idx_arr[1] as usize],
-                state_scores[idx_arr[2] as usize],
-                state_scores[idx_arr[3] as usize],
-                state_scores[idx_arr[4] as usize],
-                state_scores[idx_arr[5] as usize],
-                state_scores[idx_arr[6] as usize],
-                state_scores[idx_arr[7] as usize],
-            ]);
+            let child_evs_f = f32x16::new(std::array::from_fn(|s| {
+                state_scores[idx_arr[s] as usize]
+            }));
 
             for d in 0..N_DICE {
                 let raw_score_i = scores_row[d] as i32;
-                let raw_score_f = f32x8::splat(raw_score_i as f32);
+                let raw_score_f = f32x16::splat(raw_score_i as f32);
 
                 let yahtzee_face_opt = yahtzee_dice[d];
                 let dice_is_yahtzee = yahtzee_face_opt.is_some();
@@ -860,21 +841,21 @@ pub fn phase_entry_actions_hoisted(
                         .map(|f| f.bits() as i32)
                         .unwrap_or(0);
                     let entries_have_face_mask = (entries_v
-                        & i32x8::splat(yahtzee_face_bits))
-                        .simd_gt(i32x8::splat(0));
+                        & i32x16::splat(yahtzee_face_bits))
+                        .simd_gt(i32x16::splat(0));
                     let joker_lane_mask = contains_yahtzee_mask & entries_have_face_mask;
-                    cast::<i32x8, f32x8>(joker_lane_mask)
-                        .blend(f32x8::splat(joker_val as f32), raw_score_f)
+                    cast::<i32x16, f32x16>(joker_lane_mask)
+                        .blend(f32x16::splat(joker_val as f32), raw_score_f)
                 } else {
                     raw_score_f
                 };
 
                 // Yahtzee bonus only — upper bonus can't fire here.
                 let yahtzee_bonus_f = if dice_is_yahtzee {
-                    cast::<i32x8, f32x8>(yahtzee_eligible_mask)
-                        .blend(f32x8::splat(100.0), f32x8::splat(0.0))
+                    cast::<i32x16, f32x16>(yahtzee_eligible_mask)
+                        .blend(f32x16::splat(100.0), f32x16::splat(0.0))
                 } else {
-                    f32x8::splat(0.0)
+                    f32x16::splat(0.0)
                 };
 
                 let total_f = normal_score_f + yahtzee_bonus_f + child_evs_f;
@@ -882,57 +863,50 @@ pub fn phase_entry_actions_hoisted(
             }
         } else {
             // Slow arm: child depends on dice (upper or yahtzee actions).
-            // Per-d gather via i32x8 child_idx + 8 scalar loads.
+            // Per-d gather via i32x16 child_idx + 8 scalar loads.
             for d in 0..N_DICE {
                 let raw_score_i = scores_row[d] as i32;
-                let raw_score_v = i32x8::splat(raw_score_i);
-                let raw_score_f = f32x8::splat(raw_score_i as f32);
+                let raw_score_v = i32x16::splat(raw_score_i);
+                let raw_score_f = f32x16::splat(raw_score_i as f32);
 
                 let yahtzee_face_opt = yahtzee_dice[d];
                 let dice_is_yahtzee = yahtzee_face_opt.is_some();
 
                 let new_upper_v = if is_upper_action {
-                    (upper_remaining_v - raw_score_v).max(i32x8::splat(0))
+                    (upper_remaining_v - raw_score_v).max(i32x16::splat(0))
                 } else {
                     upper_remaining_v
                 };
 
                 let new_yahtzee_eligible_v = if is_yahtzee_action && dice_is_yahtzee {
-                    yahtzee_eligible_v | i32x8::splat(1)
+                    yahtzee_eligible_v | i32x16::splat(1)
                 } else {
                     yahtzee_eligible_v
                 };
 
-                let child_idx_v: i32x8 = (entries_with_action_v << 7_u32)
+                let child_idx_v: i32x16 = (entries_with_action_v << 7_u32)
                     | (new_yahtzee_eligible_v << 6_u32)
                     | new_upper_v;
 
                 let idx_arr = child_idx_v.to_array();
-                let child_evs_f = f32x8::new([
-                    state_scores[idx_arr[0] as usize],
-                    state_scores[idx_arr[1] as usize],
-                    state_scores[idx_arr[2] as usize],
-                    state_scores[idx_arr[3] as usize],
-                    state_scores[idx_arr[4] as usize],
-                    state_scores[idx_arr[5] as usize],
-                    state_scores[idx_arr[6] as usize],
-                    state_scores[idx_arr[7] as usize],
-                ]);
+                let child_evs_f = f32x16::new(std::array::from_fn(|s| {
+                    state_scores[idx_arr[s] as usize]
+                }));
 
                 // joker_score is None for upper/yahtzee actions (joker is
                 // only FH/SS/LS, all in fast arm), so normal_score = raw_score.
                 let _ = joker_score;
 
-                let new_upper_zero_mask = new_upper_v.simd_eq(i32x8::splat(0));
+                let new_upper_zero_mask = new_upper_v.simd_eq(i32x16::splat(0));
                 let upper_fires_mask = !upper_complete_mask & new_upper_zero_mask;
-                let upper_bonus_f = cast::<i32x8, f32x8>(upper_fires_mask)
-                    .blend(f32x8::splat(35.0), f32x8::splat(0.0));
+                let upper_bonus_f = cast::<i32x16, f32x16>(upper_fires_mask)
+                    .blend(f32x16::splat(35.0), f32x16::splat(0.0));
 
                 let yahtzee_bonus_f = if dice_is_yahtzee {
-                    cast::<i32x8, f32x8>(yahtzee_eligible_mask)
-                        .blend(f32x8::splat(100.0), f32x8::splat(0.0))
+                    cast::<i32x16, f32x16>(yahtzee_eligible_mask)
+                        .blend(f32x16::splat(100.0), f32x16::splat(0.0))
                 } else {
-                    f32x8::splat(0.0)
+                    f32x16::splat(0.0)
                 };
 
                 let total_f = raw_score_f + upper_bonus_f + yahtzee_bonus_f + child_evs_f;
@@ -953,9 +927,9 @@ pub fn phase_entry_actions_hoisted(
 
 /// Round 2 — vectorized variant of [`phase_entry_actions_precomputed`].
 ///
-/// Same semantics: build a `[f32x8; N_ACTIONS * N_DICE]` table of
+/// Same semantics: build a `[f32x16; N_ACTIONS * N_DICE]` table of
 /// `(score + state_scores[child]) * valid_mask` per `(action, dice)` cell,
-/// where each `f32x8` lane is one of the 8 input states. Then max-reduce
+/// where each `f32x16` lane is one of the 8 input states. Then max-reduce
 /// over actions per dice into `out_third_dice`.
 ///
 /// **Why vectorize.** Round 1's precomputed variant runs scalar
@@ -969,7 +943,7 @@ pub fn phase_entry_actions_hoisted(
 ///
 /// **Hoisting.** Per-batch state-only quantities (`entries`, `upper`,
 /// `yahtzee_eligible`, `contains_yahtzee_box`, `upper_complete`) live in
-/// `i32x8` registers across the whole loop. Per-action quantities (action
+/// `i32x16` registers across the whole loop. Per-action quantities (action
 /// bits, joker score, `is_upper_action`, `is_yahtzee_action`, per-lane
 /// validity) hoist out of the d-loop. Only the `(a, d)` cell-specific
 /// `raw_score` and the `YAHTZEE_DICE[d]` flag are loaded per d, both
@@ -993,27 +967,27 @@ pub fn phase_entry_actions_hoisted(
 /// delta.
 ///
 /// **Validity.** Per-lane `is_valid_action(a)` is precomputed at the top
-/// of the action loop as an `i32x8` bitmask. The final cell value is
+/// of the action loop as an `i32x16` bitmask. The final cell value is
 /// `total * valid_mask`, where `valid_mask` is 0.0 / 1.0 per lane (rather
 /// than `blend`-replacing with 0 — equivalent, lets us skip a separate
-/// `f32x8::ZERO` operand).
+/// `f32x16::ZERO` operand).
 #[doc(hidden)]
 #[inline]
 pub fn phase_entry_actions_vectorized(
     states: &[State; LANES],
     state_scores: &[f32],
-    table: &mut [f32x8],
-    out_third_dice: &mut [f32x8],
+    table: &mut [f32x16],
+    out_third_dice: &mut [f32x16],
 ) {
     debug_assert_eq!(table.len(), N_ACTIONS * N_DICE);
     debug_assert_eq!(out_third_dice.len(), N_DICE);
 
-    // Hoist per-batch state-only quantities into i32x8 SoA. Each lane is one
+    // Hoist per-batch state-only quantities into i32x16 SoA. Each lane is one
     // input state; the lane stays put for the entire pipeline.
-    let entries_v = i32x8::new(std::array::from_fn(|s| states[s].entries.bits() as i32));
+    let entries_v = i32x16::new(std::array::from_fn(|s| states[s].entries.bits() as i32));
     let upper_remaining_v =
-        i32x8::new(std::array::from_fn(|s| states[s].upper_score_remaining as i32));
-    let yahtzee_eligible_v = i32x8::new(std::array::from_fn(|s| {
+        i32x16::new(std::array::from_fn(|s| states[s].upper_score_remaining as i32));
+    let yahtzee_eligible_v = i32x16::new(std::array::from_fn(|s| {
         if states[s].yahtzee_bonus_eligible {
             1
         } else {
@@ -1022,15 +996,15 @@ pub fn phase_entry_actions_vectorized(
     }));
     // upper_complete_mask: all-1s lanes where parent already had upper bonus
     // (so we can't fire the +35 again).
-    let upper_complete_mask = upper_remaining_v.simd_eq(i32x8::splat(0));
+    let upper_complete_mask = upper_remaining_v.simd_eq(i32x16::splat(0));
     // contains_yahtzee_mask: all-1s lanes where parent has the Yahtzee box
     // already filled (gate for joker rule and for whether re-rolling a
     // Yahtzee qualifies for the +100 bonus).
     let contains_yahtzee_mask =
-        (entries_v & i32x8::splat(YAHTZEE_BIT)).simd_gt(i32x8::splat(0));
+        (entries_v & i32x16::splat(YAHTZEE_BIT)).simd_gt(i32x16::splat(0));
     // yahtzee_eligible_mask: all-1s lanes where state.yahtzee_bonus_eligible
     // is true (the +100 bonus precondition).
-    let yahtzee_eligible_mask = yahtzee_eligible_v.simd_gt(i32x8::splat(0));
+    let yahtzee_eligible_mask = yahtzee_eligible_v.simd_gt(i32x16::splat(0));
 
     let dice_and_entry_scores = &*crate::DICE_AND_ENTRY_SCORES;
     let yahtzee_dice = &*crate::YAHTZEE_DICE;
@@ -1048,22 +1022,22 @@ pub fn phase_entry_actions_vectorized(
         };
 
         // Per-lane validity = !entries.contains(action) = ((entries & action) == 0).
-        // valid_mask is an f32x8 with 1.0 in valid lanes, 0.0 in invalid.
+        // valid_mask is an f32x16 with 1.0 in valid lanes, 0.0 in invalid.
         let valid_int_mask =
-            (entries_v & i32x8::splat(action_bits)).simd_eq(i32x8::splat(0));
-        let valid_mask_f: f32x8 =
-            cast::<i32x8, f32x8>(valid_int_mask).blend(f32x8::splat(1.0), f32x8::splat(0.0));
+            (entries_v & i32x16::splat(action_bits)).simd_eq(i32x16::splat(0));
+        let valid_mask_f: f32x16 =
+            cast::<i32x16, f32x16>(valid_int_mask).blend(f32x16::splat(1.0), f32x16::splat(0.0));
 
         // entries with this action OR'd in (used for child_idx).
-        let entries_with_action_v = entries_v | i32x8::splat(action_bits);
+        let entries_with_action_v = entries_v | i32x16::splat(action_bits);
 
         let row = &mut table[action_idx * N_DICE..(action_idx + 1) * N_DICE];
         let scores_row = &dice_and_entry_scores[action_idx];
 
         for d in 0..N_DICE {
             let raw_score_i = scores_row[d] as i32;
-            let raw_score_v = i32x8::splat(raw_score_i);
-            let raw_score_f = f32x8::splat(raw_score_i as f32);
+            let raw_score_v = i32x16::splat(raw_score_i);
+            let raw_score_f = f32x16::splat(raw_score_i as f32);
 
             let yahtzee_face_opt = yahtzee_dice[d];
             let yahtzee_face_bits =
@@ -1073,7 +1047,7 @@ pub fn phase_entry_actions_vectorized(
             // child.upper_score_remaining = saturating_sub(parent_upper, raw_score) for upper
             // actions, unchanged otherwise. (raw_score - parent_upper) clamps via .max(0).
             let new_upper_v = if is_upper_action {
-                (upper_remaining_v - raw_score_v).max(i32x8::splat(0))
+                (upper_remaining_v - raw_score_v).max(i32x16::splat(0))
             } else {
                 upper_remaining_v
             };
@@ -1081,13 +1055,13 @@ pub fn phase_entry_actions_vectorized(
             // child.yahtzee_bonus_eligible = parent.eligible | (action==YAHTZEE && dice_is_yahtzee).
             // Only the second term is per-action-and-dice; first term is parent-only.
             let new_yahtzee_eligible_v = if is_yahtzee_action && dice_is_yahtzee {
-                yahtzee_eligible_v | i32x8::splat(1)
+                yahtzee_eligible_v | i32x16::splat(1)
             } else {
                 yahtzee_eligible_v
             };
 
             // child_idx = (entries_with_action << 7) | (new_yahtzee_eligible << 6) | new_upper.
-            let child_idx_v: i32x8 = (entries_with_action_v << 7_u32)
+            let child_idx_v: i32x16 = (entries_with_action_v << 7_u32)
                 | (new_yahtzee_eligible_v << 6_u32)
                 | new_upper_v;
 
@@ -1096,16 +1070,9 @@ pub fn phase_entry_actions_vectorized(
             // for fixed (s, a) (child differs from parent only by upper or
             // yahtzee-eligible bit), so the L1 absorbs them.
             let idx_arr = child_idx_v.to_array();
-            let child_evs_f = f32x8::new([
-                state_scores[idx_arr[0] as usize],
-                state_scores[idx_arr[1] as usize],
-                state_scores[idx_arr[2] as usize],
-                state_scores[idx_arr[3] as usize],
-                state_scores[idx_arr[4] as usize],
-                state_scores[idx_arr[5] as usize],
-                state_scores[idx_arr[6] as usize],
-                state_scores[idx_arr[7] as usize],
-            ]);
+            let child_evs_f = f32x16::new(std::array::from_fn(|s| {
+                state_scores[idx_arr[s] as usize]
+            }));
 
             // Joker rule: if action ∈ {FULL_HOUSE, SMALL_STRAIGHT, LARGE_STRAIGHT}
             // AND dice is a Yahtzee AND parent has Yahtzee box filled AND
@@ -1116,28 +1083,28 @@ pub fn phase_entry_actions_vectorized(
                 && dice_is_yahtzee
             {
                 let entries_have_face_mask = (entries_v
-                    & i32x8::splat(yahtzee_face_bits))
-                    .simd_gt(i32x8::splat(0));
+                    & i32x16::splat(yahtzee_face_bits))
+                    .simd_gt(i32x16::splat(0));
                 let joker_lane_mask = contains_yahtzee_mask & entries_have_face_mask;
-                cast::<i32x8, f32x8>(joker_lane_mask)
-                    .blend(f32x8::splat(joker_val as f32), raw_score_f)
+                cast::<i32x16, f32x16>(joker_lane_mask)
+                    .blend(f32x16::splat(joker_val as f32), raw_score_f)
             } else {
                 raw_score_f
             };
 
             // Upper bonus: !parent.upper_complete && child.upper_complete.
             // child.upper_complete = (new_upper == 0).
-            let new_upper_zero_mask = new_upper_v.simd_eq(i32x8::splat(0));
+            let new_upper_zero_mask = new_upper_v.simd_eq(i32x16::splat(0));
             let upper_fires_mask = !upper_complete_mask & new_upper_zero_mask;
-            let upper_bonus_f = cast::<i32x8, f32x8>(upper_fires_mask)
-                .blend(f32x8::splat(35.0), f32x8::splat(0.0));
+            let upper_bonus_f = cast::<i32x16, f32x16>(upper_fires_mask)
+                .blend(f32x16::splat(35.0), f32x16::splat(0.0));
 
             // Yahtzee bonus: dice is Yahtzee && parent.yahtzee_bonus_eligible.
             let yahtzee_bonus_f = if dice_is_yahtzee {
-                cast::<i32x8, f32x8>(yahtzee_eligible_mask)
-                    .blend(f32x8::splat(100.0), f32x8::splat(0.0))
+                cast::<i32x16, f32x16>(yahtzee_eligible_mask)
+                    .blend(f32x16::splat(100.0), f32x16::splat(0.0))
             } else {
-                f32x8::splat(0.0)
+                f32x16::splat(0.0)
             };
 
             let total_f = normal_score_f + upper_bonus_f + yahtzee_bonus_f + child_evs_f;
@@ -1176,11 +1143,11 @@ pub fn phase_entry_actions_vectorized(
 pub fn phase_entry_actions_fuse(
     states: &[State; LANES],
     state_scores: &[f32],
-    out_third_dice: &mut [f32x8],
+    out_third_dice: &mut [f32x16],
 ) {
     debug_assert_eq!(out_third_dice.len(), N_DICE);
     for d in 0..N_DICE {
-        let mut acc = f32x8::splat(0.0);
+        let mut acc = f32x16::splat(0.0);
         for action_idx in 0..N_ACTIONS {
             let action = ENTRY_ACTIONS[action_idx];
             let mut lanes = [0.0_f32; LANES];
@@ -1192,7 +1159,7 @@ pub fn phase_entry_actions_fuse(
                     lanes[s] = score + state_scores[child_idx];
                 }
             }
-            acc = acc.fast_max(f32x8::from(lanes));
+            acc = acc.fast_max(f32x16::from(lanes));
         }
         out_third_dice[d] = acc;
     }
@@ -1204,14 +1171,14 @@ pub fn phase_entry_actions_fuse(
 /// Exposed as `#[doc(hidden)] pub` for the criterion phase benches.
 #[doc(hidden)]
 #[inline]
-pub fn phase_gemv(out: &mut [f32x8], input: &[f32x8]) {
+pub fn phase_gemv(out: &mut [f32x16], input: &[f32x16]) {
     debug_assert_eq!(out.len(), N_KEEPERS);
     debug_assert_eq!(input.len(), N_DICE);
     let m = &*KEEPERS_TO_DICE_PROBABILITIES;
     for k in 0..N_KEEPERS {
-        let mut acc = f32x8::splat(0.0);
+        let mut acc = f32x16::splat(0.0);
         for d in 0..N_DICE {
-            acc += f32x8::splat(m[(k, d)]) * input[d];
+            acc += f32x16::splat(m[(k, d)]) * input[d];
         }
         out[k] = acc;
     }
@@ -1224,14 +1191,14 @@ pub fn phase_gemv(out: &mut [f32x8], input: &[f32x8]) {
 /// Exposed as `#[doc(hidden)] pub` for the criterion phase benches.
 #[doc(hidden)]
 #[inline]
-pub fn phase_masked_max(out: &mut [f32x8], input: &[f32x8]) {
+pub fn phase_masked_max(out: &mut [f32x16], input: &[f32x16]) {
     debug_assert_eq!(out.len(), N_DICE);
     debug_assert_eq!(input.len(), N_KEEPERS);
     let mask = &*DICE_TO_ALLOWED_KEEPERS;
     for d in 0..N_DICE {
-        let mut acc = f32x8::splat(0.0);
+        let mut acc = f32x16::splat(0.0);
         for k in 0..N_KEEPERS {
-            acc = acc.fast_max(f32x8::splat(mask[(d, k)]) * input[k]);
+            acc = acc.fast_max(f32x16::splat(mask[(d, k)]) * input[k]);
         }
         out[d] = acc;
     }
@@ -1260,12 +1227,12 @@ pub fn phase_masked_max(out: &mut [f32x8], input: &[f32x8]) {
 /// 4,368 max-updates. Both inputs to the FMA are register-sized loads:
 /// `splat(p)` is a scalar broadcast, and `in_dice[col_idx[i]]` is one
 /// aligned 256-bit load (lanes are pre-packed 8-states-contiguous in the
-/// `f32x8` buffer, so no gather is needed even when `col_idx[i]` strides).
+/// `f32x16` buffer, so no gather is needed even when `col_idx[i]` strides).
 ///
 /// Exposed as `#[doc(hidden)] pub` for the criterion phase benches.
 #[doc(hidden)]
 #[inline]
-pub fn phase_fused_keeper_round(out_dice: &mut [f32x8], in_dice: &[f32x8]) {
+pub fn phase_fused_keeper_round(out_dice: &mut [f32x16], in_dice: &[f32x16]) {
     debug_assert_eq!(out_dice.len(), N_DICE);
     debug_assert_eq!(in_dice.len(), N_DICE);
     let sparse = &*SPARSE_K2D;
@@ -1277,7 +1244,7 @@ pub fn phase_fused_keeper_round(out_dice: &mut [f32x8], in_dice: &[f32x8]) {
     // covered by at least one k — d ⊇ k for k = 0-keeper is always true —
     // but the zero-init is the principled floor.)
     for slot in out_dice.iter_mut() {
-        *slot = f32x8::splat(0.0);
+        *slot = f32x16::splat(0.0);
     }
 
     for k in 0..N_KEEPERS {
@@ -1287,10 +1254,10 @@ pub fn phase_fused_keeper_round(out_dice: &mut [f32x8], in_dice: &[f32x8]) {
         let row_vals = &sparse.values[row_start..row_end];
 
         // Pass 1: sparse dot product. `val[s]` = K2D[k, ·] · in_dice for lane s.
-        let mut val = f32x8::splat(0.0);
+        let mut val = f32x16::splat(0.0);
         for i in 0..row_cols.len() {
             let d = row_cols[i] as usize;
-            val += f32x8::splat(row_vals[i]) * in_dice[d];
+            val += f32x16::splat(row_vals[i]) * in_dice[d];
         }
 
         // Pass 2: scatter-max `val` into out_dice[d] for every d in this row.
@@ -1310,12 +1277,12 @@ pub fn phase_fused_keeper_round(out_dice: &mut [f32x8], in_dice: &[f32x8]) {
 /// Exposed as `#[doc(hidden)] pub` for the criterion phase benches.
 #[doc(hidden)]
 #[inline]
-pub fn phase_final_dot(first_dice: &[f32x8]) -> [f32; LANES] {
+pub fn phase_final_dot(first_dice: &[f32x16]) -> [f32; LANES] {
     debug_assert_eq!(first_dice.len(), N_DICE);
     let m = &*KEEPERS_TO_DICE_PROBABILITIES;
-    let mut ev = f32x8::splat(0.0);
+    let mut ev = f32x16::splat(0.0);
     for d in 0..N_DICE {
-        ev += f32x8::splat(m[(0, d)]) * first_dice[d];
+        ev += f32x16::splat(m[(0, d)]) * first_dice[d];
     }
     ev.into()
 }

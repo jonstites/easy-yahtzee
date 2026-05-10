@@ -44,10 +44,10 @@ cargo bench -p yahtzee-core --features "simd faer cuda" -- "Scores::new_with"
 | `ndarray` | 4.13 s | 1.87× | `matrixmultiply` GEMV via ndarray's `.dot()`. Default `Scores::new()`. |
 | `faer` | 3.20 s | 2.42× | faer's `Mat * Col` GEMV; quietly the best CPU GEMV at 252×462. |
 | `simd` | 2.57 s | 3.01× | Per-state intra-state SIMD on the masked-max via `wide::f32x8`. |
-| `simd_batch` | **101 ms** | **76.6×** | **Best end-to-end.** Outer-loop SIMD across 8 states + sparse-fused GEMV/masked_max + flat-array `DICE_AND_ENTRY_SCORES` + `#[inline]` on the per-state DP fns + precomputed `(score + state_scores[child])` table + vectorized `score_and_child` across the 8 lanes + parallel BFS reachability filter + d-independent gather hoist for 6 of the 13 actions + per-score-class precomputation for the slow arm (6 distinct child states per upper action, 2 per YAHTZEE) + bucket-sort by `!yahtzee_eligible` (R6.5) + LazyLock hoist out of BFS (R7). CLI default. |
+| `simd_batch` | **78.9 ms** | **98.1×** | **Best end-to-end.** Outer-loop SIMD across 16 states (AVX-512 ZMM via `wide::f32x16`) + sparse-fused GEMV/masked_max + flat-array `DICE_AND_ENTRY_SCORES` + `#[inline]` on the per-state DP fns + precomputed `(score + state_scores[child])` table + vectorized `score_and_child` across the 16 lanes + parallel BFS reachability filter + d-independent gather hoist for 6 of the 13 actions + per-score-class precomputation for the slow arm (6 distinct child states per upper action, 2 per YAHTZEE) + bucket-sort by `!yahtzee_eligible` (R6.5) + LazyLock hoist out of BFS (R7) + AVX-512 widening (R8). CLI default. |
 | `cuda` | 712 ms | 10.87× | Per-level batched on GPU; cuBLAS sgemm + 3 NVRTC kernels. |
 
-`simd_batch` overtook CUDA after the sparse fused-keeper-round landed and has pulled progressively further ahead — currently **7.05× faster than CUDA** end-to-end. Walking the arc:
+`simd_batch` overtook CUDA after the sparse fused-keeper-round landed and has pulled progressively further ahead — currently **9.0× faster than CUDA** end-to-end. Walking the arc:
 
 | Stage | Wall (criterion) | vs prior |
 |---|---:|---|
@@ -62,9 +62,10 @@ cargo bench -p yahtzee-core --features "simd faer cuda" -- "Scores::new_with"
 | + per-score-class precompute in slow arm (R5) | 152 ms | 1.27× |
 | + `target-cpu=native` (AVX2 + FMA + BMI2 enabled, was SSE2 only) | 124.5 ms | 1.22× |
 | + bucket-sort by `!yahtzee_eligible` (R6.5) | 119 ms | 1.04× |
-| + LazyLock hoist + d-independent action collapse in BFS (R7) | **101 ms** | 1.18× |
+| + LazyLock hoist + d-independent action collapse in BFS (R7) | 101 ms | 1.18× |
+| + AVX-512 widening via `wide::f32x16` (R8) | **78.9 ms** | 1.28× |
 
-The current row is **22.7× faster than the dense `simd_batch` starting point**. R7 (the most recent landed round) is structurally different from R0..R6.5: every prior round optimized the *DP per-level compute_level*, but R7 optimizes the *BFS reachability filter* (`Scores::set_valid_states`). After R7, BFS is ~28% of e2e wall (was ~40% pre-R7), and the DP work — specifically `phase_fused_keeper_round` — is back to dominating. The handoff between R6.5 and R7 predicted a state-encoding restructure (different bijection from `State` to `usize`) as the next big win, estimating 20-40% e2e. Cachegrind disproved that hypothesis: D1 miss rate is 0.1% and LLd is 0.0%, so cache locality isn't the bottleneck. The real cost was ~21% of total Ir going to `sync/once.rs` + `sync/atomic.rs` — the BFS hot loop's per-iteration LazyLock atomic checks for `DICE_AND_ENTRY_SCORES` and `YAHTZEE_DICE`. The per-stage micro-benches below didn't catch this because they only bench `phase_*` functions, not `set_valid_states`.
+The current row is **29.0× faster than the dense `simd_batch` starting point**. R7 (the most recent landed round) is structurally different from R0..R6.5: every prior round optimized the *DP per-level compute_level*, but R7 optimizes the *BFS reachability filter* (`Scores::set_valid_states`). After R7, BFS is ~28% of e2e wall (was ~40% pre-R7), and the DP work — specifically `phase_fused_keeper_round` — is back to dominating. The handoff between R6.5 and R7 predicted a state-encoding restructure (different bijection from `State` to `usize`) as the next big win, estimating 20-40% e2e. Cachegrind disproved that hypothesis: D1 miss rate is 0.1% and LLd is 0.0%, so cache locality isn't the bottleneck. The real cost was ~21% of total Ir going to `sync/once.rs` + `sync/atomic.rs` — the BFS hot loop's per-iteration LazyLock atomic checks for `DICE_AND_ENTRY_SCORES` and `YAHTZEE_DICE`. The per-stage micro-benches below didn't catch this because they only bench `phase_*` functions, not `set_valid_states`.
 
 R5 (per-score-class precompute) was the prior big structural win, sharing a pattern with R4 (gather hoist): ask "for which inputs does the gathered `state_scores[child_idx]` actually depend on `dice`?" R4 found that 6 of 13 actions have d-independent children (entire gather hoists out of d-loop); R5 found that the remaining 7 have very *low-cardinality* d-dependence (upper actions: 6 distinct values per parent, indexed by `count(face, d)`; YAHTZEE: 2, indexed by `is_yahtzee(d)`). The R5 entry-actions phase was **2.36× faster** cache-warm vs R4 and **1.27× e2e** — total slow-arm gathers per batch dropped from 14,112 to ~304.
 
@@ -89,28 +90,30 @@ cargo bench -p yahtzee-core --features "simd faer" -- "state_value/backends"
 
 (No `simd_batch` row: it's a `BuildBackend`, not a `LinalgBackend` — vectorizes across states, so single-state-per-call is meaningless.)
 
-External comparison: the `timpalpant/yahtzee` Go reference takes ~45 s for the same table on the same hardware (16 threads). Our naive Rust is 5.8× faster than that, default Rust 10.9×, simd_batch **445×**, CUDA 63×. (Their start-state EV converges to 254.49, ours to 254.5896 — likely a small game-rule difference, not investigated.)
+External comparison: the `timpalpant/yahtzee` Go reference takes ~45 s for the same table on the same hardware (16 threads). Our naive Rust is 5.8× faster than that, default Rust 10.9×, simd_batch **570×**, CUDA 63×. (Their start-state EV converges to 254.49, ours to 254.5896 — likely a small game-rule difference, not investigated.)
 
 ---
 
 ## Thread scaling
 
-`simd_batch` scaling on the 9800X3D (8 physical / 16 logical), post-R7 + target-cpu=native, single `time_build` sample per thread count:
+`simd_batch` scaling on the 9800X3D (8 physical / 16 logical), post-R8 (AVX-512 LANES=16) + target-cpu=native, single `time_build` sample per thread count:
 
 | Threads | Wall (ms) | Speedup vs 1T | Efficiency |
 |---:|---:|---:|---:|
-| 1 | 562 | 1.00× | 100% |
-| 2 | 291 | 1.93× | **96%** |
-| 4 | 154 | 3.65× | **91%** |
-| 8 | 110 | 5.11× | 64% |
-| 12 | **95** | 5.91× | 49% |
-| 16 | 110 | 5.11× | 32% |
+| 1 | 373 | 1.00× | 100% |
+| 2 | 200 | 1.87× | **93%** |
+| 4 | 112 | 3.33× | **83%** |
+| 8 | **78** | 4.78× | 60% |
+| 12 | 80 | 4.66× | 39% |
+| 16 | 94 | 3.97× | 25% |
+
+(Pre-R8 reference, LANES=8: 1T = 562 ms, 12T sweet-spot = 95 ms, 16T = 110 ms. R8 dropped 1T by 34% and 8T by 29%.)
 
 Reproduce: `for n in 1 2 4 8 12 16; do RAYON_NUM_THREADS=$n YAHTZEE_BACKEND=simd_batch cargo run -p yahtzee-core --release --features simd --example time_build; done`
 
-**Sweet spot is 12 threads.** Going from 12→16 adds nothing (and slightly *hurts*: 95 → 110 ms) — the 9800X3D's SMT can't hide behind any execution-unit slack because vectorized SIMD already saturates the FPU. The second SMT thread per core just contests for L1d / L2 / store buffer slots. 8→12 threads picks up ~16% wall (110 → 95 ms) from OS scheduling flexibility without full SMT pairing.
+**Sweet spot is now 8 threads** (was 12 pre-R8). The sweet spot moved DOWN because per-batch work doubled in R8 (16 states per batch instead of 8), so each level produces half as many batches and the rayon work-stealing dispatcher has less to keep extra threads busy. Going 8→16 still regresses (78 → 94 ms) — same SMT-contention story as before, just at a lower thread-count threshold.
 
-The 64% efficiency at 8T (compared to ~84% pre-target-cpu) is mostly fixed-cost overhead becoming a larger relative share now that the parallel work shrunk dramatically. Total fixed costs: the post-build `state_scores` write-back (single-threaded), the `into_par_iter` startup on tiny levels (L=12 has 1598 states, ~0.5 µs of work split 8 ways gets dwarfed by rayon dispatch), the BFS reduce-OR merge between levels (sequential by design), and trace prints when enabled. R3's parallel BFS removed the previous ~175 ms sequential ceiling that capped 8T efficiency at 54%; R7 then halved the BFS wall itself (56 ms → 29 ms at 16T), so the BFS line is no longer a noticeable Amdahl ceiling.
+The 60% efficiency at 8T (compared to 64% pre-R8) is fixed-cost overhead's growing relative share: the parallel work shrunk again, and the absolute fixed costs (BFS reduce-OR merge between levels, scratch zero-init, rayon dispatch, post-build single-threaded write-back) stay constant. R3's parallel BFS removed the previous ~175 ms sequential ceiling that capped 8T efficiency at 54%; R7 then halved the BFS wall itself (56 ms → 29 ms at 16T); R8 didn't touch BFS. The remaining Amdahl ceiling is now spread thin across many small sequential costs rather than concentrated in one phase.
 
 ---
 
@@ -131,33 +134,35 @@ YAHTZEE_TRACE_LEVELS=1 \
 
 Per-level `compute=` is wall-time of the parallel `compute_level` call. Note the BFS reachability filter (`set_valid_states`) runs *before* level 12 and isn't shown in any column — see the [Thread scaling](#thread-scaling) section for the relevant numbers.
 
-Current measurements (post-R7, target-cpu=native, 16T):
+Current measurements (post-R8, target-cpu=native, 16T):
 
-| Level | States | ndarray | simd | sb (R5, pre-target-cpu) | sb (R7) | cuda |
-|---:|---:|---:|---:|---:|---:|---:|
-| 12 | 1,598 | 12.0 | 13.8 | 1.3 | 1.6 | 2.0 |
-| 11 | 9,135 | 65.9 | 44.6 | 2.1 | 1.8 | 5.7 |
-| 10 | 31,322 | 232.1 | 153.7 | 5.7 | 4.8 | 30.0 |
-| 9 | 71,237 | 540.4 | 391.4 | 13.3 | 9.6 | 69.7 |
-| **8** | **112,596** | **861.3** | **564.9** | **19.6** | **14.5** | **109.6** |
-| **7** | **126,219** | **991.1** | **674.3** | **21.5** | **16.3** | **123.8** |
-| **6** | **100,619** | **781.9** | **502.7** | **17.0** | **12.9** | **97.0** |
-| 5 | 56,283 | 442.1 | 300.8 | 10.1 | 7.6 | 55.0 |
-| 4 | 21,377 | 167.8 | 123.0 | 3.9 | 3.3 | 9.4 |
-| 3 | 5,178 | 41.2 | 33.3 | 1.1 | 1.3 | 2.5 |
-| 2 | 711 | 5.7 | 4.8 | 0.6 | 0.6 | 0.3 |
-| 1 | 44 | 0.4 | 0.8 | 0.3 | 0.3 | 0.1 |
-| 0 | 1 | 0.1 | 0.1 | 0.1 | 0.1 | 4.7* |
-| total compute_level | | 4142 | 2808 | 96 | 75 | 510 |
-| BFS (`set_valid_states`) | | 29 | 65** | 56 | 29 | 29 |
-| **wall (criterion, warm)** | | **4127 ms** | **2566 ms** | **152 ms** | **101 ms** | **712 ms** |
+| Level | States | ndarray | simd | sb (R5, pre-target-cpu) | sb (R7) | sb (R8) | cuda |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 1,598 | 12.0 | 13.8 | 1.3 | 1.6 | 2.5 | 2.0 |
+| 11 | 9,135 | 65.9 | 44.6 | 2.1 | 1.8 | 1.7 | 5.7 |
+| 10 | 31,322 | 232.1 | 153.7 | 5.7 | 4.8 | 3.8 | 30.0 |
+| 9 | 71,237 | 540.4 | 391.4 | 13.3 | 9.6 | 7.9 | 69.7 |
+| **8** | **112,596** | **861.3** | **564.9** | **19.6** | **14.5** | **11.2** | **109.6** |
+| **7** | **126,219** | **991.1** | **674.3** | **21.5** | **16.3** | **11.4** | **123.8** |
+| **6** | **100,619** | **781.9** | **502.7** | **17.0** | **12.9** | **9.0** | **97.0** |
+| 5 | 56,283 | 442.1 | 300.8 | 10.1 | 7.6 | 5.4 | 55.0 |
+| 4 | 21,377 | 167.8 | 123.0 | 3.9 | 3.3 | 3.6 | 9.4 |
+| 3 | 5,178 | 41.2 | 33.3 | 1.1 | 1.3 | 1.1 | 2.5 |
+| 2 | 711 | 5.7 | 4.8 | 0.6 | 0.6 | 1.5 | 0.3 |
+| 1 | 44 | 0.4 | 0.8 | 0.3 | 0.3 | 0.7 | 0.1 |
+| 0 | 1 | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 | 4.7* |
+| total compute_level | | 4142 | 2808 | 96 | 75 | 60 | 510 |
+| BFS (`set_valid_states`) | | 29 | 65** | 56 | 29 | 29 | 29 |
+| **wall (criterion, warm)** | | **4127 ms** | **2566 ms** | **152 ms** | **101 ms** | **78.9 ms** | **712 ms** |
 
 `*` CUDA's L=0 outlier is kernel-launch overhead on a 1-state batch — irrelevant in absolute terms.
-`**` `simd`'s BFS is noisier in single-sample traces because target-cpu=native makes the DP fast enough that scheduler jitter at lower-thread-count workloads shows up as BFS variance. R7's BFS line is identical regardless of which backend drives `compute_level` (BFS runs *before* level 12) — quoted here as 29 ms across backends for clarity.
+`**` `simd`'s BFS is noisier in single-sample traces because target-cpu=native makes the DP fast enough that scheduler jitter at lower-thread-count workloads shows up as BFS variance. The BFS line is identical regardless of which backend drives `compute_level` (BFS runs *before* level 12) — quoted as 29 ms across backends for clarity.
 
-The bolded levels (L=6, 7, 8) are ~58% of `compute_level` time on every backend. **simd_batch (R7) beats CUDA at every level from L=3 upward** (R5 beat it from L=4); CUDA only wins at L=2 and below where its kernel-launch latency amortizes worse and the absolute numbers are sub-ms anyway. Net: simd_batch wins by 611 ms wall vs CUDA.
+The bolded levels (L=6, 7, 8) are ~52% of `compute_level` time on R8 (was ~58% pre-R8 — heavy levels shrunk slightly more than light levels). **simd_batch (R8) beats CUDA at every level from L=3 upward**; CUDA only wins at L=2 and below where its kernel-launch latency amortizes worse and the absolute numbers are sub-ms anyway. Net: simd_batch wins by 633 ms wall vs CUDA (9.0× faster).
 
-R7 vs R5 (with target-cpu=native applied between): per heavy level roughly **1.30–1.35×** uniformly (19.6 → 14.5, 21.5 → 16.3, 17.0 → 12.9). R7 itself didn't touch the DP (only `set_valid_states`); these per-level gains come from `target-cpu=native` enabling AVX2 + FMA + BMI2 in `wide::f32x8`'s lowering (previously SSE2-only fallback). R7's own win is in the BFS line: 56 ms → 29 ms at 16T (−48%) — a ~21 ms wall reduction that the per-level table can't show because BFS happens *outside* `compute_level`. Combined R5 → R7 wall: 152 → 101 ms (-33.6%), split roughly 1/3 from R6.5 + target-cpu + R7's BFS hoist, 2/3 from target-cpu's effect on the unchanged DP phases.
+R8 vs R7 per heavy level: roughly **1.25–1.43×** uniformly (14.5 → 11.2, 16.3 → 11.4, 12.9 → 9.0). R8 widened the SIMD batch from 8 states (f32x8 / AVX2) to 16 states (f32x16 / AVX-512 ZMM). Per-state work in the FMA-bound `phase_fused_keeper_round` drops ~41% because `vmulps zmm` + `vaddps zmm` directly double throughput vs `vmulps ymm` + `vaddps ymm`; per-state work in the gather-bound `phase_entry_actions_per_count` drops ~31% (gathers don't widen — each scalar load is still one cycle — but the per-batch SIMD math around them does). The small levels (L≤4) are noise-level: per-batch overhead amortizes slightly worse with 16-state batches at small populations (L=12 has 1,598 states → 100 batches at LANES=16 instead of 200 at LANES=8; tail handling matters more relatively).
+
+R7 vs R5 (with target-cpu=native applied between, then R6.5 between again): per heavy level roughly **1.30–1.35×** uniformly. R7 itself didn't touch the DP (only `set_valid_states`); these per-level gains came from `target-cpu=native` enabling AVX2 + FMA + BMI2 in `wide::f32x8`'s lowering (previously SSE2-only fallback). R7's own win is in the BFS line: 56 ms → 29 ms at 16T (−48%) — a ~21 ms wall reduction that the per-level table can't show because BFS happens *outside* `compute_level`. Combined R5 → R8 wall: 152 → 78.9 ms (-48%), split roughly 1/4 from R6.5 + target-cpu + R7's BFS hoist, 1/4 from target-cpu's effect on the unchanged DP phases at f32x8 width, 1/4 from R8's f32x8 → f32x16 widening of the DP phases, and 1/4 from the secondary effects of all three.
 
 Pre-target-cpu progression (numbers in the 5466 → 96 ms range of the old table) — see [Backend sweep "stage" table](#backend-sweep) for the full arc. Brief summary of the per-heavy-level deltas: **R5 vs R4** was 1.40–1.65× from per-score-class precompute (slow-arm gathers dropped 14,112 → 304); **R4 vs R3** was 1.20–1.27× from d-independent gather hoist (46% fewer gathers); **R3 vs R2** was identical per-level (R3 only changed BFS); **R2 vs R1** was 2.0× from vectorizing `score_and_child` across 8 lanes.
 
@@ -173,53 +178,64 @@ cargo bench -p yahtzee-core --features simd -- "simd_batch_phases"
 
 The production pipeline is now `phase_entry_actions_per_count` + 2× `phase_fused_keeper_round` + `phase_final_dot`. The earlier `phase_entry_actions_*` variants and dense `phase_gemv` / `phase_masked_max` are all kept as bench-only baselines so each successive win stays measurable on every CI run.
 
-Current measurements (post-R7, target-cpu=native):
+Current measurements (post-R8, target-cpu=native; 16-state batches):
 
-| Phase | Time per 8-state batch | Calls per batch | Subtotal | % of pipeline |
+| Phase | Time per 16-state batch | Calls per batch | Subtotal | % of pipeline |
 |---|---:|---:|---:|---:|
-| `entry_actions_per_count` (steps 1+2, both buckets) | 2.17 µs | 1 | 2.17 µs | **29%** |
-| `entry_actions_per_count_not_yahtzee_elig` (R6.5 fast bucket) | 1.90 µs | — | — | — |
-| `fused_keeper_round` (sparse, steps 3+4 / 5+6) | 2.60 µs | 2 | 5.20 µs | **70%** |
+| `entry_actions_per_count` (steps 1+2, both buckets) | 2.98 µs | 1 | 2.98 µs | **32%** |
+| `entry_actions_per_count_not_yahtzee_elig` (R6.5 fast bucket) | 2.76 µs | — | — | — |
+| `fused_keeper_round` (sparse, steps 3+4 / 5+6) | 3.06 µs | 2 | 6.11 µs | **67%** |
 | `final_dot` (step 7) | 0.08 µs | 1 | 0.08 µs | 1% |
-| **pipeline total** | | | **~7.45 µs** | 100% |
+| **pipeline total per batch** | | | **~9.18 µs** | 100% |
+| **pipeline total per state** | | | **~0.57 µs** | (was 0.93 µs at LANES=8) |
 | | | | | |
-| `entry_actions_hoisted` (R4, bench-only) | 5.35 µs | — | — | — |
-| `entry_actions_vectorized` (R2, bench-only) | 8.01 µs | — | — | — |
-| `entry_actions_precomputed` (R1, bench-only) | 76.9 µs | — | — | — |
-| `entry_actions_fuse` (R0, bench-only) | 83.0 µs | — | — | — |
-| dense `gemv` (bench-only) | 36.6 µs | — | — | — |
-| dense `masked_max` (bench-only) | 40.2 µs | — | — | — |
+| `entry_actions_hoisted` (R4 design, bench-only) | 10.22 µs | — | — | — |
+| `entry_actions_vectorized` (R2 design, bench-only) | 15.76 µs | — | — | — |
+| `entry_actions_precomputed` (R1 design, bench-only) | 154.5 µs | — | — | — |
+| `entry_actions_fuse` (R0 design, bench-only) | 168.9 µs | — | — | — |
+| dense `gemv` (bench-only) | 36.8 µs | — | — | — |
+| dense `masked_max` (bench-only) | 40.3 µs | — | — | — |
 
-Sparse fused vs dense: `phase_fused_keeper_round` at 2.60 µs replaces the dense `gemv` (36.6) + `masked_max` (40.2) = 76.8 µs pair → **30× speedup on this stage** (the dense pair benefits more from AVX-512 / FMA than the sparse path does, since the dense path's hot loop is just FMA throughput; the sparse path's loop is mostly load-modify-store bound on the scatter-max pass and gains less from wider SIMD).
+**Reading per-batch vs per-state at LANES=16.** Every per-batch number is for 16 states' worth of work in one batch. To get per-state cost, divide by 16. R8 doubled the per-batch work (we now compute 16 lanes' EVs simultaneously) — but it didn't double the per-batch *time* on most stages, because each AVX-512 `vmulps zmm` / `vaddps zmm` does 2× the work of the AVX2 `vmulps ymm` / `vaddps ymm` it replaces. Effective per-state speedups vs the R7 column in the per-level breakdown:
 
-R5 vs R4 entry_actions (post-target-cpu, current measurements): 2.17 vs 5.35 µs → **2.46× speedup on this stage**. The win is per-score-class precomputation in the slow arm: upper actions produce only 6 distinct child states per parent (indexed by `count(face, d)`), and YAHTZEE produces only 2 (indexed by `is_yahtzee(d)`). Slow-arm gathers per batch drop from 14,112 (R4) to ~304 (R5) — 46× fewer gathers in the slow arm, 40× total batch gathers.
+- `entry_actions_per_count`: 2.98 / 16 = 0.19 µs/state vs R7's 2.17 / 8 = 0.27 µs/state → **-31% per state**. Mixed: the SIMD math doubled in throughput, but the per-batch scalar gathers (304 state_scores reads in the slow arm) doubled in count too. Net moderate win.
+- `entry_actions_per_count_not_yahtzee_elig` (R6.5 fast bucket): 2.76 / 16 = 0.17 µs/state vs R7's 1.90 / 8 = 0.24 µs/state → **-28% per state**. Same shape.
+- `fused_keeper_round`: 3.06 / 16 = 0.19 µs/state vs R7's 2.60 / 8 = 0.33 µs/state → **-41% per state**. The CSR Pass 1 inner loop is pure `+= splat(p) * in_dice[d]` — the throughput-bound FMA-equivalent doubles cleanly on AVX-512.
+- dense `gemv`: 36.8 µs / 16 = 2.30 µs/state vs R7's 36.6 / 8 = 4.58 µs/state → **-50% per state**. Pure dense FMA loop — perfectly halves on the doubled SIMD width. (Not on the production path, but a useful AVX-512 efficiency reference.)
+- dense `masked_max`: -50% per state, same shape.
+- `final_dot`: unchanged in time per batch (it's small fixed scalar work) → -50% per state effectively, but negligible absolute.
 
-R4 vs R2 entry_actions (post-target-cpu): 5.35 vs 8.01 µs → **1.50× speedup on this stage**. The win is hoisting `state_scores[child_idx]` out of the d-loop for the 6 of 13 actions (3oak / 4oak / FH / SS / LS / chance) where `child` is d-independent.
+Sparse fused vs dense: `phase_fused_keeper_round` at 3.06 µs replaces the dense `gemv` (36.8) + `masked_max` (40.3) = 77.1 µs pair → **25× speedup on this stage**. Slightly less than the 30× pre-R8 because both sides benefit from AVX-512, but the dense side benefits MORE (perfect 2× scaling) while the sparse-fused side benefits LESS (it has scalar bookkeeping and load-modify-store on the scatter-max pass that don't widen). Still within striking distance of the 1/0.0375 = 26.7× density-ratio ceiling, which the dense baseline is now closer to than the sparse path.
 
-R2 vs R1 entry_actions (post-target-cpu): 8.01 vs 76.9 µs → **9.6× speedup**. (Pre-target-cpu was 5.7×; AVX-512 + FMA disproportionately helps R2's SIMD pass.)
+R5 vs R4 entry_actions (post-R8 measurements): 2.98 vs 10.22 µs per-batch → **3.43× speedup on this stage** at LANES=16 (was 2.46× at LANES=8 — the per-score-class precompute eliminates per-batch gather work that scales linearly with LANES, so its absolute win grows with width). Structural insight unchanged: upper actions produce only 6 distinct child states per parent (indexed by `count(face, d)`); YAHTZEE produces only 2 (indexed by `is_yahtzee(d)`); R5 collapses the slow-arm gather count by 40×.
 
-R6.5 bucket fast-bucket entry_actions: 1.90 µs vs both-buckets-mixed 2.17 µs — **1.14× saving on the heavier bucket alone**, but ~52–95% of states across levels hit it, so the bucket-sorted average lands somewhere in between (closer to 1.90 µs for late-game levels).
+R4 vs R2 entry_actions (post-R8): 10.22 vs 15.76 µs → **1.54× speedup on this stage** (was 1.50× at LANES=8). D-independent gather hoist; 46% fewer gathers per batch.
 
-End-to-end pipeline (post-target-cpu): R0 dense GEMVs ≈ 162 µs → R0 + sparse fused ≈ 25 µs → R2 ≈ 13 µs → R4 ≈ 11 µs → R5 ≈ 7.8 µs → **R7 (= R5 phases + bucket-sort) ≈ 7.45 µs**. **22× pipeline reduction over the dense baseline.**
+R2 vs R1 entry_actions (post-R8): 15.76 vs 154.5 µs → **9.8× speedup**. (Pre-target-cpu was 5.7× at LANES=8; AVX-512 + FMA + d-vectorization compound.)
 
-`fused_keeper_round` is now **70% of the pipeline** (up from 67% pre-target-cpu) — `entry_actions` has shrunk so much that the keeper-round stage dominates 2.4:1. To move the e2e number further, AVX-512 widening (state batch 8 → 16 via `wide::f32x16`) is the obvious next lever: the keeper-round Pass 1 is FMA-throughput-bound on Zen 5's full-512-bit datapath, so a 2× wide pipeline plausibly halves Pass 1's contribution. The handoff specifically called out multi-accumulator unrolling as a *don't-do* (regressed -7% in testing — Zen 5's OoO already overlaps cross-row accumulator chains via the renamer); widening avoids that pitfall.
+R6.5 bucket fast-bucket: 2.76 µs vs both-buckets-mixed 2.98 µs — **1.08× saving on the fast bucket alone** at LANES=16 (was 1.14× at LANES=8 — the DCE'd yahtzee-bonus blend chain is a smaller relative share of a smaller phase). The cumulative impact across heavy levels is still meaningful because ~52-95% of states hit the fast bucket.
+
+End-to-end pipeline: R0 dense GEMVs ≈ 162 µs → R0 + sparse fused ≈ 25 µs → R2 ≈ 13 µs → R4 ≈ 11 µs → R5 ≈ 7.8 µs → R7 (= R5 + R6.5) ≈ 7.45 µs → **R8 (16-state batch) ≈ 9.18 µs per 16-state batch = 0.57 µs per state**. Per-state pipeline reduction from the dense baseline: R0 ≈ 20.3 µs/state → R8 = 0.57 µs/state → **35.6× per-state pipeline reduction**.
+
+`fused_keeper_round` is now **67% of the pipeline** (down from 70% post-R7) — `entry_actions_per_count` shrunk less than `fused_keeper_round` under the widening, so the pipeline rebalanced slightly back toward parity. AVX-512 widening was the predicted next lever and delivered as expected.
 
 ### What this says about the *next* round of optimizations
 
-The pipeline is now ~29% `entry_actions_per_count`, ~70% `fused_keeper_round`, ~1% `final_dot`. **`fused_keeper_round` is the bottleneck and AVX-512 widening is the next big lever.**
+The pipeline is now ~32% `entry_actions_per_count`, ~67% `fused_keeper_round`, ~1% `final_dot`. **`fused_keeper_round` is still the bottleneck.**
 
-- **AVX-512 via `wide::f32x16`.** `wide` 1.3.0 ships `f32x16` and `i32x16` that lower to native `__m512` ops + `fused_mul_add_m512` when `target_feature="avx512f","fma"` are set (both already on via `.cargo/config.toml target-cpu=native` on Zen 5). The earlier handoff predicted "below 70 ms probably needs AVX-512 hardware or a different problem decomposition" — we have the hardware *and* the type. Estimated 30–50% on `phase_fused_keeper_round` (FMA-throughput-bound), less on `phase_entry_actions_per_count` (which is gather-bound and gathers don't scale with SIMD width on Zen 5). E2e estimate: ~25% off the 101 ms wall, landing in the **70–80 ms range**.
-- **Cache locality is *not* the bottleneck.** Cachegrind on the current build shows D1 miss rate 0.1%, LLd 0.0%. The handoff between R6.5 and R7 predicted a state-encoding restructure (~20–40% e2e) based on action CHANCE's 2 MiB child-idx offset — that diagnostic was wrong, because consecutive states in a batch share `entries` so the 8 gather addresses cluster within 128 idx of each other (~1 cache line), and consecutive batches share most cache lines too. Don't re-attempt encoding restructure unless a future profile actually shows a high miss rate.
-- **Parallel scaling is excellent up to physical core count.** Sweet spot is 8–12 threads. SMT contributes negative on heavy levels (16T is reliably worse than 12T). R7 didn't change scaling characteristics — BFS is now small enough that its parallel-scaling profile barely affects the e2e curve.
-- **Don't-do list from the R6.5→R7 handoff.** Re-iterating for the next session: don't multi-acc on `phase_fused_keeper_round` (regressed -7%; Zen 5's renamer already overlaps cross-row chains); don't use `mul_add` explicitly for FMA fusion on serial accumulators (the 4-cycle FMA dep chain loses to 3-cycle add-only on Zen 5); don't bucket-sort on `upper_complete` (fires <2% of states at heavy levels, can't amortize bucket-sort overhead).
+- **What's still on the table for `fused_keeper_round`.** Pass 1 (sparse dot product, 4368 nonzeros) is now 1.53 µs per batch at LANES=16 → 0.10 µs/state, or ~8 cycles per nonzero per state at 5 GHz. The naive ceiling is 1 cycle/nz on the FMA-throughput side, and we're at 8× over that — but the cycles include the CSR walk's scalar bookkeeping (row_cols index loads, splat broadcasts, sum reduction), not just the FMA. Pass 2 (scatter-max RMW into out_dice) is the other 1.53 µs per batch, dominated by load-modify-store latency on `out_dice[d]` which AVX-512 doesn't help (each store still takes a port). The remaining sub-leverage levers: explicit prefetch on `in_dice[col_idx[i+N]]` ahead of N=4 iterations (might pull L2 → L1 just in time), or restructuring Pass 2 to scatter into a temporary first then merge. Neither obviously big.
+- **`entry_actions_per_count`** at 2.98 µs / batch = 0.19 µs/state has structural floor in the scalar gather count: 304 gathers per batch for the slow arm, ~48 for the fast arm, can't easily be reduced further without state-space restructuring. AVX-512 won't help the gather throughput specifically (gather ports are width-invariant on Zen 5). Cache miss rate is still 0.1% per cachegrind.
+- **State-space restructuring revisited.** With per-state work now at 0.57 µs and 67k batches × 0.57 µs = 38 ms theoretical floor for 16 threads of perfectly-saturated compute, the gap to current 60 ms compute_level is ~1.6× — much tighter than the 2.4× we had at R5. State encoding would only help if it shrank either gather count or the entry_actions_table scratch (105 KiB pre-R8, now 210 KiB at LANES=16 — but still L2-resident per thread). The earlier hypothesis "different bijection cuts cold-cache penalty" was refuted by cachegrind showing D1 = 0.1%; what *might* help instead is a more compact per-batch scratch layout that fits more of the table in L1.
+- **Parallel scaling is excellent up to physical core count.** Sweet spot is 12 threads (95 → 89 ms on the f32x8 path; R8 hasn't been measured at all thread counts yet). SMT contributes negative on heavy levels (16T regresses).
+- **Don't-do list.** Carried forward: don't multi-acc on `phase_fused_keeper_round` (regressed -7% at LANES=8; Zen 5's renamer already overlaps cross-row chains, and at LANES=16 the renamer has 32 ZMM registers to play with); don't use `mul_add` explicitly to fuse mul+add into FMA on serial accumulators (4-cycle FMA dep chain loses to 3-cycle add-only); don't bucket-sort on `upper_complete` (predicate fires <2% of states); don't re-attempt state-encoding restructure for cache locality (refuted by cachegrind).
 
 ### Translating phase numbers to end-to-end
 
-R7 cache-warm pipeline ≈ 7.45 µs/batch. Per-level `compute_level` total is 75 ms across 16 threads; 67,056 batches × 7.45 µs / 16 threads = **31 ms theoretical floor**. The 2.4× gap (31 → 75 ms) is the cold-cache penalty (similar ratio to R5): production batches see different states with cold child_idx values. Cache-warm benches load the same 8 states many times and never miss after the first iteration; cache-cold production refills L1 per batch.
+R8 cache-warm pipeline ≈ 9.18 µs/16-state-batch = 0.57 µs/state. Per-level `compute_level` total is 60 ms across 16 threads; 67,056 states × 0.57 µs / 16 threads = **2.4 ms theoretical floor per thread** = 38 ms wall... but that assumes per-thread saturation and zero rayon overhead. The 1.58× gap (38 → 60 ms) is partly the cold-cache penalty (cache-warm phase benches don't see fresh state_scores per batch), partly per-batch setup (state SoA hoists, mask precomputes, scratch zero-init).
 
-Plus the 29 ms BFS = 104 ms total, which matches the criterion wall (101 ms ±2). Standalone `time_build` is 107-110 ms because fresh process invocations don't get criterion's cache warmup, and the BFS bitmap allocation also doesn't amortize across iterations.
+Plus the 29 ms BFS = 89 ms total. Criterion measures the build at 78.9 ms ±0.2 — slightly under the trace-sum estimate because criterion warms up across iterations, amortizing some of the BFS bitmap allocation cost.
 
-The remaining headroom on this hardware: at 12 threads × 7.45 µs / batch × 67k batches = 41 ms theoretical floor, vs current 75 ms compute_level + 29 ms BFS = 104 ms. AVX-512 widening would halve `fused_keeper_round` (the FMA-throughput-bound stage) → pipeline drops from 7.45 to ~4.85 µs → compute_level drops from 75 to ~49 ms → wall drops to ~78 ms. Below that, either a fundamentally different DP / problem decomposition, or explicit prefetch on the surviving cold-cache gathers.
+The remaining headroom on this hardware: theoretical floor of 38 ms compute_level + 29 ms BFS = 67 ms vs current 78.9 ms wall = 1.18× away. Closing the cold-cache gap further requires either explicit prefetch on the surviving gathers or a more compact working set. Below 67 ms probably needs a fundamentally different DP / problem decomposition (e.g., hierarchical state factorization, see the R6.5→R7 handoff notes).
 
 ---
 
@@ -241,7 +257,7 @@ Total nonzeros = **4,368** out of 462 × 252 = 116,424 → **3.75% density**, me
 
 A key invariant: `K2D[k, d] > 0 ⟺ k ⊆ d ⟺ DICE_TO_ALLOWED_KEEPERS[d, k] = 1`. Same predicate. So one CSR over K2D drives both ops in `compute_lanes` — the column indices of K2D row `k` are *exactly* the dice that the masked-max for that `k` needs to update. That equivalence is what `phase_fused_keeper_round` exploits: walk K2D by row, compute the sparse dot product `val`, and immediately scatter-max `val` into every `out_dice[d]` for `d` in the same column-index list. The dense `second_keepers` 462-wide intermediate is never materialized.
 
-The realized speedup (post-target-cpu=native: 76.8 / 2.60 = ~30×; pre-target-cpu was 26.3×) tracked the density-ratio prediction (26.7×) within noise — the rare case where a perf calculation cashes out at the theoretical limit, with AVX-512 / FMA helping the dense baseline more than the sparse path.
+The realized speedup (post-R8 LANES=16: 77.1 / 3.06 = ~25×; post-R7 LANES=8: ~30×; pre-target-cpu was 26.3×) tracks the density-ratio prediction (26.7×) within noise — the rare case where a perf calculation cashes out at the theoretical limit. The dense baseline ((g)emv + masked_max) scales perfectly with SIMD width (-50% per state going 8→16 lanes), while the sparse fused path has scalar bookkeeping and scatter-max load-modify-store overhead that doesn't widen — so the dense baseline closed some of the gap with R8 widening, dropping the ratio from 30× back to 25×.
 
 ---
 
