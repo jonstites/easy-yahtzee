@@ -221,12 +221,13 @@ fn bench_build_backends(c: &mut Criterion) {
 fn bench_simd_batch_phases(c: &mut Criterion) {
     use wide::f32x8;
     use yahtzee_core::linalg::simd_batch::{
-        phase_entry_actions_fuse, phase_final_dot, phase_fused_keeper_round, phase_gemv,
-        phase_masked_max,
+        phase_entry_actions_fuse, phase_entry_actions_precomputed, phase_final_dot,
+        phase_fused_keeper_round, phase_gemv, phase_masked_max,
     };
 
     const N_DICE: usize = 252;
     const N_KEEPERS: usize = 462;
+    const N_ACTIONS: usize = 13;
 
     let scores = &*SHARED_SCORES;
     let state_scores = scores.state_scores_slice();
@@ -254,6 +255,24 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("simd_batch_phases");
 
+    // Production path: precomputed (score + state_scores[child]) table fed
+    // into a branchless SIMD max-reduce. Pre-allocate the table outside the
+    // bench loop so the timing is just compute, not allocation.
+    group.bench_function("entry_actions_precomputed", |b| {
+        let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
+        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        b.iter(|| {
+            phase_entry_actions_precomputed(
+                black_box(&states),
+                black_box(state_scores),
+                black_box(&mut table),
+                black_box(&mut out),
+            );
+        })
+    });
+
+    // Bench-only baseline: same semantics, build+reduce fused inline. Kept
+    // so the precompute win shows up as a delta in the bench output.
     group.bench_function("entry_actions_fuse", |b| {
         let mut out = vec![f32x8::splat(0.0); N_DICE];
         b.iter(|| {

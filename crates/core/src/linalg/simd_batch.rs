@@ -116,12 +116,19 @@ static SPARSE_K2D: LazyLock<SparseK2D> = LazyLock::new(|| {
 /// rayon's `map_init` so the working set isn't reallocated 27k times per
 /// heavy DP level.
 ///
-/// Note: since [`phase_fused_keeper_round`] computes `second_dice` directly
-/// from `third_dice` (and `first_dice` directly from `second_dice`) without
-/// ever materializing the intermediate `second_keepers` / `first_keepers`
-/// 462-wide vectors, only three 252-wide buffers remain. Working set is now
-/// ~24 KiB per thread (down from ~50 KiB).
+/// `entry_actions_table` is the precomputed `(score + state_scores[child])`
+/// table consumed by [`phase_entry_actions_precomputed`]. Layout is
+/// action-major, dice-inner: cell `(a, d)` is at index `a * N_DICE + d`.
+/// Each `f32x8` cell holds the resolved values across all 8 lanes (one per
+/// state). 13 × 252 × 32 = 105 KiB per thread; fits in L2 (1 MiB on Zen 5).
+///
+/// The other three 252-wide buffers carry the dice-axis intermediates
+/// between pipeline phases. The 462-wide keeper-axis intermediates were
+/// eliminated by [`phase_fused_keeper_round`].
 struct Scratch {
+    /// Precomputed `score + state_scores[child]` table for the entry-actions
+    /// phase. Layout `[f32x8; N_ACTIONS * N_DICE]`, indexed `a * N_DICE + d`.
+    entry_actions_table: Vec<f32x8>,
     third_dice: Vec<f32x8>,  // length N_DICE
     second_dice: Vec<f32x8>, // length N_DICE
     first_dice: Vec<f32x8>,  // length N_DICE
@@ -130,6 +137,7 @@ struct Scratch {
 impl Scratch {
     fn new() -> Self {
         Self {
+            entry_actions_table: vec![f32x8::splat(0.0); N_ACTIONS * N_DICE],
             third_dice: vec![f32x8::splat(0.0); N_DICE],
             second_dice: vec![f32x8::splat(0.0); N_DICE],
             first_dice: vec![f32x8::splat(0.0); N_DICE],
@@ -176,26 +184,34 @@ impl BuildBackend for SimdBatchBuildBackend {
 /// The 8-wide pipeline. Returns the EV of each of the 8 input states.
 ///
 /// Each `f32x8` lane is one of the 8 input states. The matrices and masks
-/// are broadcast scalar-into-lanes via `f32x8::splat`. Steps 1+2 fuse the
-/// per-state `entry_actions` lookup with the max-over-actions reduce —
-/// never materializes the 13 × 252 × 8 intermediate, streams into
-/// `third_dice` directly. Steps 3+4 (and 5+6) fuse via
+/// are broadcast scalar-into-lanes via `f32x8::splat`. Steps 1+2 use a
+/// precomputed `(score + state_scores[child])` table built in a loop nest
+/// that preserves locality on the random-gather of `state_scores[child]`
+/// (see [`phase_entry_actions_precomputed`]); the table feeds a branchless
+/// SIMD max-reduce. Steps 3+4 (and 5+6) fuse via
 /// [`phase_fused_keeper_round`]: sparse CSR over `K2D` lets each row's
 /// dot product be computed and immediately scatter-maxed into `out_dice`
 /// without ever materializing the 462-wide `second_keepers` /
 /// `first_keepers` intermediate.
 ///
-/// Phases are factored into [`phase_entry_actions_fuse`],
+/// Phases are factored into [`phase_entry_actions_precomputed`],
 /// [`phase_fused_keeper_round`], and [`phase_final_dot`] (plus the dense
-/// [`phase_gemv`] / [`phase_masked_max`] kept around as the non-fused
-/// baseline for the criterion `simd_batch_phases` group).
+/// [`phase_gemv`] / [`phase_masked_max`] and the older inline-loop
+/// [`phase_entry_actions_fuse`] kept around as bench-only baselines for the
+/// criterion `simd_batch_phases` group).
 fn compute_lanes(
     states: &[State; LANES],
     state_scores: &[f32],
     scratch: &mut Scratch,
 ) -> [f32; LANES] {
-    // Steps 1+2: per-state entry_actions × max-over-actions, into third_dice.
-    phase_entry_actions_fuse(states, state_scores, &mut scratch.third_dice);
+    // Steps 1+2: precompute (score + state_scores[child]) table per (s, a, d),
+    // then max-reduce over actions per dice into third_dice.
+    phase_entry_actions_precomputed(
+        states,
+        state_scores,
+        &mut scratch.entry_actions_table,
+        &mut scratch.third_dice,
+    );
 
     // Steps 3+4 fused: second_dice[d] = max over k where d ⊇ k of
     //   sum over d' in supp(K2D[k, ·]) of K2D[k, d'] * third_dice[d'].
@@ -210,16 +226,102 @@ fn compute_lanes(
     phase_final_dot(&scratch.first_dice)
 }
 
-/// Steps 1+2 of the per-level pipeline: fill `out_third_dice[d]` with the
-/// max over actions of `entry_score(action, d) + state_scores[child(d, action)]`,
-/// where each `f32x8` lane corresponds to one of the 8 input states.
+/// Production path for steps 1+2: precompute a per-batch table of
+/// `score + state_scores[child]` for every `(state, action, dice)` triple,
+/// then SIMD-reduce-max over actions to fill `out_third_dice[d]`.
+///
+/// **Why precompute.** The phase has two kinds of work: (a) per-(s, a, d)
+/// scalar work to compute `(score, child_idx)` and gather `state_scores[child_idx]`
+/// (random access through ~4 MiB), and (b) a 13-way max reduction across
+/// actions to produce `out_third_dice[d]`. The naive interleaved loop nest
+/// (see [`phase_entry_actions_fuse`]) does both inside one `for d` body,
+/// which fights the cache prefetcher: each d iteration touches 8 × 13 = 104
+/// random `state_scores` cells.
+///
+/// Splitting the work into Phase A (build table, locality-preserving nest)
+/// and Phase B (branchless SIMD max-reduce) lets each phase have a clean
+/// memory access pattern. The total compute is the same, but Phase A's
+/// inner d-loop now sees *highly localized* `state_scores[child]` reads:
+///
+/// - **Non-upper actions** (7 of 13): for fixed `(s, a)`, `child` is
+///   constant across all d (the child state's `entries` and
+///   `upper_score_remaining` don't change with the dice). Same address read
+///   252 times → guaranteed L1 hit after the first.
+/// - **Upper actions** (6 of 13): `child.upper_score_remaining` varies with
+///   the score on `d` (range 0..5k for face k). 252 reads land within a
+///   ~30-value band of the parent's `idx` → small working set, prefetcher
+///   catches it easily.
+///
+/// **Phase B's win.** Pure branchless SIMD: 13 `fast_max` ops per d on
+/// pre-resolved `f32x8` cells. No scalar work, no random gather, no
+/// validity branch. The compiler emits the optimal reduce-max pattern.
+///
+/// **Layout.** Action-major, dice-inner: cell `(a, d)` lives at table index
+/// `a * N_DICE + d`. Phase A writes one lane at a time via `as_mut_array()`
+/// (stride-32 across 252 cells per (s, a)); Phase B reads whole `f32x8`
+/// cells. 13 × 252 × 32 = 105 KiB scratch per thread.
+///
+/// **Invalid actions.** Phase A unconditionally writes every `(s, a, d)`
+/// cell — either the resolved value (valid) or 0.0 (invalid) — so no
+/// pre-zero is needed and Phase B doesn't need a validity mask. The 0.0
+/// floor is correct because EVs are non-negative.
+///
+/// Exposed as `#[doc(hidden)] pub` so the criterion `simd_batch_phases`
+/// group can call it directly. Not part of the stable API.
+#[doc(hidden)]
+#[inline]
+pub fn phase_entry_actions_precomputed(
+    states: &[State; LANES],
+    state_scores: &[f32],
+    table: &mut [f32x8],
+    out_third_dice: &mut [f32x8],
+) {
+    debug_assert_eq!(table.len(), N_ACTIONS * N_DICE);
+    debug_assert_eq!(out_third_dice.len(), N_DICE);
+
+    // Phase A: build table. Lane-by-lane fill in a (s outer, a middle, d
+    // inner) nest so state_scores[child_idx] reads stay localized for fixed
+    // (s, a). The validity branch hoists out of the d-loop.
+    for s in 0..LANES {
+        let state = states[s];
+        for action_idx in 0..N_ACTIONS {
+            let action = ENTRY_ACTIONS[action_idx];
+            let row = &mut table[action_idx * N_DICE..(action_idx + 1) * N_DICE];
+            if state.is_valid_action(action) {
+                for d in 0..N_DICE {
+                    let (score, child) = state.score_and_child(action, d as u8);
+                    let child_idx: usize = child.into();
+                    row[d].as_mut_array()[s] = score + state_scores[child_idx];
+                }
+            } else {
+                for d in 0..N_DICE {
+                    row[d].as_mut_array()[s] = 0.0;
+                }
+            }
+        }
+    }
+
+    // Phase B: max-reduce. For each d, max over actions of table[a][d].
+    // Pure SIMD — no scalar work, no branches.
+    for d in 0..N_DICE {
+        let mut acc = table[d]; // a = 0
+        for action_idx in 1..N_ACTIONS {
+            acc = acc.fast_max(table[action_idx * N_DICE + d]);
+        }
+        out_third_dice[d] = acc;
+    }
+}
+
+/// Bench-only baseline for steps 1+2: same semantics as
+/// [`phase_entry_actions_precomputed`] but with the build and reduce fused
+/// inside a single `for d` loop. Kept so the criterion
+/// `simd_batch_phases` group can measure the precompute win as a delta.
 ///
 /// Per-state work (`is_valid_action`, `score_and_child`, `state_scores[child_idx]`)
 /// is scalar — the lane axis is purely outer-loop SIMD over states. Invalid
-/// actions contribute 0.0 to their lane, matching `entry_actions_array`'s
-/// semantics; the max reduction picks them up only if every action is
-/// invalid (terminal state), which can't happen in `compute_level` since
-/// `set_scores` never hits level 13.
+/// actions contribute 0.0 to their lane; the max reduction picks them up
+/// only if every action is invalid (terminal state), which can't happen in
+/// `compute_level` since `set_scores` never hits level 13.
 ///
 /// Exposed as `#[doc(hidden)] pub` so the criterion `simd_batch_phases`
 /// group can call it directly. Not part of the stable API.

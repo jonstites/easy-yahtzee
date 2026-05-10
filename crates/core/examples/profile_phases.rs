@@ -41,6 +41,7 @@ fn main() {
 
     const N_DICE: usize = 252;
     const N_KEEPERS: usize = 462;
+    const N_ACTIONS: usize = 13;
     const NUM_STATES: usize = 1 << 20; // matches yahtzee_core's NUM_STATES (private)
 
     // Synthetic state_scores. Values irrelevant — what matters is that
@@ -78,16 +79,26 @@ fn main() {
     // to 30–50 s under callgrind. entry_actions_fuse is ~30× slower per
     // call than fused_keeper_round, so it gets fewer iters.
     let n_entry = iters("ITERS_ENTRY_ACTIONS", 2_000);
+    let n_precomputed = iters("ITERS_ENTRY_ACTIONS_PRECOMPUTED", 2_000);
     let n_fused = iters("ITERS_FUSED", 60_000);
     let n_gemv = iters("ITERS_DENSE_GEMV", 5_000);
     let n_max = iters("ITERS_DENSE_MASKED_MAX", 5_000);
 
     eprintln!(
-        "iters: entry_actions={n_entry} fused={n_fused} dense_gemv={n_gemv} \
-         dense_masked_max={n_max}"
+        "iters: entry_actions={n_entry} entry_actions_precomputed={n_precomputed} \
+         fused={n_fused} dense_gemv={n_gemv} dense_masked_max={n_max}"
     );
 
     bench_entry_actions(n_entry, &states, &state_scores, &mut third_dice);
+    let mut entry_actions_table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
+    bench_entry_actions_precomputed(
+        n_precomputed,
+        &states,
+        &state_scores,
+        &mut entry_actions_table,
+        &mut third_dice,
+    );
+    black_box(&entry_actions_table);
     bench_fused(n_fused, &mut second_dice, &third_dice);
     bench_dense_gemv(n_gemv, &mut second_keepers, &third_dice);
     bench_dense_masked_max(n_max, &mut second_dice, &second_keepers);
@@ -111,6 +122,27 @@ fn bench_entry_actions(
     use yahtzee_core::linalg::simd_batch::phase_entry_actions_fuse;
     for _ in 0..iters {
         phase_entry_actions_fuse(black_box(states), black_box(state_scores), black_box(out));
+    }
+}
+
+#[cfg(feature = "simd")]
+#[inline(never)]
+fn bench_entry_actions_precomputed(
+    iters: usize,
+    states: &[yahtzee_core::State; 8],
+    state_scores: &[f32],
+    table: &mut [wide::f32x8],
+    out: &mut [wide::f32x8],
+) {
+    use std::hint::black_box;
+    use yahtzee_core::linalg::simd_batch::phase_entry_actions_precomputed;
+    for _ in 0..iters {
+        phase_entry_actions_precomputed(
+            black_box(states),
+            black_box(state_scores),
+            black_box(table),
+            black_box(out),
+        );
     }
 }
 
