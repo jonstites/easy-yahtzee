@@ -221,7 +221,8 @@ fn bench_build_backends(c: &mut Criterion) {
 fn bench_simd_batch_phases(c: &mut Criterion) {
     use wide::f32x8;
     use yahtzee_core::linalg::simd_batch::{
-        phase_entry_actions_fuse, phase_final_dot, phase_gemv, phase_masked_max,
+        phase_entry_actions_fuse, phase_final_dot, phase_fused_keeper_round, phase_gemv,
+        phase_masked_max,
     };
 
     const N_DICE: usize = 252;
@@ -275,6 +276,15 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
         let mut out = vec![f32x8::splat(0.0); N_DICE];
         b.iter(|| {
             phase_masked_max(black_box(&mut out), black_box(&second_keepers));
+        })
+    });
+
+    // Sparse fused gemv+masked_max: drops in for the gemv→masked_max pair
+    // above. Compare time vs (gemv + masked_max) to see the sparse fusion win.
+    group.bench_function("fused_keeper_round", |b| {
+        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        b.iter(|| {
+            phase_fused_keeper_round(black_box(&mut out), black_box(&third_dice));
         })
     });
 
