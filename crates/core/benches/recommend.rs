@@ -221,8 +221,8 @@ fn bench_build_backends(c: &mut Criterion) {
 fn bench_simd_batch_phases(c: &mut Criterion) {
     use wide::f32x8;
     use yahtzee_core::linalg::simd_batch::{
-        phase_entry_actions_fuse, phase_entry_actions_precomputed, phase_final_dot,
-        phase_fused_keeper_round, phase_gemv, phase_masked_max,
+        phase_entry_actions_fuse, phase_entry_actions_precomputed, phase_entry_actions_vectorized,
+        phase_final_dot, phase_fused_keeper_round, phase_gemv, phase_masked_max,
     };
 
     const N_DICE: usize = 252;
@@ -255,9 +255,26 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("simd_batch_phases");
 
-    // Production path: precomputed (score + state_scores[child]) table fed
-    // into a branchless SIMD max-reduce. Pre-allocate the table outside the
-    // bench loop so the timing is just compute, not allocation.
+    // Production path: vectorized score-and-child across 8 lanes, building
+    // the precomputed (score + state_scores[child]) table that feeds a
+    // branchless SIMD max-reduce. Pre-allocate the table outside the bench
+    // loop so the timing is just compute, not allocation.
+    group.bench_function("entry_actions_vectorized", |b| {
+        let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
+        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        b.iter(|| {
+            phase_entry_actions_vectorized(
+                black_box(&states),
+                black_box(state_scores),
+                black_box(&mut table),
+                black_box(&mut out),
+            );
+        })
+    });
+
+    // Bench-only baseline: same precompute layout as vectorized, but the
+    // per-lane work is scalar (one lane at a time). Captures the
+    // vectorization win as a delta against entry_actions_vectorized.
     group.bench_function("entry_actions_precomputed", |b| {
         let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
         let mut out = vec![f32x8::splat(0.0); N_DICE];

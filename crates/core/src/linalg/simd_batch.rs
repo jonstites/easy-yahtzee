@@ -1,6 +1,8 @@
 //! Outer-loop SIMD: vectorize the per-state EV pipeline *across* states
 //! rather than within a single state's masked-max, plus a sparse-fused
-//! keeper round that merges each GEMV→masked_max pair into one CSR walk.
+//! keeper round that merges each GEMV→masked_max pair into one CSR walk,
+//! plus a vectorized `score_and_child` that computes all 8 lanes' scores
+//! and child indices in one SIMD pass per `(action, dice)` cell.
 //!
 //! [`SimdBackend`] (in the parent module) is the per-state intra-state
 //! vectorizer: `wide::f32x8` lanes are the 8 keepers being max-reduced for
@@ -39,13 +41,14 @@
 use std::convert::Infallible;
 use std::sync::LazyLock;
 
+use bytemuck::cast;
 use rayon::prelude::*;
-use wide::f32x8;
+use wide::{f32x8, i32x8, CmpEq, CmpGt};
 
 use super::{BuildBackend, SimdBackend};
 use crate::{
-    state_value_with, DICE_TO_ALLOWED_KEEPERS, ENTRY_ACTIONS, KEEPERS_TO_DICE_PROBABILITIES,
-    NUM_DICE_COMBINATIONS, NUM_KEEPERS, State,
+    state_value_with, DICE_TO_ALLOWED_KEEPERS, ENTRY_ACTIONS, EntryAction,
+    KEEPERS_TO_DICE_PROBABILITIES, NUM_DICE_COMBINATIONS, NUM_KEEPERS, State,
 };
 
 const LANES: usize = 8;
@@ -183,30 +186,33 @@ impl BuildBackend for SimdBatchBuildBackend {
 
 /// The 8-wide pipeline. Returns the EV of each of the 8 input states.
 ///
-/// Each `f32x8` lane is one of the 8 input states. The matrices and masks
-/// are broadcast scalar-into-lanes via `f32x8::splat`. Steps 1+2 use a
-/// precomputed `(score + state_scores[child])` table built in a loop nest
-/// that preserves locality on the random-gather of `state_scores[child]`
-/// (see [`phase_entry_actions_precomputed`]); the table feeds a branchless
-/// SIMD max-reduce. Steps 3+4 (and 5+6) fuse via
-/// [`phase_fused_keeper_round`]: sparse CSR over `K2D` lets each row's
-/// dot product be computed and immediately scatter-maxed into `out_dice`
-/// without ever materializing the 462-wide `second_keepers` /
+/// Each `f32x8` lane is one of the 8 input states. Steps 1+2 use a
+/// precomputed `(score + state_scores[child])` table whose cells are
+/// computed by [`phase_entry_actions_vectorized`] — all 8 lanes are
+/// computed in parallel via SIMD per `(action, dice)` cell. The table
+/// then feeds a branchless SIMD max-reduce over actions. Steps 3+4 (and
+/// 5+6) fuse via [`phase_fused_keeper_round`]: sparse CSR over `K2D` lets
+/// each row's dot product be computed and immediately scatter-maxed into
+/// `out_dice` without ever materializing the 462-wide `second_keepers` /
 /// `first_keepers` intermediate.
 ///
-/// Phases are factored into [`phase_entry_actions_precomputed`],
-/// [`phase_fused_keeper_round`], and [`phase_final_dot`] (plus the dense
-/// [`phase_gemv`] / [`phase_masked_max`] and the older inline-loop
-/// [`phase_entry_actions_fuse`] kept around as bench-only baselines for the
-/// criterion `simd_batch_phases` group).
+/// Phases are factored into [`phase_entry_actions_vectorized`],
+/// [`phase_fused_keeper_round`], and [`phase_final_dot`]. The older
+/// scalar-per-lane variant [`phase_entry_actions_precomputed`] (Round 1)
+/// and the inline build+reduce variant [`phase_entry_actions_fuse`]
+/// (Round 0) are kept as bench-only baselines for the criterion
+/// `simd_batch_phases` group, so the vectorization and precompute wins
+/// stay measurable on every CI run.
 fn compute_lanes(
     states: &[State; LANES],
     state_scores: &[f32],
     scratch: &mut Scratch,
 ) -> [f32; LANES] {
     // Steps 1+2: precompute (score + state_scores[child]) table per (s, a, d),
-    // then max-reduce over actions per dice into third_dice.
-    phase_entry_actions_precomputed(
+    // then max-reduce over actions per dice into third_dice. The vectorized
+    // path computes all 8 lanes in parallel via SIMD; see
+    // [`phase_entry_actions_vectorized`].
+    phase_entry_actions_vectorized(
         states,
         state_scores,
         &mut scratch.entry_actions_table,
@@ -226,9 +232,11 @@ fn compute_lanes(
     phase_final_dot(&scratch.first_dice)
 }
 
-/// Production path for steps 1+2: precompute a per-batch table of
-/// `score + state_scores[child]` for every `(state, action, dice)` triple,
-/// then SIMD-reduce-max over actions to fill `out_third_dice[d]`.
+/// Round 1 — bench-only baseline. Same precompute layout as
+/// [`phase_entry_actions_vectorized`] but the per-lane work is scalar
+/// (one lane at a time, locality-preserving `(s outer, a middle, d inner)`
+/// nest). Kept so the `simd_batch_phases` group can measure the
+/// vectorization win as a delta.
 ///
 /// **Why precompute.** The phase has two kinds of work: (a) per-(s, a, d)
 /// scalar work to compute `(score, child_idx)` and gather `state_scores[child_idx]`
@@ -305,6 +313,224 @@ pub fn phase_entry_actions_precomputed(
     // Pure SIMD — no scalar work, no branches.
     for d in 0..N_DICE {
         let mut acc = table[d]; // a = 0
+        for action_idx in 1..N_ACTIONS {
+            acc = acc.fast_max(table[action_idx * N_DICE + d]);
+        }
+        out_third_dice[d] = acc;
+    }
+}
+
+/// Bit values from `EntryAction` (bitflags<u16>) that the vectorized phase
+/// uses directly. Kept as `const` so they fold into the SIMD splats at
+/// compile time.
+const UPPER_ACTIONS_MASK: i32 = (EntryAction::ONE.bits()
+    | EntryAction::TWO.bits()
+    | EntryAction::THREE.bits()
+    | EntryAction::FOUR.bits()
+    | EntryAction::FIVE.bits()
+    | EntryAction::SIX.bits()) as i32;
+const YAHTZEE_BIT: i32 = EntryAction::YAHTZEE.bits() as i32;
+
+/// Round 2 — vectorized variant of [`phase_entry_actions_precomputed`].
+///
+/// Same semantics: build a `[f32x8; N_ACTIONS * N_DICE]` table of
+/// `(score + state_scores[child]) * valid_mask` per `(action, dice)` cell,
+/// where each `f32x8` lane is one of the 8 input states. Then max-reduce
+/// over actions per dice into `out_third_dice`.
+///
+/// **Why vectorize.** Round 1's precomputed variant runs scalar
+/// `score_and_child` 26,208 times per batch (8 lanes × 13 actions × 252
+/// dice). The body has ~30 instructions of branchy state-level logic
+/// (upper bonus, Yahtzee bonus, joker rule); doing it scalar one lane at
+/// a time leaves ~6× IPC on the table at AVX2 width. This variant flips
+/// the loop nest to put the lane axis innermost — `(a outer, d middle,
+/// s inner-vectorized)` — and computes all 8 lanes' `(score, child_idx)`
+/// in one SIMD pass per `(action, dice)` cell.
+///
+/// **Hoisting.** Per-batch state-only quantities (`entries`, `upper`,
+/// `yahtzee_eligible`, `contains_yahtzee_box`, `upper_complete`) live in
+/// `i32x8` registers across the whole loop. Per-action quantities (action
+/// bits, joker score, `is_upper_action`, `is_yahtzee_action`, per-lane
+/// validity) hoist out of the d-loop. Only the `(a, d)` cell-specific
+/// `raw_score` and the `YAHTZEE_DICE[d]` flag are loaded per d, both
+/// once.
+///
+/// **Joker rule** (Yahtzee bonus categories take guaranteed 25/30/40 if
+/// the matching upper category was already filled when a Yahtzee is
+/// rolled): per-lane mask = `contains_yahtzee_box & entries_have_yahtzee_face`,
+/// only enabled when the action's `joker_lower_score` is `Some`. The mask
+/// `blend`s the joker constant in for matching lanes, leaves
+/// `raw_score` for the rest.
+///
+/// **Gather.** `state_scores[child_idx]` is still 8 scalar loads per cell
+/// — `wide` doesn't expose VGATHERDPS. The locality argument from Round 1
+/// still holds per lane: for fixed `(s, a)`, child_idx varies in a small
+/// band across d, so the L1 cache absorbs the gather even though the
+/// loads aren't a single SIMD instruction. Round 1 walked d innermost
+/// for fixed `(s, a)`; this variant walks d in the middle but the
+/// per-lane access pattern across consecutive d's is the same — child_idx
+/// for `(s, a, d)` and `(s, a, d+1)` differ by at most a small upper-score
+/// delta.
+///
+/// **Validity.** Per-lane `is_valid_action(a)` is precomputed at the top
+/// of the action loop as an `i32x8` bitmask. The final cell value is
+/// `total * valid_mask`, where `valid_mask` is 0.0 / 1.0 per lane (rather
+/// than `blend`-replacing with 0 — equivalent, lets us skip a separate
+/// `f32x8::ZERO` operand).
+#[doc(hidden)]
+#[inline]
+pub fn phase_entry_actions_vectorized(
+    states: &[State; LANES],
+    state_scores: &[f32],
+    table: &mut [f32x8],
+    out_third_dice: &mut [f32x8],
+) {
+    debug_assert_eq!(table.len(), N_ACTIONS * N_DICE);
+    debug_assert_eq!(out_third_dice.len(), N_DICE);
+
+    // Hoist per-batch state-only quantities into i32x8 SoA. Each lane is one
+    // input state; the lane stays put for the entire pipeline.
+    let entries_v = i32x8::new(std::array::from_fn(|s| states[s].entries.bits() as i32));
+    let upper_remaining_v =
+        i32x8::new(std::array::from_fn(|s| states[s].upper_score_remaining as i32));
+    let yahtzee_eligible_v = i32x8::new(std::array::from_fn(|s| {
+        if states[s].yahtzee_bonus_eligible {
+            1
+        } else {
+            0
+        }
+    }));
+    // upper_complete_mask: all-1s lanes where parent already had upper bonus
+    // (so we can't fire the +35 again).
+    let upper_complete_mask = upper_remaining_v.simd_eq(i32x8::splat(0));
+    // contains_yahtzee_mask: all-1s lanes where parent has the Yahtzee box
+    // already filled (gate for joker rule and for whether re-rolling a
+    // Yahtzee qualifies for the +100 bonus).
+    let contains_yahtzee_mask =
+        (entries_v & i32x8::splat(YAHTZEE_BIT)).simd_gt(i32x8::splat(0));
+    // yahtzee_eligible_mask: all-1s lanes where state.yahtzee_bonus_eligible
+    // is true (the +100 bonus precondition).
+    let yahtzee_eligible_mask = yahtzee_eligible_v.simd_gt(i32x8::splat(0));
+
+    let dice_and_entry_scores = &*crate::DICE_AND_ENTRY_SCORES;
+    let yahtzee_dice = &*crate::YAHTZEE_DICE;
+
+    for action_idx in 0..N_ACTIONS {
+        let action = ENTRY_ACTIONS[action_idx];
+        let action_bits = action.bits() as i32;
+        let is_upper_action = (action_bits & UPPER_ACTIONS_MASK) != 0;
+        let is_yahtzee_action = action == EntryAction::YAHTZEE;
+        let joker_score: Option<u8> = match action {
+            EntryAction::FULL_HOUSE => Some(25),
+            EntryAction::SMALL_STRAIGHT => Some(30),
+            EntryAction::LARGE_STRAIGHT => Some(40),
+            _ => None,
+        };
+
+        // Per-lane validity = !entries.contains(action) = ((entries & action) == 0).
+        // valid_mask is an f32x8 with 1.0 in valid lanes, 0.0 in invalid.
+        let valid_int_mask =
+            (entries_v & i32x8::splat(action_bits)).simd_eq(i32x8::splat(0));
+        let valid_mask_f: f32x8 =
+            cast::<i32x8, f32x8>(valid_int_mask).blend(f32x8::splat(1.0), f32x8::splat(0.0));
+
+        // entries with this action OR'd in (used for child_idx).
+        let entries_with_action_v = entries_v | i32x8::splat(action_bits);
+
+        let row = &mut table[action_idx * N_DICE..(action_idx + 1) * N_DICE];
+        let scores_row = &dice_and_entry_scores[action_idx];
+
+        for d in 0..N_DICE {
+            let raw_score_i = scores_row[d] as i32;
+            let raw_score_v = i32x8::splat(raw_score_i);
+            let raw_score_f = f32x8::splat(raw_score_i as f32);
+
+            let yahtzee_face_opt = yahtzee_dice[d];
+            let yahtzee_face_bits =
+                yahtzee_face_opt.map(|f| f.bits() as i32).unwrap_or(0);
+            let dice_is_yahtzee = yahtzee_face_opt.is_some();
+
+            // child.upper_score_remaining = saturating_sub(parent_upper, raw_score) for upper
+            // actions, unchanged otherwise. (raw_score - parent_upper) clamps via .max(0).
+            let new_upper_v = if is_upper_action {
+                (upper_remaining_v - raw_score_v).max(i32x8::splat(0))
+            } else {
+                upper_remaining_v
+            };
+
+            // child.yahtzee_bonus_eligible = parent.eligible | (action==YAHTZEE && dice_is_yahtzee).
+            // Only the second term is per-action-and-dice; first term is parent-only.
+            let new_yahtzee_eligible_v = if is_yahtzee_action && dice_is_yahtzee {
+                yahtzee_eligible_v | i32x8::splat(1)
+            } else {
+                yahtzee_eligible_v
+            };
+
+            // child_idx = (entries_with_action << 7) | (new_yahtzee_eligible << 6) | new_upper.
+            let child_idx_v: i32x8 = (entries_with_action_v << 7_u32)
+                | (new_yahtzee_eligible_v << 6_u32)
+                | new_upper_v;
+
+            // Scalar gather. wide doesn't expose VGATHERDPS, so we do 8 scalar
+            // loads. The 8 child_idx values are within a small band per lane
+            // for fixed (s, a) (child differs from parent only by upper or
+            // yahtzee-eligible bit), so the L1 absorbs them.
+            let idx_arr = child_idx_v.to_array();
+            let child_evs_f = f32x8::new([
+                state_scores[idx_arr[0] as usize],
+                state_scores[idx_arr[1] as usize],
+                state_scores[idx_arr[2] as usize],
+                state_scores[idx_arr[3] as usize],
+                state_scores[idx_arr[4] as usize],
+                state_scores[idx_arr[5] as usize],
+                state_scores[idx_arr[6] as usize],
+                state_scores[idx_arr[7] as usize],
+            ]);
+
+            // Joker rule: if action ∈ {FULL_HOUSE, SMALL_STRAIGHT, LARGE_STRAIGHT}
+            // AND dice is a Yahtzee AND parent has Yahtzee box filled AND
+            // parent has the matching upper face filled, override raw_score with
+            // the joker constant (25/30/40). The first three conditions are
+            // action+d-only; the fourth is the per-lane bit test.
+            let normal_score_f = if let Some(joker_val) = joker_score
+                && dice_is_yahtzee
+            {
+                let entries_have_face_mask = (entries_v
+                    & i32x8::splat(yahtzee_face_bits))
+                    .simd_gt(i32x8::splat(0));
+                let joker_lane_mask = contains_yahtzee_mask & entries_have_face_mask;
+                cast::<i32x8, f32x8>(joker_lane_mask)
+                    .blend(f32x8::splat(joker_val as f32), raw_score_f)
+            } else {
+                raw_score_f
+            };
+
+            // Upper bonus: !parent.upper_complete && child.upper_complete.
+            // child.upper_complete = (new_upper == 0).
+            let new_upper_zero_mask = new_upper_v.simd_eq(i32x8::splat(0));
+            let upper_fires_mask = !upper_complete_mask & new_upper_zero_mask;
+            let upper_bonus_f = cast::<i32x8, f32x8>(upper_fires_mask)
+                .blend(f32x8::splat(35.0), f32x8::splat(0.0));
+
+            // Yahtzee bonus: dice is Yahtzee && parent.yahtzee_bonus_eligible.
+            let yahtzee_bonus_f = if dice_is_yahtzee {
+                cast::<i32x8, f32x8>(yahtzee_eligible_mask)
+                    .blend(f32x8::splat(100.0), f32x8::splat(0.0))
+            } else {
+                f32x8::splat(0.0)
+            };
+
+            let total_f = normal_score_f + upper_bonus_f + yahtzee_bonus_f + child_evs_f;
+
+            // Apply validity mask: 0.0 in invalid lanes (so they lose the
+            // max-reduce in Phase B), original total in valid lanes.
+            row[d] = total_f * valid_mask_f;
+        }
+    }
+
+    // Phase B: same as Round 1 — pure SIMD max-reduce over actions per dice.
+    for d in 0..N_DICE {
+        let mut acc = table[d];
         for action_idx in 1..N_ACTIONS {
             acc = acc.fast_max(table[action_idx * N_DICE + d]);
         }
