@@ -221,8 +221,9 @@ fn bench_build_backends(c: &mut Criterion) {
 fn bench_simd_batch_phases(c: &mut Criterion) {
     use wide::f32x8;
     use yahtzee_core::linalg::simd_batch::{
-        phase_entry_actions_fuse, phase_entry_actions_precomputed, phase_entry_actions_vectorized,
-        phase_final_dot, phase_fused_keeper_round, phase_gemv, phase_masked_max,
+        phase_entry_actions_fuse, phase_entry_actions_hoisted, phase_entry_actions_precomputed,
+        phase_entry_actions_vectorized, phase_final_dot, phase_fused_keeper_round, phase_gemv,
+        phase_masked_max,
     };
 
     const N_DICE: usize = 252;
@@ -255,10 +256,28 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("simd_batch_phases");
 
-    // Production path: vectorized score-and-child across 8 lanes, building
-    // the precomputed (score + state_scores[child]) table that feeds a
-    // branchless SIMD max-reduce. Pre-allocate the table outside the bench
-    // loop so the timing is just compute, not allocation.
+    // Production path: vectorized score-and-child across 8 lanes, with the
+    // d-independent gather hoisted out of the d-loop for the 6 actions
+    // (3oak/4oak/FH/SS/LS/chance) where `child` doesn't depend on dice.
+    // Pre-allocate the table outside the bench loop so the timing is just
+    // compute, not allocation.
+    group.bench_function("entry_actions_hoisted", |b| {
+        let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
+        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        b.iter(|| {
+            phase_entry_actions_hoisted(
+                black_box(&states),
+                black_box(state_scores),
+                black_box(&mut table),
+                black_box(&mut out),
+            );
+        })
+    });
+
+    // Bench-only baseline: same SIMD vectorization as `hoisted` but with the
+    // gather inside the d-loop for *all* 13 actions (including the 6 where
+    // child is d-independent and could have been hoisted). Captures the
+    // hoist win as a delta against `entry_actions_hoisted`.
     group.bench_function("entry_actions_vectorized", |b| {
         let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
         let mut out = vec![f32x8::splat(0.0); N_DICE];
