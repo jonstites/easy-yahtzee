@@ -260,17 +260,39 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("simd_batch_phases");
 
-    // Production path (R5): per-score-class precomputation in the slow arm.
-    // Upper actions get a `[f32x8; 6]` precomputed `state_scores[child]`
-    // table indexed by `count(face, d)`; YAHTZEE gets a 2-entry table
-    // indexed by `is_yahtzee(d)`. Slow-arm gathers per batch drop from
-    // ~14k (R4) to ~300 (R5). Pre-allocate the table outside the bench
-    // loop so the timing is just compute, not allocation.
+    // Production path (R5+R6.5) — slow bucket: 8 default-state copies, all
+    // with `yahtzee_bonus_eligible = false`, but we dispatch via
+    // `<false>` to keep the +100 yahtzee-bonus blend live (i.e. the "may
+    // be yahtzee-eligible" code path). Per-score-class precompute in the
+    // slow arm: upper actions get a `[f32x8; 6]` precomputed
+    // `state_scores[child]` table indexed by `count(face, d)`; YAHTZEE
+    // gets a 2-entry table indexed by `is_yahtzee(d)`. Slow-arm gathers
+    // per batch drop from ~14k (R4) to ~300 (R5).
     group.bench_function("entry_actions_per_count", |b| {
         let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
         let mut out = vec![f32x8::splat(0.0); N_DICE];
         b.iter(|| {
-            phase_entry_actions_per_count(
+            phase_entry_actions_per_count::<false>(
+                black_box(&states),
+                black_box(state_scores),
+                black_box(&mut table),
+                black_box(&mut out),
+            );
+        })
+    });
+
+    // Production path (R5+R6.5) — fast bucket: same 8 default-state copies
+    // (yahtzee_bonus_eligible = false) but dispatched via `<true>` so the
+    // const generic DCE's the entire +100 yahtzee-bonus blend chain at
+    // compile time. Bucket frequency at heavy levels is ~52-95% of states
+    // (no lane in the batch is yahtzee-eligible), so this is the more
+    // common code path in production. Per-batch saving over `<false>` is
+    // small but applies to the majority of work.
+    group.bench_function("entry_actions_per_count_not_yahtzee_elig", |b| {
+        let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
+        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        b.iter(|| {
+            phase_entry_actions_per_count::<true>(
                 black_box(&states),
                 black_box(state_scores),
                 black_box(&mut table),
