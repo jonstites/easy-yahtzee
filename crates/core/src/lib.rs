@@ -807,6 +807,7 @@ impl State {
         self.entries.bits().count_ones() as usize
     }
 
+    #[inline]
     pub fn child(self, action: EntryAction, dice_idx: u8) -> State {
         let mut child = self;
 
@@ -849,6 +850,7 @@ impl State {
         score
     }
 
+    #[inline]
     pub fn score_and_child(self, action_idx: EntryAction, dice_idx: u8) -> (f32, State) {
         let child = self.child(action_idx, dice_idx);
 
