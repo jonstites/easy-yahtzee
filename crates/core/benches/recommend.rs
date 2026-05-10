@@ -207,11 +207,15 @@ fn bench_build_backends(c: &mut Criterion) {
 }
 
 /// Phase-level micro-benches for the `SimdBatchBuildBackend` pipeline. Each
-/// 8-state batch in `compute_lanes` is four phases: the entry-actions fuse
-/// (steps 1+2), two GEMVs (steps 3 & 5), two masked-maxes (steps 4 & 6),
-/// and a final dot (step 7). This group times each in isolation against
-/// realistic pre-filled scratch, so we can attribute end-to-end CPU build
-/// cost to specific phases — and measure the win when sparsity / fusion
+/// 8-state batch in `compute_lanes` is three production phases now: the
+/// entry-actions per-count phase (steps 1+2 — `phase_entry_actions_per_count`),
+/// two sparse-fused keeper rounds (steps 3+4 / 5+6 — `phase_fused_keeper_round`),
+/// and a final dot (step 7 — `phase_final_dot`). The dense GEMV and
+/// masked-max stages from earlier rounds are kept as bench-only baselines so
+/// each fusion / sparsity / specialization win stays measurable as a delta
+/// on every CI run. This group times each in isolation against realistic
+/// pre-filled scratch, so we can attribute end-to-end CPU build cost to
+/// specific phases — and measure the win when sparsity / fusion / per-count
 /// optimizations land. Reproducer:
 ///
 ///     cargo bench -p yahtzee-core --features simd -- "simd_batch_phases"
@@ -221,9 +225,9 @@ fn bench_build_backends(c: &mut Criterion) {
 fn bench_simd_batch_phases(c: &mut Criterion) {
     use wide::f32x8;
     use yahtzee_core::linalg::simd_batch::{
-        phase_entry_actions_fuse, phase_entry_actions_hoisted, phase_entry_actions_precomputed,
-        phase_entry_actions_vectorized, phase_final_dot, phase_fused_keeper_round, phase_gemv,
-        phase_masked_max,
+        phase_entry_actions_fuse, phase_entry_actions_hoisted, phase_entry_actions_per_count,
+        phase_entry_actions_precomputed, phase_entry_actions_vectorized, phase_final_dot,
+        phase_fused_keeper_round, phase_gemv, phase_masked_max,
     };
 
     const N_DICE: usize = 252;
@@ -256,11 +260,28 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("simd_batch_phases");
 
-    // Production path: vectorized score-and-child across 8 lanes, with the
-    // d-independent gather hoisted out of the d-loop for the 6 actions
-    // (3oak/4oak/FH/SS/LS/chance) where `child` doesn't depend on dice.
-    // Pre-allocate the table outside the bench loop so the timing is just
-    // compute, not allocation.
+    // Production path (R5): per-score-class precomputation in the slow arm.
+    // Upper actions get a `[f32x8; 6]` precomputed `state_scores[child]`
+    // table indexed by `count(face, d)`; YAHTZEE gets a 2-entry table
+    // indexed by `is_yahtzee(d)`. Slow-arm gathers per batch drop from
+    // ~14k (R4) to ~300 (R5). Pre-allocate the table outside the bench
+    // loop so the timing is just compute, not allocation.
+    group.bench_function("entry_actions_per_count", |b| {
+        let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
+        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        b.iter(|| {
+            phase_entry_actions_per_count(
+                black_box(&states),
+                black_box(state_scores),
+                black_box(&mut table),
+                black_box(&mut out),
+            );
+        })
+    });
+
+    // Bench-only baseline (R4): same SIMD vectorization but the slow arm
+    // gathers per (state, action, dice) — no per-count precompute. Captures
+    // the R5 win as a delta against `entry_actions_per_count`.
     group.bench_function("entry_actions_hoisted", |b| {
         let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
         let mut out = vec![f32x8::splat(0.0); N_DICE];

@@ -115,6 +115,30 @@ static SPARSE_K2D: LazyLock<SparseK2D> = LazyLock::new(|| {
     }
 });
 
+/// `COUNT_LUT[face_idx][d]` = count of face value `face_idx + 1` in dice
+/// combination `d`, for `face_idx ∈ {0..=5}`. Equivalent to
+/// `DICE_AND_ENTRY_SCORES[face_idx][d] / (face_idx + 1)` — the upper-action
+/// scoring tables already encode this implicitly, but we materialize it as
+/// a `[[u8; 252]; 6]` (1,512 B, lives in L1) so the per-count precompute
+/// path can index it without integer division on the hot loop.
+///
+/// Each upper action `a` at face value `v = a.as_idx() + 1` produces only
+/// **6 distinct child states** per parent: `child.upper_score_remaining =
+/// max(parent_upper - v * count, 0)`, where `count ∈ {0..=5}`. So
+/// `state_scores[child_idx]` for action `a` and dice `d` reduces to one of
+/// 6 precomputed `f32x8` values, indexed by `COUNT_LUT[a.as_idx()][d]`.
+static COUNT_LUT: LazyLock<[[u8; N_DICE]; 6]> = LazyLock::new(|| {
+    let scores = &*crate::DICE_AND_ENTRY_SCORES;
+    let mut lut = [[0_u8; N_DICE]; 6];
+    for face_idx in 0..6 {
+        let face_value = (face_idx + 1) as u8;
+        for d in 0..N_DICE {
+            lut[face_idx][d] = scores[face_idx][d] / face_value;
+        }
+    }
+    lut
+});
+
 /// Per-thread scratch for the 8-wide pipeline. Reused across batches via
 /// rayon's `map_init` so the working set isn't reallocated 27k times per
 /// heavy DP level.
@@ -209,13 +233,16 @@ fn compute_lanes(
     scratch: &mut Scratch,
 ) -> [f32; LANES] {
     // Steps 1+2: precompute (score + state_scores[child]) table per (s, a, d),
-    // then max-reduce over actions per dice into third_dice. The vectorized
-    // path computes all 8 lanes in parallel via SIMD; the "hoisted" variant
-    // additionally splits the 13 actions by whether `child` depends on dice,
-    // hoisting the gather out of the d-loop for the 6 actions where it
-    // doesn't (3oak / 4oak / FH / SS / LS / chance). See
-    // [`phase_entry_actions_hoisted`].
-    phase_entry_actions_hoisted(
+    // then max-reduce over actions per dice into third_dice. Production path
+    // is [`phase_entry_actions_per_count`] (R5), which exploits the structural
+    // fact that upper actions produce only 6 distinct child states per
+    // (state, action) — indexed by `count(face, d)` — and YAHTZEE produces
+    // only 2 (toggled on `is_yahtzee(d)`). Slow-arm gathers drop from 14,112
+    // per batch (R4) to ~352. Earlier variants
+    // ([`phase_entry_actions_hoisted`], [`phase_entry_actions_vectorized`],
+    // [`phase_entry_actions_precomputed`], [`phase_entry_actions_fuse`]) are
+    // kept as bench-only baselines.
+    phase_entry_actions_per_count(
         states,
         state_scores,
         &mut scratch.entry_actions_table,
@@ -333,6 +360,294 @@ const UPPER_ACTIONS_MASK: i32 = (EntryAction::ONE.bits()
     | EntryAction::FIVE.bits()
     | EntryAction::SIX.bits()) as i32;
 const YAHTZEE_BIT: i32 = EntryAction::YAHTZEE.bits() as i32;
+
+/// Round 5 — per-score-class precomputation in the slow arm.
+///
+/// **The structural fact.** R4's slow arm (upper actions ONE..SIX +
+/// YAHTZEE) gathered `state_scores[child_idx]` once per `(state, action,
+/// dice)` cell because `child` was d-dependent. But the d-dependence has
+/// extremely fine structure:
+///
+/// - **Upper actions**: `child` only differs across d in
+///   `child.upper_score_remaining = max(parent_upper - face_value × count, 0)`.
+///   `count(face, d) ∈ {0..=5}`, so `child` takes **at most 6 distinct
+///   values per (state, upper_action)**, indexed by `count(face, d)`.
+/// - **YAHTZEE action**: `child.yahtzee_bonus_eligible` flips iff dice is a
+///   Yahtzee. **At most 2 distinct children per (state, YAHTZEE)**, indexed
+///   by `is_yahtzee(d)`.
+///
+/// **The win.** R4's slow arm did 7 actions × 252 d × 8 lanes = 14,112
+/// gathers per batch. With per-count precomputation: 6 upper × 6 counts ×
+/// 8 + 1 yahtzee × 2 × 8 = 304 slow-arm gathers — **46× reduction**. Plus
+/// the fast arm's 48 gathers, total batch gathers drop from 14,160 (R4) to
+/// ~352 (R5) — **40× reduction**.
+///
+/// **Layout.**
+///
+/// - **Upper arm** (6 actions, idx 0..6): for each action's face value `v`,
+///   precompute `child_evs_per_count[c]` for `c ∈ {0..=5}` as the gathered
+///   `state_scores[child_idx]` where `child.upper_score_remaining =
+///   max(parent_upper - v × c, 0)`. Also precompute the upper-bonus blend
+///   per count (depends only on whether `new_upper` reached 0). Inside the
+///   d-loop, look up `c = COUNT_LUT[face_idx][d]` and read both precomputed
+///   `f32x8`s — no per-d gather, no per-d upper-bonus computation. The
+///   yahtzee-bonus blend stays per-d because `dice_is_yahtzee` doesn't
+///   correlate with `count` cleanly (e.g., `count=0` includes both the 5
+///   other-face yahtzees and 247 non-yahtzee d's).
+/// - **Yahtzee arm** (1 action): precompute `child_evs_off` (eligible
+///   unchanged) and `child_evs_on` (eligible set). The d-loop branches on
+///   `dice_is_yahtzee` to pick between them. Compiler turns this into loop
+///   unswitching; we keep it as a per-d if/else for readability.
+/// - **Fast arm** (6 actions): unchanged from
+///   [`phase_entry_actions_hoisted`]. `child` is d-independent, one gather
+///   per (state, action), per-d work is just score / joker-rule blending /
+///   yahtzee-bonus blending.
+///
+/// **Joker rule.** Joker only applies to FH/SS/LS, all in the fast arm.
+/// The upper arm doesn't need joker logic at all (`joker_lower_score` is
+/// `None` for upper actions). The yahtzee arm's `joker_lower_score` is
+/// also `None` (joker overrides *lower-section* scores when YAHTZEE is
+/// already filled — the action being scored is YAHTZEE itself doesn't
+/// trigger joker).
+///
+/// Exposed as `#[doc(hidden)] pub` for the criterion `simd_batch_phases`
+/// group. Not part of the stable API.
+#[doc(hidden)]
+#[inline]
+pub fn phase_entry_actions_per_count(
+    states: &[State; LANES],
+    state_scores: &[f32],
+    table: &mut [f32x8],
+    out_third_dice: &mut [f32x8],
+) {
+    debug_assert_eq!(table.len(), N_ACTIONS * N_DICE);
+    debug_assert_eq!(out_third_dice.len(), N_DICE);
+
+    // Per-batch state-only quantities (same as `_hoisted`).
+    let entries_v = i32x8::new(std::array::from_fn(|s| states[s].entries.bits() as i32));
+    let upper_remaining_v =
+        i32x8::new(std::array::from_fn(|s| states[s].upper_score_remaining as i32));
+    let yahtzee_eligible_v = i32x8::new(std::array::from_fn(|s| {
+        if states[s].yahtzee_bonus_eligible {
+            1
+        } else {
+            0
+        }
+    }));
+    let upper_complete_mask = upper_remaining_v.simd_eq(i32x8::splat(0));
+    let contains_yahtzee_mask =
+        (entries_v & i32x8::splat(YAHTZEE_BIT)).simd_gt(i32x8::splat(0));
+    let yahtzee_eligible_mask = yahtzee_eligible_v.simd_gt(i32x8::splat(0));
+
+    let dice_and_entry_scores = &*crate::DICE_AND_ENTRY_SCORES;
+    let yahtzee_dice = &*crate::YAHTZEE_DICE;
+    let count_lut = &*COUNT_LUT;
+
+    for action_idx in 0..N_ACTIONS {
+        let action = ENTRY_ACTIONS[action_idx];
+        let action_bits = action.bits() as i32;
+        let is_upper_action = action_idx < 6;
+        let is_yahtzee_action = action == EntryAction::YAHTZEE;
+        let joker_score: Option<u8> = match action {
+            EntryAction::FULL_HOUSE => Some(25),
+            EntryAction::SMALL_STRAIGHT => Some(30),
+            EntryAction::LARGE_STRAIGHT => Some(40),
+            _ => None,
+        };
+
+        let valid_int_mask =
+            (entries_v & i32x8::splat(action_bits)).simd_eq(i32x8::splat(0));
+        let valid_mask_f: f32x8 =
+            cast::<i32x8, f32x8>(valid_int_mask).blend(f32x8::splat(1.0), f32x8::splat(0.0));
+
+        let entries_with_action_v = entries_v | i32x8::splat(action_bits);
+
+        let row = &mut table[action_idx * N_DICE..(action_idx + 1) * N_DICE];
+        let scores_row = &dice_and_entry_scores[action_idx];
+
+        if is_upper_action {
+            // Upper arm: 6 distinct child states per (state, action), indexed
+            // by count(face, d). Precompute child_evs and upper_bonus per
+            // count once, then look up per d via COUNT_LUT.
+            let face_value = (action_idx + 1) as i32;
+            let counts_for_face = &count_lut[action_idx];
+
+            let mut child_evs_per_count = [f32x8::splat(0.0); 6];
+            // upper_bonus_per_count[c] = 35.0 in lanes where bonus would fire,
+            // 0.0 elsewhere. !upper_complete && (new_upper == 0).
+            let mut upper_bonus_per_count = [f32x8::splat(0.0); 6];
+            for c in 0..6 {
+                let s_for_c = face_value * (c as i32);
+                let new_upper =
+                    (upper_remaining_v - i32x8::splat(s_for_c)).max(i32x8::splat(0));
+                let child_idx_v: i32x8 = (entries_with_action_v << 7_u32)
+                    | (yahtzee_eligible_v << 6_u32)
+                    | new_upper;
+                let idx_arr = child_idx_v.to_array();
+                child_evs_per_count[c] = f32x8::new([
+                    state_scores[idx_arr[0] as usize],
+                    state_scores[idx_arr[1] as usize],
+                    state_scores[idx_arr[2] as usize],
+                    state_scores[idx_arr[3] as usize],
+                    state_scores[idx_arr[4] as usize],
+                    state_scores[idx_arr[5] as usize],
+                    state_scores[idx_arr[6] as usize],
+                    state_scores[idx_arr[7] as usize],
+                ]);
+
+                let new_upper_zero_mask = new_upper.simd_eq(i32x8::splat(0));
+                let upper_fires_mask = !upper_complete_mask & new_upper_zero_mask;
+                upper_bonus_per_count[c] = cast::<i32x8, f32x8>(upper_fires_mask)
+                    .blend(f32x8::splat(35.0), f32x8::splat(0.0));
+            }
+
+            // joker_score is None for upper actions; suppress the unused
+            // binding warning. (Keeping the match common across arms keeps
+            // the structure aligned with `_hoisted` for easy diff review.)
+            let _ = joker_score;
+
+            for d in 0..N_DICE {
+                let raw_score_i = scores_row[d] as i32;
+                let raw_score_f = f32x8::splat(raw_score_i as f32);
+                let c = counts_for_face[d] as usize;
+                debug_assert_eq!(raw_score_i, face_value * (c as i32));
+
+                let yahtzee_face_opt = yahtzee_dice[d];
+                let dice_is_yahtzee = yahtzee_face_opt.is_some();
+
+                let yahtzee_bonus_f = if dice_is_yahtzee {
+                    cast::<i32x8, f32x8>(yahtzee_eligible_mask)
+                        .blend(f32x8::splat(100.0), f32x8::splat(0.0))
+                } else {
+                    f32x8::splat(0.0)
+                };
+
+                let total_f = raw_score_f
+                    + upper_bonus_per_count[c]
+                    + yahtzee_bonus_f
+                    + child_evs_per_count[c];
+                row[d] = total_f * valid_mask_f;
+            }
+        } else if is_yahtzee_action {
+            // Yahtzee arm: 2 distinct child states. `dice_is_yahtzee` flips
+            // `yahtzee_bonus_eligible` in `child`; `upper_score_remaining`
+            // doesn't change (YAHTZEE isn't an upper action).
+            let child_idx_off: i32x8 = (entries_with_action_v << 7_u32)
+                | (yahtzee_eligible_v << 6_u32)
+                | upper_remaining_v;
+            let idx_off = child_idx_off.to_array();
+            let child_evs_off = f32x8::new([
+                state_scores[idx_off[0] as usize],
+                state_scores[idx_off[1] as usize],
+                state_scores[idx_off[2] as usize],
+                state_scores[idx_off[3] as usize],
+                state_scores[idx_off[4] as usize],
+                state_scores[idx_off[5] as usize],
+                state_scores[idx_off[6] as usize],
+                state_scores[idx_off[7] as usize],
+            ]);
+
+            let new_yahtzee_eligible_on_v = yahtzee_eligible_v | i32x8::splat(1);
+            let child_idx_on: i32x8 = (entries_with_action_v << 7_u32)
+                | (new_yahtzee_eligible_on_v << 6_u32)
+                | upper_remaining_v;
+            let idx_on = child_idx_on.to_array();
+            let child_evs_on = f32x8::new([
+                state_scores[idx_on[0] as usize],
+                state_scores[idx_on[1] as usize],
+                state_scores[idx_on[2] as usize],
+                state_scores[idx_on[3] as usize],
+                state_scores[idx_on[4] as usize],
+                state_scores[idx_on[5] as usize],
+                state_scores[idx_on[6] as usize],
+                state_scores[idx_on[7] as usize],
+            ]);
+
+            // Yahtzee bonus when dice is yahtzee (per-lane gated on parent
+            // eligible). Hoists out of the d-loop.
+            let yahtzee_bonus_when_yahtzee = cast::<i32x8, f32x8>(yahtzee_eligible_mask)
+                .blend(f32x8::splat(100.0), f32x8::splat(0.0));
+
+            let _ = joker_score;
+
+            for d in 0..N_DICE {
+                let raw_score_i = scores_row[d] as i32;
+                let raw_score_f = f32x8::splat(raw_score_i as f32);
+
+                let dice_is_yahtzee = yahtzee_dice[d].is_some();
+
+                let (child_evs_f, yahtzee_bonus_f) = if dice_is_yahtzee {
+                    (child_evs_on, yahtzee_bonus_when_yahtzee)
+                } else {
+                    (child_evs_off, f32x8::splat(0.0))
+                };
+
+                // Upper bonus can't fire here (YAHTZEE isn't an upper action,
+                // so child.upper_score_remaining == parent.upper_score_remaining).
+                let total_f = raw_score_f + yahtzee_bonus_f + child_evs_f;
+                row[d] = total_f * valid_mask_f;
+            }
+        } else {
+            // Fast arm: child is d-independent. Same as `_hoisted`.
+            let child_idx_v: i32x8 = (entries_with_action_v << 7_u32)
+                | (yahtzee_eligible_v << 6_u32)
+                | upper_remaining_v;
+            let idx_arr = child_idx_v.to_array();
+            let child_evs_f = f32x8::new([
+                state_scores[idx_arr[0] as usize],
+                state_scores[idx_arr[1] as usize],
+                state_scores[idx_arr[2] as usize],
+                state_scores[idx_arr[3] as usize],
+                state_scores[idx_arr[4] as usize],
+                state_scores[idx_arr[5] as usize],
+                state_scores[idx_arr[6] as usize],
+                state_scores[idx_arr[7] as usize],
+            ]);
+
+            for d in 0..N_DICE {
+                let raw_score_i = scores_row[d] as i32;
+                let raw_score_f = f32x8::splat(raw_score_i as f32);
+
+                let yahtzee_face_opt = yahtzee_dice[d];
+                let dice_is_yahtzee = yahtzee_face_opt.is_some();
+
+                let normal_score_f = if let Some(joker_val) = joker_score
+                    && dice_is_yahtzee
+                {
+                    let yahtzee_face_bits =
+                        yahtzee_face_opt.map(|f| f.bits() as i32).unwrap_or(0);
+                    let entries_have_face_mask = (entries_v
+                        & i32x8::splat(yahtzee_face_bits))
+                        .simd_gt(i32x8::splat(0));
+                    let joker_lane_mask = contains_yahtzee_mask & entries_have_face_mask;
+                    cast::<i32x8, f32x8>(joker_lane_mask)
+                        .blend(f32x8::splat(joker_val as f32), raw_score_f)
+                } else {
+                    raw_score_f
+                };
+
+                let yahtzee_bonus_f = if dice_is_yahtzee {
+                    cast::<i32x8, f32x8>(yahtzee_eligible_mask)
+                        .blend(f32x8::splat(100.0), f32x8::splat(0.0))
+                } else {
+                    f32x8::splat(0.0)
+                };
+
+                let total_f = normal_score_f + yahtzee_bonus_f + child_evs_f;
+                row[d] = total_f * valid_mask_f;
+            }
+        }
+    }
+
+    // Phase B: same SIMD max-reduce over actions per dice.
+    for d in 0..N_DICE {
+        let mut acc = table[d];
+        for action_idx in 1..N_ACTIONS {
+            acc = acc.fast_max(table[action_idx * N_DICE + d]);
+        }
+        out_third_dice[d] = acc;
+    }
+}
 
 /// Round 4 — vectorized + d-independent gather hoisted out of the d-loop.
 ///
