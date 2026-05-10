@@ -110,7 +110,20 @@ static YAHTZEE_DICE: LazyLock<Vec<Option<EntryAction>>> = LazyLock::new(math::ya
 static DICE_IDX_LOOKUP: LazyLock<HashMap<DiceCounts, usize>> = LazyLock::new(math::dice_idx_lookup);
 static IDX_KEEPERS_LOOKUP: LazyLock<HashMap<usize, DiceCounts>> =
     LazyLock::new(math::idx_keepers_lookup);
-static DICE_AND_ENTRY_SCORES: LazyLock<Array2<u8>> = LazyLock::new(math::dice_and_entry_scores);
+/// Per-(entry action, dice combination) raw score, indexed as
+/// `DICE_AND_ENTRY_SCORES[action_idx][dice_idx]`. Joker rule and bonuses
+/// are layered on by `State::score_and_child` / `State::entry_score` —
+/// this table is the un-adjusted "value of dice in entry box" lookup.
+///
+/// Stored as a fixed `[[u8; 252]; 13]` (3,276 bytes, lives in L1) instead of
+/// `Array2<u8>`. Callgrind on `phase_entry_actions_fuse` showed ndarray's
+/// multi-dim index machinery (`dimension_trait.rs` stride math + bounds
+/// checks) was ~280M Ir per build (~1% of total program Ir, but ~10% of
+/// `score_and_child` + `State::child` self time, the bottleneck). A flat
+/// 2D array compiles to one `lea` + one bounds check per access.
+static DICE_AND_ENTRY_SCORES: LazyLock<
+    [[u8; NUM_DICE_COMBINATIONS as usize]; NUM_ENTRY_ACTIONS as usize],
+> = LazyLock::new(math::dice_and_entry_scores);
 // `pub(crate)` so the `linalg` submodule can read them; not part of the
 // public API.
 pub(crate) static DICE_TO_ALLOWED_KEEPERS: LazyLock<Array2<f32>> =
@@ -200,9 +213,9 @@ mod math {
         yahtzees
     }
 
-    pub fn dice_and_entry_scores() -> Array2<u8> {
-        let shape = (NUM_ENTRY_ACTIONS as usize, NUM_DICE_COMBINATIONS as usize);
-        let mut scores = Array2::zeros(shape);
+    pub fn dice_and_entry_scores(
+    ) -> [[u8; NUM_DICE_COMBINATIONS as usize]; NUM_ENTRY_ACTIONS as usize] {
+        let mut scores = [[0_u8; NUM_DICE_COMBINATIONS as usize]; NUM_ENTRY_ACTIONS as usize];
 
         let dice_combinations = dice_combinations(NUM_DICE);
 
@@ -249,7 +262,7 @@ mod math {
                         .sum::<u8>(),
                     _ => 0,
                 };
-                scores[(action_idx, dice_idx)] = score;
+                scores[action_idx][dice_idx] = score;
             }
         }
         scores
@@ -723,7 +736,7 @@ fn joker_lower_score(action: EntryAction) -> Option<u8> {
 // achievable under the joker rule in a given state.
 pub fn achievable_scores(entry_idx: usize) -> Vec<u8> {
     let action = ENTRY_ACTIONS[entry_idx];
-    let row = DICE_AND_ENTRY_SCORES.row(action.as_idx());
+    let row = &DICE_AND_ENTRY_SCORES[action.as_idx()];
     let mut values: std::collections::BTreeSet<u8> = row.iter().copied().collect();
     match action {
         EntryAction::FULL_HOUSE => {
@@ -809,7 +822,7 @@ impl State {
             | EntryAction::SIX;
 
         if upper_actions.contains(action) {
-            let score = DICE_AND_ENTRY_SCORES[(action.as_idx(), dice_idx as usize)];
+            let score = DICE_AND_ENTRY_SCORES[action.as_idx()][dice_idx as usize];
             child.upper_score_remaining = child.upper_score_remaining.saturating_sub(score);
         }
 
@@ -822,7 +835,7 @@ impl State {
 
     pub fn entry_score(self, action: EntryAction, dice: &DiceCounts) -> u8 {
         let dice_idx = lookup_dice_idx(dice);
-        let mut score = DICE_AND_ENTRY_SCORES[(action.as_idx(), dice_idx)];
+        let mut score = DICE_AND_ENTRY_SCORES[action.as_idx()][dice_idx];
         // Joker rule: if the Yahtzee box is filled, the dice are a Yahtzee, and
         // the matching upper category is also filled, the lower-section
         // categories take their joker fixed scores.
@@ -840,7 +853,7 @@ impl State {
         let child = self.child(action_idx, dice_idx);
 
         let mut normal_score =
-            f32::from(DICE_AND_ENTRY_SCORES[(action_idx.as_idx(), dice_idx as usize)]);
+            f32::from(DICE_AND_ENTRY_SCORES[action_idx.as_idx()][dice_idx as usize]);
         let upper_bonus = if !self.upper_complete() && child.upper_complete() {
             35_f32
         } else {

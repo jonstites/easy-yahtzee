@@ -415,7 +415,12 @@ impl CudaBuildBackend {
         let dk = crate::DICE_TO_ALLOWED_KEEPERS
             .as_slice()
             .expect("DICE_TO_ALLOWED_KEEPERS is contiguous");
-        let des: Vec<u8> = crate::DICE_AND_ENTRY_SCORES.iter().copied().collect();
+        // `DICE_AND_ENTRY_SCORES` is `[[u8; 252]; 13]` (row-major); flatten
+        // for the GPU upload.
+        let des: Vec<u8> = crate::DICE_AND_ENTRY_SCORES
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect();
         let yd: Vec<i8> = crate::YAHTZEE_DICE
             .iter()
             .map(|opt| match opt {

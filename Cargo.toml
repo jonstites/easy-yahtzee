@@ -4,3 +4,11 @@ resolver = "3"
 
 [profile.test]
 opt-level = 3
+
+# Line-table debug info in release builds so callgrind / perf / flamegraph can
+# attribute samples to source lines. Verified zero perf impact (criterion
+# `simd_batch_phases` shows < 0.2% delta with vs. without). Costs tens of KB
+# of `.debug_line` per binary; strips fine if size matters.
+[profile.release]
+debug = "line-tables-only"
+
