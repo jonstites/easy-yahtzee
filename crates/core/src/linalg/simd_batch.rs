@@ -187,25 +187,77 @@ impl BuildBackend for SimdBatchBuildBackend {
         states: &[State],
         state_scores: &[f32],
     ) -> Result<Vec<f32>, Infallible> {
-        // par_chunks_exact(8) feeds the SIMD core; the remainder (0..8) goes
-        // through the scalar per-state SimdBackend so the same code path
-        // serves validated batches (which can have an arbitrary tail).
-        let chunks = states.par_chunks_exact(LANES);
-        let remainder: Vec<State> = chunks.remainder().to_vec();
+        // R6.5: bucket-sort by `!yahtzee_bonus_eligible` so each chunk has
+        // lane-uniform `ALL_NOT_YAHTZEE_ELIGIBLE`. When no lane is eligible,
+        // the +100 yahtzee-bonus blend is dead in every entry-actions cell
+        // (always blends 0) and DCEs at compile time via const-generic
+        // monomorphization. Empirically `yahtzee_bonus_eligible` is false
+        // for ~52-95% of states across the heavy levels (L=4..L=12), so the
+        // fast bucket carries most of the work.
+        //
+        // We chose this predicate over `upper_complete` after measuring R6:
+        // upper_complete fires for sub-1% of states at heavy levels, so
+        // even with bucket-sort guaranteeing 100% lane uniformity the
+        // fast bucket was too small to move e2e. The `yahtzee_eligible`
+        // bucket is closer to a 50/50 split, where bucket-sort's
+        // O(n_states) overhead is amortized over real per-batch work in
+        // *both* buckets.
+        let mut idx_not_elig: Vec<usize> = Vec::with_capacity(states.len());
+        let mut idx_elig: Vec<usize> = Vec::with_capacity(states.len());
+        for (i, s) in states.iter().enumerate() {
+            if s.yahtzee_bonus_eligible {
+                idx_elig.push(i);
+            } else {
+                idx_not_elig.push(i);
+            }
+        }
+        let states_not_elig: Vec<State> =
+            idx_not_elig.iter().map(|&i| states[i]).collect();
+        let states_elig: Vec<State> = idx_elig.iter().map(|&i| states[i]).collect();
 
-        let mut out: Vec<f32> = chunks
-            .map_init(Scratch::new, |scratch, chunk| {
-                let group: &[State; LANES] = chunk.try_into().unwrap();
-                compute_lanes(group, state_scores, scratch)
-            })
-            .flat_map_iter(|arr| arr.into_iter())
-            .collect();
+        let evs_not_elig = process_bucket::<true>(&states_not_elig, state_scores);
+        let evs_elig = process_bucket::<false>(&states_elig, state_scores);
 
-        for state in &remainder {
-            out.push(state_value_with(*state, state_scores, &SimdBackend::new()));
+        let mut out = vec![0.0_f32; states.len()];
+        for (i, &orig_idx) in idx_not_elig.iter().enumerate() {
+            out[orig_idx] = evs_not_elig[i];
+        }
+        for (i, &orig_idx) in idx_elig.iter().enumerate() {
+            out[orig_idx] = evs_elig[i];
         }
         Ok(out)
     }
+}
+
+/// Process a single invariant-uniform bucket. `ALL_NOT_YAHTZEE_ELIGIBLE`
+/// is a const generic so each call site monomorphizes through to
+/// [`phase_entry_actions_per_count`]'s const branches and the dead arm is
+/// DCE'd at compile time.
+///
+/// `par_chunks_exact(8)` feeds the SIMD core; the remainder (0..8) goes
+/// through the scalar per-state `SimdBackend` so the same code path serves
+/// validated batches (which can have an arbitrary tail). Each bucket has
+/// its own tail since the bucket sizes are no longer multiples of 128 on
+/// the unvalidated path either — handled the same way.
+fn process_bucket<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
+    states: &[State],
+    state_scores: &[f32],
+) -> Vec<f32> {
+    let chunks = states.par_chunks_exact(LANES);
+    let remainder: Vec<State> = chunks.remainder().to_vec();
+
+    let mut out: Vec<f32> = chunks
+        .map_init(Scratch::new, |scratch, chunk| {
+            let group: &[State; LANES] = chunk.try_into().unwrap();
+            compute_lanes::<ALL_NOT_YAHTZEE_ELIGIBLE>(group, state_scores, scratch)
+        })
+        .flat_map_iter(|arr| arr.into_iter())
+        .collect();
+
+    for state in &remainder {
+        out.push(state_value_with(*state, state_scores, &SimdBackend::new()));
+    }
+    out
 }
 
 /// The 8-wide pipeline. Returns the EV of each of the 8 input states.
@@ -227,22 +279,29 @@ impl BuildBackend for SimdBatchBuildBackend {
 /// (Round 0) are kept as bench-only baselines for the criterion
 /// `simd_batch_phases` group, so the vectorization and precompute wins
 /// stay measurable on every CI run.
-fn compute_lanes(
+fn compute_lanes<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
     states: &[State; LANES],
     state_scores: &[f32],
     scratch: &mut Scratch,
 ) -> [f32; LANES] {
     // Steps 1+2: precompute (score + state_scores[child]) table per (s, a, d),
     // then max-reduce over actions per dice into third_dice. Production path
-    // is [`phase_entry_actions_per_count`] (R5), which exploits the structural
-    // fact that upper actions produce only 6 distinct child states per
-    // (state, action) — indexed by `count(face, d)` — and YAHTZEE produces
-    // only 2 (toggled on `is_yahtzee(d)`). Slow-arm gathers drop from 14,112
-    // per batch (R4) to ~352. Earlier variants
-    // ([`phase_entry_actions_hoisted`], [`phase_entry_actions_vectorized`],
-    // [`phase_entry_actions_precomputed`], [`phase_entry_actions_fuse`]) are
-    // kept as bench-only baselines.
-    phase_entry_actions_per_count(
+    // is [`phase_entry_actions_per_count`] (R5+R6.5):
+    //
+    // - **R5**: upper actions produce only 6 distinct child states per
+    //   (state, action) — indexed by `count(face, d)` — and YAHTZEE produces
+    //   only 2 (toggled on `is_yahtzee(d)`). Slow-arm gathers drop from 14,112
+    //   per batch (R4) to ~352.
+    // - **R6.5**: when no lane in the batch is yahtzee-eligible
+    //   (`ALL_NOT_YAHTZEE_ELIGIBLE = true`), the +100 yahtzee-bonus blend
+    //   `cast(yahtzee_eligible_mask).blend(100, 0)` is identically 0 and
+    //   the entire `yahtzee_bonus_f` add chain DCEs at compile time. The
+    //   const generic threads through from `process_bucket`'s bucket-sort.
+    //
+    // Earlier variants ([`phase_entry_actions_hoisted`],
+    // [`phase_entry_actions_vectorized`], [`phase_entry_actions_precomputed`],
+    // [`phase_entry_actions_fuse`]) are kept as bench-only baselines.
+    phase_entry_actions_per_count::<ALL_NOT_YAHTZEE_ELIGIBLE>(
         states,
         state_scores,
         &mut scratch.entry_actions_table,
@@ -361,7 +420,8 @@ const UPPER_ACTIONS_MASK: i32 = (EntryAction::ONE.bits()
     | EntryAction::SIX.bits()) as i32;
 const YAHTZEE_BIT: i32 = EntryAction::YAHTZEE.bits() as i32;
 
-/// Round 5 — per-score-class precomputation in the slow arm.
+/// Rounds 5 + 6.5 — per-score-class precomputation in the slow arm,
+/// with const-generic specialization on `ALL_NOT_YAHTZEE_ELIGIBLE`.
 ///
 /// **The structural fact.** R4's slow arm (upper actions ONE..SIX +
 /// YAHTZEE) gathered `state_scores[child_idx]` once per `(state, action,
@@ -414,12 +474,18 @@ const YAHTZEE_BIT: i32 = EntryAction::YAHTZEE.bits() as i32;
 /// group. Not part of the stable API.
 #[doc(hidden)]
 #[inline]
-pub fn phase_entry_actions_per_count(
+pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
     states: &[State; LANES],
     state_scores: &[f32],
     table: &mut [f32x8],
     out_third_dice: &mut [f32x8],
 ) {
+    if ALL_NOT_YAHTZEE_ELIGIBLE {
+        debug_assert!(
+            states.iter().all(|s| !s.yahtzee_bonus_eligible),
+            "ALL_NOT_YAHTZEE_ELIGIBLE = true requires every lane's parent to have yahtzee_bonus_eligible = false"
+        );
+    }
     debug_assert_eq!(table.len(), N_ACTIONS * N_DICE);
     debug_assert_eq!(out_third_dice.len(), N_DICE);
 
@@ -515,7 +581,12 @@ pub fn phase_entry_actions_per_count(
                 let yahtzee_face_opt = yahtzee_dice[d];
                 let dice_is_yahtzee = yahtzee_face_opt.is_some();
 
-                let yahtzee_bonus_f = if dice_is_yahtzee {
+                // R6.5: when ALL_NOT_YAHTZEE_ELIGIBLE, yahtzee_eligible_mask
+                // is all-zeros so the +100 blend is identically 0 — the
+                // entire add is dead. The const generic DCE's it.
+                let yahtzee_bonus_f = if ALL_NOT_YAHTZEE_ELIGIBLE {
+                    f32x8::splat(0.0)
+                } else if dice_is_yahtzee {
                     cast::<i32x8, f32x8>(yahtzee_eligible_mask)
                         .blend(f32x8::splat(100.0), f32x8::splat(0.0))
                 } else {
@@ -564,9 +635,15 @@ pub fn phase_entry_actions_per_count(
             ]);
 
             // Yahtzee bonus when dice is yahtzee (per-lane gated on parent
-            // eligible). Hoists out of the d-loop.
-            let yahtzee_bonus_when_yahtzee = cast::<i32x8, f32x8>(yahtzee_eligible_mask)
-                .blend(f32x8::splat(100.0), f32x8::splat(0.0));
+            // eligible). Hoists out of the d-loop. R6.5: when
+            // ALL_NOT_YAHTZEE_ELIGIBLE, this is identically 0 and the
+            // const generic DCE's the add.
+            let yahtzee_bonus_when_yahtzee = if ALL_NOT_YAHTZEE_ELIGIBLE {
+                f32x8::splat(0.0)
+            } else {
+                cast::<i32x8, f32x8>(yahtzee_eligible_mask)
+                    .blend(f32x8::splat(100.0), f32x8::splat(0.0))
+            };
 
             let _ = joker_score;
 
@@ -626,7 +703,10 @@ pub fn phase_entry_actions_per_count(
                     raw_score_f
                 };
 
-                let yahtzee_bonus_f = if dice_is_yahtzee {
+                // R6.5 DCE-via-const-generic, same as upper arm above.
+                let yahtzee_bonus_f = if ALL_NOT_YAHTZEE_ELIGIBLE {
+                    f32x8::splat(0.0)
+                } else if dice_is_yahtzee {
                     cast::<i32x8, f32x8>(yahtzee_eligible_mask)
                         .blend(f32x8::splat(100.0), f32x8::splat(0.0))
                 } else {
