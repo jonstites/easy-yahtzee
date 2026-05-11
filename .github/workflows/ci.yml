@@ -20,12 +20,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `.cargo/config.toml` sets `-C target-cpu=native` on host builds. On
+      # GitHub's shared runner pool the CPU rotates (Intel Cascade Lake with
+      # AVX-512 <-> AMD EPYC Milan without) and `wasm-bindgen-macro`'s proc
+      # macro `.so` — either compiled with AVX-512 this run or restored from
+      # a previous run's cache — hits SIGILL when loaded on a runner that
+      # can't execute those instructions. Truncate the config to empty so
+      # CI compiles with baseline codegen. Local dev keeps the flag via
+      # git (this step doesn't commit).
+      - name: Neutralize .cargo/config.toml (avoid target-cpu=native on CI)
+        run: ': > .cargo/config.toml'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       # `[profile.test] opt-level = 3` makes a cold build slow because
       # `Scores::new()` is exercised in tests; the cache makes warm runs fast.
+      # Key bump `no-native-v1` invalidates caches poisoned by prior runs
+      # that compiled proc macros with `-C target-cpu=native`.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: no-native-v1
 
       - name: cargo build (tests)
         run: cargo build --workspace --tests

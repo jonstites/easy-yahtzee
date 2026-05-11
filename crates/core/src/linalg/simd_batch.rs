@@ -202,7 +202,10 @@ impl BuildBackend for SimdBatchBuildBackend {
         &self,
         states: &[State],
         state_scores: &[f32],
-    ) -> Result<Vec<f32>, Infallible> {
+        out: &mut [f32],
+    ) -> Result<(), Infallible> {
+        debug_assert_eq!(states.len(), out.len());
+
         // R6.5: bucket-sort by `!yahtzee_bonus_eligible` so each chunk has
         // lane-uniform `ALL_NOT_YAHTZEE_ELIGIBLE`. When no lane is eligible,
         // the +100 yahtzee-bonus blend is dead in every entry-actions cell
@@ -218,6 +221,17 @@ impl BuildBackend for SimdBatchBuildBackend {
         // bucket is closer to a 50/50 split, where bucket-sort's
         // O(n_states) overhead is amortized over real per-batch work in
         // *both* buckets.
+        //
+        // R9 — process_bucket now gathers states from the bucket-INDEX
+        // slice + the original states list inside its parallel closures,
+        // and writes EVs directly to `out` at the original positions.
+        // This eliminates two intermediate state Vecs (`states_not_elig`,
+        // `states_elig` of `Vec<State>` each up to 67k×4 bytes) and two
+        // EV Vecs (the `process_bucket` return values) — 4 per-level
+        // allocations gone. The unbucket-scatter loops are also gone:
+        // bucket workers write to `out[idx_*[i]]` directly via an
+        // `UnsafeCell` shim (disjoint indices by construction; each
+        // state appears in exactly one bucket).
         let mut idx_not_elig: Vec<usize> = Vec::with_capacity(states.len());
         let mut idx_elig: Vec<usize> = Vec::with_capacity(states.len());
         for (i, s) in states.iter().enumerate() {
@@ -227,21 +241,51 @@ impl BuildBackend for SimdBatchBuildBackend {
                 idx_not_elig.push(i);
             }
         }
-        let states_not_elig: Vec<State> =
-            idx_not_elig.iter().map(|&i| states[i]).collect();
-        let states_elig: Vec<State> = idx_elig.iter().map(|&i| states[i]).collect();
 
-        let evs_not_elig = process_bucket::<true>(&states_not_elig, state_scores);
-        let evs_elig = process_bucket::<false>(&states_elig, state_scores);
+        // SAFETY: each bucket-state has a unique index in `out` (every state
+        // is in exactly one bucket via the partition above), so the two
+        // bucket workers write to disjoint positions in `out`. We share a
+        // `*mut f32` pointer between them and reconstruct disjoint mutable
+        // slices via unchecked writes inside the parallel closures. This
+        // is the same disjoint-write pattern that rayon's `par_chunks_mut`
+        // uses internally, generalized to non-contiguous index lists.
+        let out_ptr = OutWritePtr {
+            ptr: out.as_mut_ptr(),
+        };
+        process_bucket_scatter::<true>(&idx_not_elig, states, state_scores, out_ptr);
+        process_bucket_scatter::<false>(&idx_elig, states, state_scores, out_ptr);
 
-        let mut out = vec![0.0_f32; states.len()];
-        for (i, &orig_idx) in idx_not_elig.iter().enumerate() {
-            out[orig_idx] = evs_not_elig[i];
-        }
-        for (i, &orig_idx) in idx_elig.iter().enumerate() {
-            out[orig_idx] = evs_elig[i];
-        }
-        Ok(out)
+        Ok(())
+    }
+}
+
+/// Thin `Send + Sync` wrapper around `*mut f32` so the bucket workers can
+/// scatter into `out` from rayon parallel iterators. **Safety contract**:
+/// callers must ensure that all writes through this pointer hit distinct
+/// indices within bounds. Used only by [`process_bucket_scatter`], where
+/// the bucket partition guarantees disjoint indices and `out.len() ==
+/// states.len()` is debug-asserted at the `compute_level` entry.
+#[derive(Copy, Clone)]
+struct OutWritePtr {
+    ptr: *mut f32,
+}
+// SAFETY: see contract on `OutWritePtr`. The pointer is dereferenced only
+// in `process_bucket_scatter`'s parallel closures via the `write_at` method,
+// which honors the disjoint-index invariant.
+unsafe impl Send for OutWritePtr {}
+unsafe impl Sync for OutWritePtr {}
+
+impl OutWritePtr {
+    /// SAFETY: caller must ensure (a) `idx` is in bounds for the underlying
+    /// allocation, and (b) no other thread writes to the same `idx`
+    /// simultaneously. Called via a method (not field access) so the
+    /// closure capturing `self: &OutWritePtr` takes the whole struct rather
+    /// than the inner `*mut f32` field (Rust 2021 disjoint captures would
+    /// otherwise capture `&*mut f32`, which is `!Sync` regardless of our
+    /// `unsafe impl Sync for OutWritePtr`).
+    #[inline]
+    unsafe fn write_at(&self, idx: usize, val: f32) {
+        unsafe { *self.ptr.add(idx) = val };
     }
 }
 
@@ -255,25 +299,63 @@ impl BuildBackend for SimdBatchBuildBackend {
 /// validated batches (which can have an arbitrary tail). Each bucket has
 /// its own tail since the bucket sizes are no longer multiples of 128 on
 /// the unvalidated path either — handled the same way.
-fn process_bucket<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
-    states: &[State],
+/// R9 — scatter variant of `process_bucket`: gathers states from
+/// `(bucket_indices, all_states)` inside the parallel closure (no
+/// `Vec<State>` materialization), and writes each computed EV directly
+/// to `out_ptr.0[bucket_indices[i]]` (no intermediate `Vec<f32>` either).
+/// `bucket_indices` is the list of positions in `all_states` belonging to
+/// this bucket; the corresponding output positions are at the SAME
+/// indices in `out` (the caller pre-allocates `out` of `all_states.len()`).
+///
+/// **Safety.** Each index in `bucket_indices` is unique (it's a partition
+/// of `0..all_states.len()`), and the two bucket calls use disjoint
+/// partitions of the index space, so the writes through `out_ptr` are
+/// guaranteed disjoint across all parallel workers in both bucket calls.
+fn process_bucket_scatter<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
+    bucket_indices: &[usize],
+    all_states: &[State],
     state_scores: &[f32],
-) -> Vec<f32> {
-    let chunks = states.par_chunks_exact(LANES);
-    let remainder: Vec<State> = chunks.remainder().to_vec();
+    out_ptr: OutWritePtr,
+) {
+    let chunks = bucket_indices.par_chunks_exact(LANES);
+    let remainder: Vec<usize> = chunks.remainder().to_vec();
 
-    let mut out: Vec<f32> = chunks
-        .map_init(Scratch::new, |scratch, chunk| {
-            let group: &[State; LANES] = chunk.try_into().unwrap();
-            compute_lanes::<ALL_NOT_YAHTZEE_ELIGIBLE>(group, state_scores, scratch)
+    chunks
+        .map_init(Scratch::new, |scratch, idx_chunk| {
+            // Gather LANES states from `all_states` via the index chunk.
+            let group: [State; LANES] =
+                std::array::from_fn(|i| all_states[idx_chunk[i]]);
+            let evs = compute_lanes::<ALL_NOT_YAHTZEE_ELIGIBLE>(&group, state_scores, scratch);
+            (idx_chunk, evs)
         })
-        .flat_map_iter(|arr| arr.into_iter())
-        .collect();
+        // `move` forces each closure invocation to capture `out_ptr` by
+        // value (it's `Copy`), so the closure's auto-derived `Sync` goes
+        // through `OutWritePtr`'s `unsafe impl Sync` rather than through
+        // a Rust 2021 partial-capture of the inner `*mut f32` field
+        // (which would be `&*mut f32`, not `Sync`).
+        .for_each(move |(idx_chunk, evs)| {
+            // SAFETY: see OutWritePtr's safety contract.
+            // - Each `idx_chunk[i]` is unique across all workers in this
+            //   bucket call (par_chunks_exact gives disjoint slices) and
+            //   across the two bucket calls (idx_not_elig and idx_elig
+            //   partition 0..states.len()).
+            // - All indices are in-bounds: `bucket_indices` contains only
+            //   valid indices into `all_states`, and `out` has the same
+            //   length as `all_states`.
+            for (i, &ev) in evs.iter().enumerate() {
+                let target = idx_chunk[i];
+                unsafe { out_ptr.write_at(target, ev) };
+            }
+        });
 
-    for state in &remainder {
-        out.push(state_value_with(*state, state_scores, &SimdBackend::new()));
+    // Tail handler: any indices in the bucket past the LANES-aligned chunks.
+    for &orig_idx in &remainder {
+        let ev = state_value_with(all_states[orig_idx], state_scores, &SimdBackend::new());
+        // SAFETY: same disjoint-index argument as above. The remainder
+        // indices are still inside `bucket_indices` so still unique within
+        // the partition.
+        unsafe { out_ptr.write_at(orig_idx, ev) };
     }
-    out
 }
 
 /// The 8-wide pipeline. Returns the EV of each of the 8 input states.
@@ -1237,17 +1319,46 @@ pub fn phase_fused_keeper_round(out_dice: &mut [f32x16], in_dice: &[f32x16]) {
     debug_assert_eq!(in_dice.len(), N_DICE);
     let sparse = &*SPARSE_K2D;
 
-    // The masked-max trick (multiply by 0-mask) used 0 as the floor for the
-    // max because EVs are non-negative. We preserve that invariant by zeroing
-    // out_dice up front: the scatter-max only ever sees `val ≥ 0` updates,
-    // and any d that no k ever updates stays at 0. (Empirically, every d is
-    // covered by at least one k — d ⊇ k for k = 0-keeper is always true —
-    // but the zero-init is the principled floor.)
-    for slot in out_dice.iter_mut() {
-        *slot = f32x16::splat(0.0);
+    // R9 — Skip out_dice zero-init by special-casing k=0 as a direct WRITE.
+    //
+    // The scatter-max needs a floor (0.0, since EVs are non-negative). Pre-R9
+    // we provided this by memset-ing `out_dice` to zero up front (~16 KiB per
+    // call × 2 calls/batch × 67k batches per build = lots of zero writes;
+    // ~2% of total program Ir per cachegrind). We can eliminate it because
+    // **row k=0 of K2D is dense — it covers every dice index**. The 0-keeper
+    // (empty kept multiset) is a sub-multiset of every full roll, so
+    // `K2D[0, d] > 0` for all 252 d's, and `row_cols[k=0]` is `[0, 1, ..., 251]`.
+    //
+    // So Pass 2 for k=0 visits every out_dice[d] exactly once. We replace
+    // the first fast_max (which would max against the zero floor) with a
+    // direct write: `out_dice[d] = val`. Identical result (val ≥ 0, so
+    // max(0, val) = val), one fewer instruction per slot, and the
+    // out_dice slots that weren't yet initialized get initialized HERE
+    // rather than by the memset that we no longer do.
+    //
+    // For k = 1..N_KEEPERS, behavior is unchanged (max-update).
+    debug_assert_eq!(sparse.row_ptr[1] - sparse.row_ptr[0], N_DICE as u32,
+                     "row k=0 of K2D must be dense for the no-zero-init optimization");
+
+    // k=0: dense row. Pass 1 + direct-write Pass 2.
+    let row_start_0 = sparse.row_ptr[0] as usize;
+    let row_end_0 = sparse.row_ptr[1] as usize;
+    let row_cols_0 = &sparse.col_idx[row_start_0..row_end_0];
+    let row_vals_0 = &sparse.values[row_start_0..row_end_0];
+
+    let mut val_0 = f32x16::splat(0.0);
+    for i in 0..row_cols_0.len() {
+        let d = row_cols_0[i] as usize;
+        val_0 += f32x16::splat(row_vals_0[i]) * in_dice[d];
+    }
+    // Direct write — out_dice gets initialized here, not via a separate memset.
+    for &d_u16 in row_cols_0 {
+        out_dice[d_u16 as usize] = val_0;
     }
 
-    for k in 0..N_KEEPERS {
+    // k = 1..N_KEEPERS: max-update (same as before, but now starting from
+    // out_dice initialized by k=0's pass above rather than from zero).
+    for k in 1..N_KEEPERS {
         let row_start = sparse.row_ptr[k] as usize;
         let row_end = sparse.row_ptr[k + 1] as usize;
         let row_cols = &sparse.col_idx[row_start..row_end];

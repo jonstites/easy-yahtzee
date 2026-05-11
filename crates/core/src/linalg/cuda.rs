@@ -714,13 +714,21 @@ impl BuildBackend for CudaBuildBackend {
         &self,
         states: &[State],
         state_scores: &[f32],
-    ) -> Result<Vec<f32>, Self::Error> {
+        out: &mut [f32],
+    ) -> Result<(), Self::Error> {
+        debug_assert_eq!(states.len(), out.len());
         if states.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        // Errors propagate to `Scores::new_with`'s caller; mid-build CUDA
-        // failure leaves the partial DP buffer in an inconsistent state but
-        // the `Scores` value is dropped so it's never observed.
-        self.compute_level_inner(states, state_scores)
+        // R9 — `compute_level_inner` still returns Vec<f32> for now (the GPU
+        // pipeline does a D->H memcpy into a host buffer; threading
+        // `&mut [f32]` down into it would need refactoring `Stream::memcpy_dtoh`
+        // bookkeeping). Copy into the caller's `out` slice here. The
+        // per-level allocation moves from `set_scores` to `compute_level_inner`
+        // for CUDA but the slot-count is identical, so no perf change vs
+        // pre-R9. The CPU backends get the alloc-elimination benefit.
+        let host_result = self.compute_level_inner(states, state_scores)?;
+        out.copy_from_slice(&host_result);
+        Ok(())
     }
 }
