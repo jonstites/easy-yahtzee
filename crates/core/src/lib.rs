@@ -385,6 +385,20 @@ const VALID_STATES_WORDS: usize = (NUM_STATES as usize).div_ceil(64);
 // `Scores::values` call the default `NdarrayBackend` and behave identically;
 // the `_with` variants accept any backend for benchmarking.
 
+/// Whether the DP build filters per-level batches against the BFS-reachability
+/// bitmap. Internal selector for [`Scores::new_with`] vs
+/// [`Scores::new_with_unvalidated`]; not user-facing.
+#[derive(Copy, Clone)]
+enum BuildMode {
+    /// Filter the level batch through `valid_state()` — only BFS-reachable
+    /// states get DP'd. ~50% smaller batches, ~2× faster end-to-end.
+    Validated,
+    /// Process every state at the level, reachable or not. ~2× more compute
+    /// but trivially correct: any latent BFS-soundness bug becomes a no-op
+    /// (every state's child is also in the batch by construction).
+    Unvalidated,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scores {
     state_scores: Array1<f32>,
@@ -481,19 +495,55 @@ impl Scores {
     /// backends can fail (driver errors, out-of-memory, kernel launch
     /// failure) — call this directly with `&CudaBuildBackend` and handle
     /// the error.
+    ///
+    /// This is the validated path: per-level batches are filtered by the
+    /// BFS-reachability bitmap, so we only run the DP over the ~536k of 1M
+    /// states that any real game can visit. See
+    /// [`Scores::new_with_unvalidated`] for the trivially-correct sibling
+    /// that skips the filter (and processes all ~1M states per build).
     pub fn new_with<B: BuildBackend>(backend: &B) -> Result<Scores, B::Error> {
+        Self::build(backend, BuildMode::Validated)
+    }
+
+    /// Like [`Scores::new_with`], but with the per-level filter against the
+    /// reachability bitmap disabled — every structurally-possible state at
+    /// each level enters the DP batch, including the ~512k that no actual
+    /// game can ever reach. The resulting [`Scores`] table is correct for
+    /// every reachable state by construction (DP recurrence is closed
+    /// under reachability), and additionally carries well-defined EVs for
+    /// the unreachable ones (which nothing reads).
+    ///
+    /// Roughly 2× the build wall-clock vs `new_with`. The point isn't
+    /// speed, it's *regularity*: the per-level batch shape becomes a
+    /// known-at-compile-time function of the level alone, which is what
+    /// outer-loop SIMD and level-specialized GPU kernels want. Use this
+    /// for cross-checking the BFS soundness and as the substrate for any
+    /// future unvalidated fast path.
+    pub fn new_with_unvalidated<B: BuildBackend>(backend: &B) -> Result<Scores, B::Error> {
+        Self::build(backend, BuildMode::Unvalidated)
+    }
+
+    fn build<B: BuildBackend>(backend: &B, mode: BuildMode) -> Result<Scores, B::Error> {
         let state_scores = Array1::zeros(NUM_STATES as usize);
         let valid_states = vec![0_u64; VALID_STATES_WORDS].into_boxed_slice();
         let mut scores = Scores {
             state_scores,
             valid_states,
         };
+        // Always populate the BFS bitmap so `Scores::valid_state()` retains
+        // its meaning ("reachable from default state") regardless of build
+        // mode. The mode only controls whether the per-level enumeration
+        // *uses* the bitmap as a filter.
         scores.set_valid_states();
-        scores.set_scores(backend)?;
+        scores.set_scores(backend, mode)?;
         Ok(scores)
     }
 
-    fn set_scores<B: BuildBackend>(&mut self, backend: &B) -> Result<(), B::Error> {
+    fn set_scores<B: BuildBackend>(
+        &mut self,
+        backend: &B,
+        mode: BuildMode,
+    ) -> Result<(), B::Error> {
         // Bottom-up by level (most filled entries first) so each level only
         // reads strictly-higher-level state scores. Within a level, all
         // states are independent — that's the parallelism the BuildBackend
@@ -501,7 +551,7 @@ impl Scores {
         let trace = std::env::var("YAHTZEE_TRACE_LEVELS").ok().is_some();
         for level in (0..NUM_ENTRY_ACTIONS).rev() {
             let t_collect = std::time::Instant::now();
-            let states = self.collect_states_at_level(level as usize);
+            let states = self.collect_states_at_level(level as usize, mode);
             let collect_ms = t_collect.elapsed().as_secs_f64() * 1000.0;
             if states.is_empty() {
                 continue;
@@ -529,21 +579,27 @@ impl Scores {
         Ok(())
     }
 
-    /// All valid states at exactly the given DP level (`level` = number of
-    /// entries filled). Returned in `usize`-encoded ascending order; the
-    /// `BuildBackend` doesn't depend on the order, but a stable order makes
-    /// debugging easier.
-    fn collect_states_at_level(&self, level: usize) -> Vec<State> {
+    /// States at exactly the given DP level. In [`BuildMode::Validated`]
+    /// (the default), only BFS-reachable states are returned (~half the
+    /// state space). In [`BuildMode::Unvalidated`], every structurally
+    /// possible state at the level is returned.
+    ///
+    /// Returned in `usize`-encoded ascending order; the `BuildBackend`
+    /// doesn't depend on the order, but a stable order makes debugging
+    /// easier.
+    fn collect_states_at_level(&self, level: usize, mode: BuildMode) -> Vec<State> {
         // Parallel filter is cheap (tens of ms across all 13 levels) and not
         // worth optimizing further; the inner DP per state dominates.
         (0..NUM_STATES as usize)
             .into_par_iter()
             .filter_map(|idx| {
                 let state: State = idx.into();
-                if self.valid_state(state) && state.level() == level {
-                    Some(state)
-                } else {
-                    None
+                if state.level() != level {
+                    return None;
+                }
+                match mode {
+                    BuildMode::Validated if !self.valid_state(state) => None,
+                    _ => Some(state),
                 }
             })
             .collect()
@@ -1079,6 +1135,65 @@ mod tests {
         let scores = shared_scores();
         let expected_value = scores.state_scores[default_idx];
         assert!((expected_value - 254.5896).abs() < 0.0001);
+    }
+
+    /// Cross-check: `Scores::new_with_unvalidated` should produce EVs
+    /// identical (within float reduction-order tolerance) to
+    /// `Scores::new_with` for every BFS-reachable state.
+    ///
+    /// What this catches: if the BFS in `set_valid_states` has any false
+    /// negatives — i.e. it marks some actually-reachable state as
+    /// unreachable — the validated path leaves that state's EV at 0.0,
+    /// which propagates into its parents' EVs as a wrong (low) value.
+    /// The unvalidated path has no such gap (every level processes every
+    /// state), so a divergence here is exactly a BFS-soundness bug.
+    ///
+    /// Gated `#[ignore]` because it builds a second `Scores` table
+    /// (~doubles the test wall-clock). Run explicitly with
+    /// `cargo test -p yahtzee-core --release -- --ignored
+    /// test_unvalidated_matches_validated`.
+    #[test]
+    #[ignore]
+    fn test_unvalidated_matches_validated() {
+        let validated = shared_scores();
+        let unvalidated = Scores::new_with_unvalidated(&CpuBuildBackend).unwrap();
+
+        let v = validated.state_scores_slice();
+        let u = unvalidated.state_scores_slice();
+        assert_eq!(v.len(), u.len());
+
+        let mut mismatches = 0_usize;
+        let mut max_abs_diff = 0.0_f32;
+        let mut unreachable_nonzero = 0_usize;
+
+        for idx in 0..(NUM_STATES as usize) {
+            let state: State = idx.into();
+            let diff = (v[idx] - u[idx]).abs();
+            if validated.valid_state(state) {
+                if diff > 1e-3 {
+                    mismatches += 1;
+                    if diff > max_abs_diff {
+                        max_abs_diff = diff;
+                    }
+                }
+            } else if u[idx] != 0.0 {
+                // Informational: unreachable states may have nonzero EVs in
+                // the unvalidated table because the DP visits them. As long
+                // as the validated path agrees on every *reachable* state,
+                // these don't affect anything observable.
+                unreachable_nonzero += 1;
+            }
+        }
+
+        eprintln!(
+            "unvalidated cross-check: {unreachable_nonzero} unreachable states \
+             with nonzero EV in the unvalidated table (informational; expected)"
+        );
+        assert_eq!(
+            mismatches, 0,
+            "validated and unvalidated tables disagree on {mismatches} reachable states; \
+             max |Δ| = {max_abs_diff}",
+        );
     }
 
     /// NaiveBackend (scalar `for` loops, no ndarray ops) should produce the

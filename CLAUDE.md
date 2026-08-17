@@ -48,6 +48,8 @@ A `State` is `(entries: EntryAction bitflags, yahtzee_bonus_eligible: bool, uppe
 
 `Scores::new_with<B: BuildBackend>(backend: &B) -> Result<Self, B::Error>` is the generic constructor; `Scores::new()` calls it with `&CpuBuildBackend` and unwraps the `Infallible` result. Use `new_with` directly to opt into a non-default backend (e.g. `&CudaBuildBackend::new()?` under the `cuda` feature).
 
+`Scores::new_with_unvalidated<B>` is the sibling that skips the BFS-reachability filter in the per-level batch enumeration: every structurally possible state at each level enters the DP, including the ~512k that no real game reaches. ~2× build wall-clock vs `new_with`. Used (a) as a soundness oracle for the BFS — `test_unvalidated_matches_validated` (gated `#[ignore]`) cross-checks that the validated and unvalidated tables agree on every reachable state's EV, and (b) as the substrate for any future fast path that wants regular per-level batch shapes (outer-loop SIMD across states, level-specialized GPU kernels). Today the validated path is what `Scores::new` uses; the unvalidated one is opt-in.
+
 `Scores::values(state)` returns an `ExpectedValues` by walking the three-roll decision tree in reverse, dispatching the linalg ops through a [`LinalgBackend`](#linalg-and-build-backends):
 
 1. `entry_actions[action, dice]` = immediate score of taking `action` on `dice` + stored EV of the resulting child state (via `State::score_and_child`, which handles upper bonus, Yahtzee bonus, and the joker rule).
@@ -97,7 +99,7 @@ For external comparison: the `timpalpant/yahtzee` Go reference takes ~45 s for t
 Helpful entry points:
 - **Examples**: `crates/core/examples/time_build.rs` (default), `time_build_naive.rs`, `cuda_smoke.rs`.
 - **Benches**: `crates/core/benches/recommend.rs` — see the `bench_backends` (per-state) and `bench_build_backends` (full builds) groups.
-- **Cross-check test**: `test_naive_backend_matches` asserts naive and ndarray agree on default-state EV within 1e-3.
+- **Cross-check tests**: `test_naive_backend_matches` asserts naive and ndarray agree on the default-state EV within 1e-3 (single scalar tripwire). `proptests::linalg_backends_agree_on_action_ranking` is the broader cousin: for `arb_state() × dice_idx`, every enabled `LinalgBackend` (naive, ndarray, optionally faer/simd) must produce the same overall EV *and* the same EV at each rank in the sorted entries / first_keepers / second_keepers lists, within 5e-3. This catches structural backend bugs that nudge EVs by ~1e-2 on niche states — well below the default-state test's noise floor. `test_unvalidated_matches_validated` (gated `#[ignore]`, run with `cargo test -p yahtzee-core --release -- --ignored`) compares `Scores::new_with` against `Scores::new_with_unvalidated` across every reachable state — i.e. cross-checks the BFS soundness as a side effect.
 
 ### Scoring helpers
 
@@ -120,7 +122,15 @@ Private helpers `turn_ev_by_roll3_dice()` and `turn_ev_by_roll2_dice(...)` build
 
 `Scores` derives `Serialize` / `Deserialize` and is persisted with `bincode`. The CLI (`crates/cli/src/main.rs`) is `clap`-subcommand-based — see the Commands section above for the four subcommands (`solve`, `value`, `play`, `build`) and how `--scores PATH` overrides the embedded score table. The `--entries` argument used by `solve` / `value` is a 13-character `0`/`1` string aligned with `ENTRY_ACTIONS` order.
 
-Both the CLI and wasm crates currently consume `yahtzee-core` with default features only (so the table-build path uses `CpuBuildBackend` → `NdarrayBackend`). The faster CPU backends (`simd`, `faer`) are gated behind features that neither downstream crate enables today; switching the CLI's `build` subcommand to use `simd` is a 1.84× wall-clock win with no API change. `cuda` is more situational (driver libs at runtime, NVIDIA-only) but plausible as an opt-in `cuda` feature on the CLI.
+CLI feature wiring (`crates/cli/Cargo.toml`):
+
+- `default = ["simd"]` — the `build` subcommand dispatches through `CpuBuildBackendWith(SimdBackend)` (~1.84× wall-clock vs `NdarrayBackend`, no API change). The `solve` / `value` / `play` subcommands deserialize the embedded table and don't hit `Scores::new()` regardless of features, so this only affects table regeneration.
+- `cuda` (opt-in) — when compiled (`cargo build -p yahtzee-cli --release --features cuda`), `build` dispatches through `CudaBuildBackend` instead, taking precedence over `simd`. Requires `libcuda` / `libcublas` / `libnvrtc` `.so`s on the runtime host (cudarc dynamic-loads, no CUDA SDK at build time). If GPU init fails the subcommand errors out — there's no automatic CPU fallback.
+- `--no-default-features` — falls back to `Scores::new()` (`NdarrayBackend`). Useful for benching the unaccelerated path.
+
+The selection is compile-time (`cfg`-gated `build_scores()` in `crates/cli/src/main.rs`), not a runtime flag.
+
+The wasm crate intentionally consumes `yahtzee-core` with default features only. It deserializes the embedded brotli blob rather than calling `Scores::new()`, so `simd` / `faer` / `cuda` would only affect the per-state `Scores::values()` walk (~100 µs/call, single-call-per-UI-action) — not worth a feature surface or extra deps. The canonical `scores.bin.br` is regenerated through the CLI's `build` subcommand, so backend-driven build wins land via the CLI path.
 
 `crates/wasm/src/lib.rs` exposes:
 

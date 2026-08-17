@@ -216,8 +216,7 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    eprintln!("[build] computing Scores::new() ...");
-    let scores = Scores::new();
+    let scores = build_scores()?;
 
     eprintln!("[build] serializing with bincode ...");
     let raw: Vec<u8> = bincode::serde::encode_to_vec(&scores, bincode::config::standard())
@@ -283,6 +282,35 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Helpers: scores I/O, state construction
 // ---------------------------------------------------------------------------
+
+/// Build a fresh `Scores` table for the `build` subcommand, using the fastest
+/// `BuildBackend` that was compiled in. Selection is feature-gated, *not* a
+/// runtime flag: `--features cuda` ⇒ GPU; otherwise default `simd` ⇒
+/// `CpuBuildBackendWith(SimdBackend)`; otherwise plain `Scores::new()`
+/// (`NdarrayBackend`). See `[features]` in `Cargo.toml` for the trade-offs.
+fn build_scores() -> Result<Scores> {
+    #[cfg(feature = "cuda")]
+    {
+        use yahtzee_core::linalg::CudaBuildBackend;
+        eprintln!("[build] computing Scores::new() via CudaBuildBackend ...");
+        let backend = CudaBuildBackend::new()
+            .context("initializing CUDA backend (libcuda/libcublas/libnvrtc on runtime host?)")?;
+        return Scores::new_with(&backend).context("CUDA Scores::new_with");
+    }
+    #[cfg(all(feature = "simd", not(feature = "cuda")))]
+    {
+        use yahtzee_core::linalg::{CpuBuildBackendWith, SimdBackend};
+        eprintln!("[build] computing Scores::new() via CpuBuildBackendWith(SimdBackend) ...");
+        let backend = CpuBuildBackendWith(SimdBackend::new());
+        // CpuBuildBackendWith::Error is Infallible — unwrap is statically safe.
+        return Ok(Scores::new_with(&backend).unwrap());
+    }
+    #[cfg(not(any(feature = "simd", feature = "cuda")))]
+    {
+        eprintln!("[build] computing Scores::new() via NdarrayBackend ...");
+        Ok(Scores::new())
+    }
+}
 
 /// The canonical solver table, brotli-compressed bincode of `Scores`. Tracked
 /// in git at `crates/cli/data/scores.bin.br` so fresh clones can build the CLI
