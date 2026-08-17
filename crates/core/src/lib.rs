@@ -16,6 +16,12 @@
 //! callers want [`recommend::recommend`] rather than the lower-level types
 //! here.
 
+// Anchor `blas-src` so the BLAS provider's symbols (e.g. `cblas_sdot`) survive
+// `--as-needed` link-time DCE. Without this, ndarray's `.dot()` calls fail to
+// link with `--features blas`. Has no runtime effect; pure link-time glue.
+#[cfg(feature = "blas")]
+extern crate blas_src;
+
 use std::collections::HashMap;
 use std::convert::From;
 use std::fmt;
@@ -23,7 +29,6 @@ use std::fmt::Display;
 use std::sync::LazyLock;
 
 use bitflags::bitflags;
-use ndarray::Zip;
 use ndarray::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -32,6 +37,12 @@ mod recommend;
 pub use recommend::{
     build_state, counts_to_faces, dice_to_counts, recommend, EntryRec, KeeperRec, Recommendation,
     StateInput,
+};
+
+pub mod linalg;
+pub use linalg::{
+    BuildBackend, CpuBuildBackend, CpuBuildBackendWith, LinalgBackend, NaiveBackend,
+    NdarrayBackend,
 };
 
 #[cfg(test)]
@@ -100,8 +111,12 @@ static DICE_IDX_LOOKUP: LazyLock<HashMap<DiceCounts, usize>> = LazyLock::new(mat
 static IDX_KEEPERS_LOOKUP: LazyLock<HashMap<usize, DiceCounts>> =
     LazyLock::new(math::idx_keepers_lookup);
 static DICE_AND_ENTRY_SCORES: LazyLock<Array2<u8>> = LazyLock::new(math::dice_and_entry_scores);
-static DICE_TO_ALLOWED_KEEPERS: LazyLock<Array2<f32>> = LazyLock::new(math::dice_to_keepers);
-static KEEPERS_TO_DICE_PROBABILITIES: LazyLock<Array2<f32>> = LazyLock::new(math::keepers_to_dice);
+// `pub(crate)` so the `linalg` submodule can read them; not part of the
+// public API.
+pub(crate) static DICE_TO_ALLOWED_KEEPERS: LazyLock<Array2<f32>> =
+    LazyLock::new(math::dice_to_keepers);
+pub(crate) static KEEPERS_TO_DICE_PROBABILITIES: LazyLock<Array2<f32>> =
+    LazyLock::new(math::keepers_to_dice);
 
 mod math {
     use super::EntryAction;
@@ -364,43 +379,81 @@ mod math {
 // Packed bitset over NUM_STATES entries (16_384 u64 words = 128 KiB).
 const VALID_STATES_WORDS: usize = (NUM_STATES as usize).div_ceil(64);
 
-/// Per-keeper expected dice-value: for each keeper `k`, sum over re-roll
-/// outcomes `d` of `P(k → d) * dice_values[d]`.
-fn keepers_from_dice(dice_values: &Array1<f32>) -> Array1<f32> {
-    let mut keepers: Array1<f32> = Array1::zeros(NUM_KEEPERS as usize);
-    Zip::from(&mut keepers)
-        .and(KEEPERS_TO_DICE_PROBABILITIES.rows())
-        .for_each(|avg, row| {
-            *avg = (&row * dice_values).sum();
-        });
-    keepers
-}
-
-/// Per-dice "best keeper" value: for each dice combo `d`, max over keepers
-/// valid for `d` of `keeper_values[k]`. (`DICE_TO_ALLOWED_KEEPERS` is an
-/// indicator matrix: 1 where the keeper is achievable from `d`, 0 elsewhere,
-/// so element-wise multiply masks the invalid keepers to 0 before the max.)
-fn dice_from_keepers(keeper_values: &Array1<f32>) -> Array1<f32> {
-    let mut dice: Array1<f32> = Array1::zeros(NUM_DICE_COMBINATIONS as usize);
-    Zip::from(&mut dice)
-        .and(DICE_TO_ALLOWED_KEEPERS.rows())
-        .for_each(|val, mask_row| {
-            *val = (&mask_row * keeper_values).fold(0_f32, |acc, elem| acc.max(*elem));
-        });
-    dice
-}
-
-/// Initial-roll distribution: row 0 of `KEEPERS_TO_DICE_PROBABILITIES` is the
-/// "kept nothing → roll 5 fresh dice" row, which is the marginal we want for
-/// turning per-dice values into the state EV.
-fn first_roll_probabilities() -> ndarray::ArrayView1<'static, f32> {
-    KEEPERS_TO_DICE_PROBABILITIES.index_axis(Axis(0), 0)
-}
+// The keepers_from_dice / dice_from_keepers / initial-roll-dot operations
+// previously implemented as free functions here now live on the
+// `LinalgBackend` trait in `crate::linalg`. `Scores::state_value` /
+// `Scores::values` call the default `NdarrayBackend` and behave identically;
+// the `_with` variants accept any backend for benchmarking.
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scores {
     state_scores: Array1<f32>,
     valid_states: Box<[u64]>,
+}
+
+/// Per-state entry-actions table: `(13, 252)` of `score + V(child)` for valid
+/// `(action, final_dice)` pairs, 0 otherwise. The first thing the per-state
+/// EV walk computes; what `state_value_with` / `values_with` fold over to get
+/// `third_dice`. Free function over a raw `&[f32]` state-scores buffer so it
+/// can be called from a [`BuildBackend`] impl that doesn't hold a `Scores`.
+pub fn entry_actions_array(state: State, state_scores: &[f32]) -> Array2<f32> {
+    Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
+        let action = EntryAction::from_bits(1 << action_idx).unwrap();
+        if state.is_valid_action(action) {
+            let (score, child) = state.score_and_child(action, dice_idx as u8);
+            let child_idx: usize = child.into();
+            score + state_scores[child_idx]
+        } else {
+            0_f32
+        }
+    })
+}
+
+/// Overall expected final score from `state` under optimal play, given the
+/// `state_scores` DP buffer. Free-function form of [`Scores::state_value_with`]:
+/// the per-state pipeline that [`BuildBackend`] impls call from inside their
+/// `compute_level`.
+pub fn state_value_with<B: LinalgBackend>(
+    state: State,
+    state_scores: &[f32],
+    backend: &B,
+) -> f32 {
+    let entry_actions = entry_actions_array(state, state_scores);
+    let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
+    let second_keepers = backend.keepers_from_dice(&third_dice);
+    let second_dice = backend.dice_from_keepers(&second_keepers);
+    let first_keepers = backend.keepers_from_dice(&second_dice);
+    let first_dice = backend.dice_from_keepers(&first_keepers);
+    backend.initial_roll_ev(&first_dice)
+}
+
+/// Materialize an [`ExpectedValues`] for `state` against the `state_scores`
+/// DP buffer. Free-function form of [`Scores::values_with`]; same math as
+/// [`state_value_with`] but keeps the per-roll intermediate arrays the
+/// recommendation API needs.
+pub fn values_with<B: LinalgBackend>(
+    state: State,
+    state_scores: &[f32],
+    backend: &B,
+) -> ExpectedValues {
+    let entry_actions = entry_actions_array(state, state_scores);
+    let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
+    let second_keepers = backend.keepers_from_dice(&third_dice);
+    let second_dice = backend.dice_from_keepers(&second_keepers);
+    let first_keepers = backend.keepers_from_dice(&second_dice);
+    let first_dice = backend.dice_from_keepers(&first_keepers);
+    let value = backend.initial_roll_ev(&first_dice);
+
+    ExpectedValues {
+        entry_actions,
+        third_dice,
+        second_keepers,
+        second_dice,
+        first_keepers,
+        first_dice,
+        value,
+        state,
+    }
 }
 
 impl Scores {
@@ -411,6 +464,24 @@ impl Scores {
     // startup; only the `build` subcommand and tests instantiate fresh.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Scores {
+        // CpuBuildBackend's Error type is `Infallible`, so the unwrap is
+        // statically guaranteed not to panic. We can't write a literal
+        // `match {}` because `Infallible` has no inhabitants and the match
+        // would still need to satisfy the return type.
+        match Scores::new_with(&CpuBuildBackend) {
+            Ok(s) => s,
+            Err(e) => match e {},
+        }
+    }
+
+    /// Build a [`Scores`] table using a caller-provided [`BuildBackend`].
+    ///
+    /// `Scores::new()` calls this with [`CpuBuildBackend`] (rayon over the
+    /// per-state pipeline) and unwraps the `Infallible` result. GPU
+    /// backends can fail (driver errors, out-of-memory, kernel launch
+    /// failure) — call this directly with `&CudaBuildBackend` and handle
+    /// the error.
+    pub fn new_with<B: BuildBackend>(backend: &B) -> Result<Scores, B::Error> {
         let state_scores = Array1::zeros(NUM_STATES as usize);
         let valid_states = vec![0_u64; VALID_STATES_WORDS].into_boxed_slice();
         let mut scores = Scores {
@@ -418,33 +489,73 @@ impl Scores {
             valid_states,
         };
         scores.set_valid_states();
-        scores.set_scores();
-        scores
+        scores.set_scores(backend)?;
+        Ok(scores)
     }
 
-    fn set_scores(&mut self) {
-        // We go level-by-level, bottom to top, for correctness when multiprocessing
+    fn set_scores<B: BuildBackend>(&mut self, backend: &B) -> Result<(), B::Error> {
+        // Bottom-up by level (most filled entries first) so each level only
+        // reads strictly-higher-level state scores. Within a level, all
+        // states are independent — that's the parallelism the BuildBackend
+        // exploits (rayon on CPU, kernel batch on GPU).
+        let trace = std::env::var("YAHTZEE_TRACE_LEVELS").ok().is_some();
         for level in (0..NUM_ENTRY_ACTIONS).rev() {
-            let mut new_scores = vec![0_f32; NUM_STATES as usize];
+            let t_collect = std::time::Instant::now();
+            let states = self.collect_states_at_level(level as usize);
+            let collect_ms = t_collect.elapsed().as_secs_f64() * 1000.0;
+            if states.is_empty() {
+                continue;
+            }
 
-            new_scores
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(state_idx, score)| {
-                    let state: State = state_idx.into();
-                    let state_level = state.level();
-                    if self.valid_state(state) && state_level == level as usize {
-                        *score = self.state_value(state);
-                    }
-                });
+            let t_compute = std::time::Instant::now();
+            let evs = backend.compute_level(&states, self.state_scores_slice())?;
+            let compute_ms = t_compute.elapsed().as_secs_f64() * 1000.0;
 
-            // write this level's scores
-            for (score_idx, score) in new_scores.into_iter().enumerate() {
-                if score > 0_f32 {
-                    self.state_scores[score_idx] = score;
-                }
+            // Write this level's EVs back into the DP buffer. Subsequent
+            // (lower) levels read these.
+            let t_write = std::time::Instant::now();
+            for (state, ev) in states.iter().zip(evs.iter()) {
+                self.state_scores[usize::from(*state)] = *ev;
+            }
+            let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
+
+            if trace {
+                eprintln!(
+                    "level={level:>2} batch={:>6} collect={collect_ms:>6.1}ms compute={compute_ms:>7.1}ms write={write_ms:>5.1}ms",
+                    states.len()
+                );
             }
         }
+        Ok(())
+    }
+
+    /// All valid states at exactly the given DP level (`level` = number of
+    /// entries filled). Returned in `usize`-encoded ascending order; the
+    /// `BuildBackend` doesn't depend on the order, but a stable order makes
+    /// debugging easier.
+    fn collect_states_at_level(&self, level: usize) -> Vec<State> {
+        // Parallel filter is cheap (tens of ms across all 13 levels) and not
+        // worth optimizing further; the inner DP per state dominates.
+        (0..NUM_STATES as usize)
+            .into_par_iter()
+            .filter_map(|idx| {
+                let state: State = idx.into();
+                if self.valid_state(state) && state.level() == level {
+                    Some(state)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Read-only view of the DP buffer. The CPU build backend hands this to
+    /// each per-state worker; the CUDA backend uploads it to device memory
+    /// once per level.
+    pub fn state_scores_slice(&self) -> &[f32] {
+        self.state_scores
+            .as_slice()
+            .expect("state_scores is contiguous")
     }
 
     /// Overall expected final score from `state` under optimal play. This is
@@ -454,57 +565,24 @@ impl Scores {
     /// underlying math is identical, so the perf delta is small (skips a
     /// struct construction); use this when you only need the EV.
     pub fn state_value(&self, state: State) -> f32 {
-        let entry_actions = self.entry_actions_array(state);
-        let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
-        let second_keepers = keepers_from_dice(&third_dice);
-        let second_dice = dice_from_keepers(&second_keepers);
-        let first_keepers = keepers_from_dice(&second_dice);
-        let first_dice = dice_from_keepers(&first_keepers);
-        first_roll_probabilities().dot(&first_dice)
+        self.state_value_with(state, &NdarrayBackend)
+    }
+
+    /// Like [`Scores::state_value`] but with a caller-provided
+    /// [`LinalgBackend`]. Used by benches to compare GEMV implementations
+    /// (matrixmultiply, BLAS, faer, …) without changing the rest of the
+    /// pipeline. Production callers want [`Scores::state_value`].
+    pub fn state_value_with<B: LinalgBackend>(&self, state: State, backend: &B) -> f32 {
+        state_value_with(state, self.state_scores_slice(), backend)
     }
 
     pub fn values(&self, state: State) -> ExpectedValues {
-        // Overall EV of each (action, final dice) pair: `score + V(child)` for
-        // valid actions, 0 for invalid. Read by the per-entry EV API.
-        let entry_actions = self.entry_actions_array(state);
-
-        // Value of each roll-3 dice combo: max action overall EV.
-        let third_dice = entry_actions.fold_axis(Axis(0), 0_f32, |acc, v| acc.max(*v));
-
-        // Value of each roll-2 keeper / roll-2 dice / roll-1 keeper / roll-1
-        // dice — alternating "max over allowed keepers" and "expectation over
-        // re-roll outcomes".
-        let second_keepers = keepers_from_dice(&third_dice);
-        let second_dice = dice_from_keepers(&second_keepers);
-        let first_keepers = keepers_from_dice(&second_dice);
-        let first_dice = dice_from_keepers(&first_keepers);
-
-        // Marginal over the initial-roll distribution gives overall state EV.
-        let value = first_roll_probabilities().dot(&first_dice);
-
-        ExpectedValues {
-            entry_actions,
-            third_dice,
-            second_keepers,
-            second_dice,
-            first_keepers,
-            first_dice,
-            value,
-            state,
-        }
+        self.values_with(state, &NdarrayBackend)
     }
 
-    fn entry_actions_array(&self, state: State) -> Array2<f32> {
-        Array2::from_shape_fn((13, 252), |(action_idx, dice_idx)| {
-            let action = EntryAction::from_bits(1 << action_idx).unwrap();
-            if state.is_valid_action(action) {
-                let (score, child) = state.score_and_child(action, dice_idx as u8);
-                let child_idx: usize = child.into();
-                score + self.state_scores[child_idx]
-            } else {
-                0_f32
-            }
-        })
+    /// Like [`Scores::values`] but with a caller-provided [`LinalgBackend`].
+    pub fn values_with<B: LinalgBackend>(&self, state: State, backend: &B) -> ExpectedValues {
+        values_with(state, self.state_scores_slice(), backend)
     }
 
     fn set_valid_states(&mut self) {
@@ -1001,6 +1079,55 @@ mod tests {
         let scores = shared_scores();
         let expected_value = scores.state_scores[default_idx];
         assert!((expected_value - 254.5896).abs() < 0.0001);
+    }
+
+    /// NaiveBackend (scalar `for` loops, no ndarray ops) should produce the
+    /// same default-state EV as NdarrayBackend (matrixmultiply-backed
+    /// `.dot()`), modulo float reordering. This is the most independent
+    /// cross-check we have, since the other backends share matrix
+    /// machinery; if these two disagree something is wrong.
+    #[test]
+    fn test_naive_backend_matches() {
+        let scores = shared_scores();
+        let state = State::default();
+        let nd = scores.state_value_with(state, &NdarrayBackend);
+        let nv = scores.state_value_with(state, &NaiveBackend);
+        assert!(
+            (nd - nv).abs() < 0.001,
+            "ndarray={nd} naive={nv} differ by more than 1e-3"
+        );
+    }
+
+    /// FaerBackend should produce the same default-state EV as NdarrayBackend
+    /// (the default), modulo float reordering. Uses the precomputed `state_scores`
+    /// table (built via the default backend) as the substrate, and only swaps
+    /// the per-state EV computation. Run with `cargo test --features faer ...`.
+    #[cfg(feature = "faer")]
+    #[test]
+    fn test_faer_backend_matches() {
+        let scores = shared_scores();
+        let state = State::default();
+        let nd = scores.state_value_with(state, &NdarrayBackend);
+        let fa = scores.state_value_with(state, &linalg::FaerBackend::new());
+        assert!(
+            (nd - fa).abs() < 0.001,
+            "ndarray={nd} faer={fa} differ by more than 1e-3"
+        );
+    }
+
+    /// Same as `test_faer_backend_matches` for the SIMD backend. Run with
+    /// `cargo test --features simd ...`.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn test_simd_backend_matches() {
+        let scores = shared_scores();
+        let state = State::default();
+        let nd = scores.state_value_with(state, &NdarrayBackend);
+        let si = scores.state_value_with(state, &linalg::SimdBackend::new());
+        assert!(
+            (nd - si).abs() < 0.001,
+            "ndarray={nd} simd={si} differ by more than 1e-3"
+        );
     }
 
     /// State for joker-rule tests: Yahtzee box filled and Threes filled, so a
