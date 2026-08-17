@@ -286,8 +286,9 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
 /// Build a fresh `Scores` table for the `build` subcommand, using the fastest
 /// `BuildBackend` that was compiled in. Selection is feature-gated, *not* a
 /// runtime flag: `--features cuda` ⇒ GPU; otherwise default `simd` ⇒
-/// `CpuBuildBackendWith(SimdBackend)`; otherwise plain `Scores::new()`
-/// (`NdarrayBackend`). See `[features]` in `Cargo.toml` for the trade-offs.
+/// `SimdBatchBuildBackend` (8-states-per-`f32x8`-lane outer-loop SIMD);
+/// otherwise plain `Scores::new()` (`NdarrayBackend`). See `[features]` in
+/// `Cargo.toml` for the trade-offs.
 fn build_scores() -> Result<Scores> {
     #[cfg(feature = "cuda")]
     {
@@ -299,11 +300,10 @@ fn build_scores() -> Result<Scores> {
     }
     #[cfg(all(feature = "simd", not(feature = "cuda")))]
     {
-        use yahtzee_core::linalg::{CpuBuildBackendWith, SimdBackend};
-        eprintln!("[build] computing Scores::new() via CpuBuildBackendWith(SimdBackend) ...");
-        let backend = CpuBuildBackendWith(SimdBackend::new());
-        // CpuBuildBackendWith::Error is Infallible — unwrap is statically safe.
-        return Ok(Scores::new_with(&backend).unwrap());
+        use yahtzee_core::linalg::SimdBatchBuildBackend;
+        eprintln!("[build] computing Scores::new() via SimdBatchBuildBackend ...");
+        // SimdBatchBuildBackend::Error is Infallible — unwrap is statically safe.
+        return Ok(Scores::new_with(&SimdBatchBuildBackend).unwrap());
     }
     #[cfg(not(any(feature = "simd", feature = "cuda")))]
     {
