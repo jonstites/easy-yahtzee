@@ -1,0 +1,21 @@
+# Compile native CPU code with all of the host's instruction-set extensions
+# enabled (AVX2, FMA, BMI2, etc. on x86_64; NEON / SVE on aarch64). The
+# default rustc target for x86_64 is just SSE2 — meaning `wide::f32x8` ops
+# silently fall back to `2 × f32x4` SSE2 implementations and `mul + add`
+# pairs never fuse into `vfmadd*ps`. On Zen 5 host hardware this leaves
+# roughly 1.2× e2e wall-clock unrealized in `Scores::new_with`.
+#
+# Scoped to x86_64 / aarch64 hosts only via `cfg`, so cross-compilation to
+# wasm32 (used by the `yahtzee-wasm` crate via `wasm-pack`) is unaffected
+# — wasm32 needs `target-feature=+simd128` not `target-cpu=native`.
+#
+# Caveat: the resulting host binary is NOT portable to older x86_64 CPUs
+# without the host's instruction-set extensions. The yahtzee-cli `solve` /
+# `value` / `play` subcommands deserialize the embedded brotli-compressed
+# scores table at startup and never call `Scores::new()`, so end users
+# don't pay the perf cost regardless. Only `cargo run --example time_build`
+# / `cargo bench` / `yahtzee-cli build` regenerate the table — and those
+# are dev-only operations on the host that compiled them.
+
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))']
+rustflags = ["-C", "target-cpu=native"]
