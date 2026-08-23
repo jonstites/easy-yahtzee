@@ -17,7 +17,7 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{anyhow, bail, Result};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 
 use yahtzee_core::{DiceCounts, EntryAction, Recommendation, Scores, State, ENTRY_ACTIONS};
 
@@ -121,7 +121,7 @@ pub(crate) fn run_with_io<R: BufRead, W: Write>(
 ) -> Result<u32> {
     let mut rng = match args.seed {
         Some(s) => StdRng::seed_from_u64(s),
-        None => StdRng::from_os_rng(),
+        None => rand::make_rng(),
     };
     let mut card = Scorecard::default();
 
