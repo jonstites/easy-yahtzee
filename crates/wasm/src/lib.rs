@@ -27,9 +27,8 @@ pub struct Solver {
 impl Solver {
     #[wasm_bindgen(constructor)]
     pub fn new(bytes: &[u8]) -> Result<Solver, JsValue> {
-        let (inner, _): (Scores, _) =
-            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-                .map_err(|e| JsValue::from_str(&format!("deserialize failed: {}", e)))?;
+        let inner: Scores = postcard::from_bytes(bytes)
+            .map_err(|e| JsValue::from_str(&format!("deserialize failed: {}", e)))?;
         Ok(Solver { inner })
     }
 

@@ -392,7 +392,7 @@ fn compute_lanes<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
     //   per batch (R4) to ~352.
     // - **R6.5**: when no lane in the batch is yahtzee-eligible
     //   (`ALL_NOT_YAHTZEE_ELIGIBLE = true`), the +100 yahtzee-bonus blend
-    //   `cast(yahtzee_eligible_mask).blend(100, 0)` is identically 0 and
+    //   `cast(yahtzee_eligible_mask).select(100, 0)` is identically 0 and
     //   the entire `yahtzee_bonus_f` add chain DCEs at compile time. The
     //   const generic threads through from `process_bucket`'s bucket-sort.
     //
@@ -622,7 +622,7 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
         let valid_int_mask =
             (entries_v & i32x16::splat(action_bits)).simd_eq(i32x16::splat(0));
         let valid_mask_f: f32x16 =
-            cast::<i32x16, f32x16>(valid_int_mask).blend(f32x16::splat(1.0), f32x16::splat(0.0));
+            cast::<i32x16, f32x16>(valid_int_mask).select(f32x16::splat(1.0), f32x16::splat(0.0));
 
         let entries_with_action_v = entries_v | i32x16::splat(action_bits);
 
@@ -655,7 +655,7 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
                 let new_upper_zero_mask = new_upper.simd_eq(i32x16::splat(0));
                 let upper_fires_mask = !upper_complete_mask & new_upper_zero_mask;
                 upper_bonus_per_count[c] = cast::<i32x16, f32x16>(upper_fires_mask)
-                    .blend(f32x16::splat(35.0), f32x16::splat(0.0));
+                    .select(f32x16::splat(35.0), f32x16::splat(0.0));
             }
 
             // joker_score is None for upper actions; suppress the unused
@@ -679,7 +679,7 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
                     f32x16::splat(0.0)
                 } else if dice_is_yahtzee {
                     cast::<i32x16, f32x16>(yahtzee_eligible_mask)
-                        .blend(f32x16::splat(100.0), f32x16::splat(0.0))
+                        .select(f32x16::splat(100.0), f32x16::splat(0.0))
                 } else {
                     f32x16::splat(0.0)
                 };
@@ -719,7 +719,7 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
                 f32x16::splat(0.0)
             } else {
                 cast::<i32x16, f32x16>(yahtzee_eligible_mask)
-                    .blend(f32x16::splat(100.0), f32x16::splat(0.0))
+                    .select(f32x16::splat(100.0), f32x16::splat(0.0))
             };
 
             let _ = joker_score;
@@ -768,7 +768,7 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
                         .simd_gt(i32x16::splat(0));
                     let joker_lane_mask = contains_yahtzee_mask & entries_have_face_mask;
                     cast::<i32x16, f32x16>(joker_lane_mask)
-                        .blend(f32x16::splat(joker_val as f32), raw_score_f)
+                        .select(f32x16::splat(joker_val as f32), raw_score_f)
                 } else {
                     raw_score_f
                 };
@@ -778,7 +778,7 @@ pub fn phase_entry_actions_per_count<const ALL_NOT_YAHTZEE_ELIGIBLE: bool>(
                     f32x16::splat(0.0)
                 } else if dice_is_yahtzee {
                     cast::<i32x16, f32x16>(yahtzee_eligible_mask)
-                        .blend(f32x16::splat(100.0), f32x16::splat(0.0))
+                        .select(f32x16::splat(100.0), f32x16::splat(0.0))
                 } else {
                     f32x16::splat(0.0)
                 };
@@ -889,7 +889,7 @@ pub fn phase_entry_actions_hoisted(
         let valid_int_mask =
             (entries_v & i32x16::splat(action_bits)).simd_eq(i32x16::splat(0));
         let valid_mask_f: f32x16 =
-            cast::<i32x16, f32x16>(valid_int_mask).blend(f32x16::splat(1.0), f32x16::splat(0.0));
+            cast::<i32x16, f32x16>(valid_int_mask).select(f32x16::splat(1.0), f32x16::splat(0.0));
 
         let entries_with_action_v = entries_v | i32x16::splat(action_bits);
 
@@ -927,7 +927,7 @@ pub fn phase_entry_actions_hoisted(
                         .simd_gt(i32x16::splat(0));
                     let joker_lane_mask = contains_yahtzee_mask & entries_have_face_mask;
                     cast::<i32x16, f32x16>(joker_lane_mask)
-                        .blend(f32x16::splat(joker_val as f32), raw_score_f)
+                        .select(f32x16::splat(joker_val as f32), raw_score_f)
                 } else {
                     raw_score_f
                 };
@@ -935,7 +935,7 @@ pub fn phase_entry_actions_hoisted(
                 // Yahtzee bonus only — upper bonus can't fire here.
                 let yahtzee_bonus_f = if dice_is_yahtzee {
                     cast::<i32x16, f32x16>(yahtzee_eligible_mask)
-                        .blend(f32x16::splat(100.0), f32x16::splat(0.0))
+                        .select(f32x16::splat(100.0), f32x16::splat(0.0))
                 } else {
                     f32x16::splat(0.0)
                 };
@@ -982,11 +982,11 @@ pub fn phase_entry_actions_hoisted(
                 let new_upper_zero_mask = new_upper_v.simd_eq(i32x16::splat(0));
                 let upper_fires_mask = !upper_complete_mask & new_upper_zero_mask;
                 let upper_bonus_f = cast::<i32x16, f32x16>(upper_fires_mask)
-                    .blend(f32x16::splat(35.0), f32x16::splat(0.0));
+                    .select(f32x16::splat(35.0), f32x16::splat(0.0));
 
                 let yahtzee_bonus_f = if dice_is_yahtzee {
                     cast::<i32x16, f32x16>(yahtzee_eligible_mask)
-                        .blend(f32x16::splat(100.0), f32x16::splat(0.0))
+                        .select(f32x16::splat(100.0), f32x16::splat(0.0))
                 } else {
                     f32x16::splat(0.0)
                 };
@@ -1108,7 +1108,7 @@ pub fn phase_entry_actions_vectorized(
         let valid_int_mask =
             (entries_v & i32x16::splat(action_bits)).simd_eq(i32x16::splat(0));
         let valid_mask_f: f32x16 =
-            cast::<i32x16, f32x16>(valid_int_mask).blend(f32x16::splat(1.0), f32x16::splat(0.0));
+            cast::<i32x16, f32x16>(valid_int_mask).select(f32x16::splat(1.0), f32x16::splat(0.0));
 
         // entries with this action OR'd in (used for child_idx).
         let entries_with_action_v = entries_v | i32x16::splat(action_bits);
@@ -1169,7 +1169,7 @@ pub fn phase_entry_actions_vectorized(
                     .simd_gt(i32x16::splat(0));
                 let joker_lane_mask = contains_yahtzee_mask & entries_have_face_mask;
                 cast::<i32x16, f32x16>(joker_lane_mask)
-                    .blend(f32x16::splat(joker_val as f32), raw_score_f)
+                    .select(f32x16::splat(joker_val as f32), raw_score_f)
             } else {
                 raw_score_f
             };
@@ -1179,12 +1179,12 @@ pub fn phase_entry_actions_vectorized(
             let new_upper_zero_mask = new_upper_v.simd_eq(i32x16::splat(0));
             let upper_fires_mask = !upper_complete_mask & new_upper_zero_mask;
             let upper_bonus_f = cast::<i32x16, f32x16>(upper_fires_mask)
-                .blend(f32x16::splat(35.0), f32x16::splat(0.0));
+                .select(f32x16::splat(35.0), f32x16::splat(0.0));
 
             // Yahtzee bonus: dice is Yahtzee && parent.yahtzee_bonus_eligible.
             let yahtzee_bonus_f = if dice_is_yahtzee {
                 cast::<i32x16, f32x16>(yahtzee_eligible_mask)
-                    .blend(f32x16::splat(100.0), f32x16::splat(0.0))
+                    .select(f32x16::splat(100.0), f32x16::splat(0.0))
             } else {
                 f32x16::splat(0.0)
             };

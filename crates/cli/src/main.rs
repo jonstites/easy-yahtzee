@@ -8,7 +8,7 @@
 //!
 //! `solve` and `value` use the score table embedded in the binary by default
 //! (`crates/cli/data/scores.bin.br`, brotli-decompressed at startup).
-//! `--scores PATH` overrides the embedded blob with a raw bincode file from
+//! `--scores PATH` overrides the embedded blob with a raw postcard file from
 //! disk — useful for testing a freshly-rebuilt table before checking it in.
 
 use std::fs;
@@ -57,7 +57,7 @@ enum Cmd {
 /// scorecard-space, plus the score-table source.
 #[derive(Args, Clone)]
 struct StateArgs {
-    /// Override the embedded score table with a raw bincode file produced by
+    /// Override the embedded score table with a raw postcard file produced by
     /// `easy-yahtzee build` (no `--brotli`). Useful when iterating on
     /// `crates/core` without rebuilding the CLI binary.
     #[arg(long, value_name = "PATH")]
@@ -146,7 +146,7 @@ pub(crate) struct PlayArgs {
 
 #[derive(Args)]
 struct BuildArgs {
-    /// Path for the bincode-serialized score table.
+    /// Path for the postcard-serialized score table.
     #[arg(short = 'o', long, default_value = "scores.bin")]
     output: PathBuf,
 
@@ -218,9 +218,8 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
 
     let scores = build_scores()?;
 
-    eprintln!("[build] serializing with bincode ...");
-    let raw: Vec<u8> = bincode::serde::encode_to_vec(&scores, bincode::config::standard())
-        .context("bincode serialize")?;
+    eprintln!("[build] serializing with postcard ...");
+    let raw: Vec<u8> = postcard::to_allocvec(&scores).context("postcard serialize")?;
     fs::write(&args.output, &raw)
         .with_context(|| format!("writing {}", args.output.display()))?;
     eprintln!("[build] wrote {} ({} bytes)", args.output.display(), raw.len());
@@ -312,7 +311,7 @@ fn build_scores() -> Result<Scores> {
     }
 }
 
-/// The canonical solver table, brotli-compressed bincode of `Scores`. Tracked
+/// The canonical solver table, brotli-compressed postcard of `Scores`. Tracked
 /// in git at `crates/cli/data/scores.bin.br` so fresh clones can build the CLI
 /// without first running the multi-minute `Scores::new()` from `crates/core`.
 const EMBEDDED_SCORES_BR: &[u8] = include_bytes!("../data/scores.bin.br");
@@ -326,22 +325,20 @@ fn load_or_embedded_scores(path: Option<&std::path::Path>) -> Result<Scores> {
 
 fn load_scores(path: &std::path::Path) -> Result<Scores> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let (scores, _): (Scores, _) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-            .with_context(|| format!("deserializing {}", path.display()))?;
+    let scores: Scores = postcard::from_bytes(&bytes)
+        .with_context(|| format!("deserializing {}", path.display()))?;
     Ok(scores)
 }
 
 /// Decompress and deserialize the embedded score table. Allocates ~4 MiB for
-/// the decompressed bincode buffer; the decode itself takes tens of ms.
+/// the decompressed postcard buffer; the decode itself takes tens of ms.
 fn embedded_scores() -> Result<Scores> {
     let mut decompressed: Vec<u8> = Vec::with_capacity(4 * 1024 * 1024);
     let mut reader: &[u8] = EMBEDDED_SCORES_BR;
     brotli::BrotliDecompress(&mut reader, &mut decompressed)
         .context("decompressing embedded score table")?;
-    let (scores, _): (Scores, _) =
-        bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())
-            .context("deserializing embedded score table (regenerate the embed?)")?;
+    let scores: Scores = postcard::from_bytes(&decompressed)
+        .context("deserializing embedded score table (regenerate the embed?)")?;
     Ok(scores)
 }
 

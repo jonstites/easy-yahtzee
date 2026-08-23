@@ -5,12 +5,9 @@ use yahtzee_wasm::{core_recommend, StateInput};
 fn opening_large_straight_roll_3() {
     let scores = Scores::new();
 
-    // Round-trip through bincode to exercise the wire format Solver::new uses.
-    let bytes = bincode::serde::encode_to_vec(&scores, bincode::config::standard())
-        .expect("serialize");
-    let (round_tripped, _): (Scores, _) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-            .expect("deserialize");
+    // Round-trip through postcard to exercise the wire format Solver::new uses.
+    let bytes = postcard::to_allocvec(&scores).expect("serialize");
+    let round_tripped: Scores = postcard::from_bytes(&bytes).expect("deserialize");
     assert_eq!(scores, round_tripped);
 
     let input = StateInput {
