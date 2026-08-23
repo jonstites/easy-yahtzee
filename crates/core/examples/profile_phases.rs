@@ -33,7 +33,7 @@ fn main() {
 #[cfg(feature = "simd")]
 fn main() {
     use std::hint::black_box;
-    use wide::f32x8;
+    use wide::f32x16;
     use yahtzee_core::linalg::simd_batch::{
         phase_entry_actions_fuse, phase_gemv, phase_masked_max,
     };
@@ -57,13 +57,13 @@ fn main() {
     // here makes callgrind's D1mr / DLmr counts meaningful proxies for the
     // production cache behavior.
     let s0 = State::default();
-    let states: [State; 8] = std::array::from_fn(|i| s0.score_and_child(ENTRY_ACTIONS[i], 0).1);
+    let states: [State; 16] = std::array::from_fn(|i| s0.score_and_child(ENTRY_ACTIONS[i], 0).1);
 
     // Realistic intermediate buffers: pre-fill once so each phase below
     // sees a representative input.
-    let mut third_dice = vec![f32x8::splat(0.0); N_DICE];
-    let mut second_keepers = vec![f32x8::splat(0.0); N_KEEPERS];
-    let mut second_dice = vec![f32x8::splat(0.0); N_DICE];
+    let mut third_dice = vec![f32x16::splat(0.0); N_DICE];
+    let mut second_keepers = vec![f32x16::splat(0.0); N_KEEPERS];
+    let mut second_dice = vec![f32x16::splat(0.0); N_DICE];
     phase_entry_actions_fuse(&states, &state_scores, &mut third_dice);
     phase_gemv(&mut second_keepers, &third_dice);
     phase_masked_max(&mut second_dice, &second_keepers);
@@ -90,7 +90,7 @@ fn main() {
     );
 
     bench_entry_actions(n_entry, &states, &state_scores, &mut third_dice);
-    let mut entry_actions_table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
+    let mut entry_actions_table = vec![f32x16::splat(0.0); N_ACTIONS * N_DICE];
     bench_entry_actions_precomputed(
         n_precomputed,
         &states,
@@ -114,9 +114,9 @@ fn main() {
 #[inline(never)]
 fn bench_entry_actions(
     iters: usize,
-    states: &[yahtzee_core::State; 8],
+    states: &[yahtzee_core::State; 16],
     state_scores: &[f32],
-    out: &mut [wide::f32x8],
+    out: &mut [wide::f32x16],
 ) {
     use std::hint::black_box;
     use yahtzee_core::linalg::simd_batch::phase_entry_actions_fuse;
@@ -129,10 +129,10 @@ fn bench_entry_actions(
 #[inline(never)]
 fn bench_entry_actions_precomputed(
     iters: usize,
-    states: &[yahtzee_core::State; 8],
+    states: &[yahtzee_core::State; 16],
     state_scores: &[f32],
-    table: &mut [wide::f32x8],
-    out: &mut [wide::f32x8],
+    table: &mut [wide::f32x16],
+    out: &mut [wide::f32x16],
 ) {
     use std::hint::black_box;
     use yahtzee_core::linalg::simd_batch::phase_entry_actions_precomputed;
@@ -148,7 +148,7 @@ fn bench_entry_actions_precomputed(
 
 #[cfg(feature = "simd")]
 #[inline(never)]
-fn bench_fused(iters: usize, out: &mut [wide::f32x8], input: &[wide::f32x8]) {
+fn bench_fused(iters: usize, out: &mut [wide::f32x16], input: &[wide::f32x16]) {
     use std::hint::black_box;
     use yahtzee_core::linalg::simd_batch::phase_fused_keeper_round;
     for _ in 0..iters {
@@ -158,7 +158,7 @@ fn bench_fused(iters: usize, out: &mut [wide::f32x8], input: &[wide::f32x8]) {
 
 #[cfg(feature = "simd")]
 #[inline(never)]
-fn bench_dense_gemv(iters: usize, out: &mut [wide::f32x8], input: &[wide::f32x8]) {
+fn bench_dense_gemv(iters: usize, out: &mut [wide::f32x16], input: &[wide::f32x16]) {
     use std::hint::black_box;
     use yahtzee_core::linalg::simd_batch::phase_gemv;
     for _ in 0..iters {
@@ -168,7 +168,7 @@ fn bench_dense_gemv(iters: usize, out: &mut [wide::f32x8], input: &[wide::f32x8]
 
 #[cfg(feature = "simd")]
 #[inline(never)]
-fn bench_dense_masked_max(iters: usize, out: &mut [wide::f32x8], input: &[wide::f32x8]) {
+fn bench_dense_masked_max(iters: usize, out: &mut [wide::f32x16], input: &[wide::f32x16]) {
     use std::hint::black_box;
     use yahtzee_core::linalg::simd_batch::phase_masked_max;
     for _ in 0..iters {

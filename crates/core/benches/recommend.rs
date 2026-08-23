@@ -223,7 +223,7 @@ fn bench_build_backends(c: &mut Criterion) {
 /// See `crates/core/PERFORMANCE.md` for current numbers.
 #[cfg(feature = "simd")]
 fn bench_simd_batch_phases(c: &mut Criterion) {
-    use wide::f32x8;
+    use wide::f32x16;
     use yahtzee_core::linalg::simd_batch::{
         phase_entry_actions_fuse, phase_entry_actions_hoisted, phase_entry_actions_per_count,
         phase_entry_actions_precomputed, phase_entry_actions_vectorized, phase_final_dot,
@@ -240,18 +240,18 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
     // Eight copies of the default state. Default-state has 13 valid actions,
     // so this is a worst-case bound for `phase_entry_actions_fuse` (most
     // action-loop iterations do real work). The other three phases are
-    // state-independent — they only see the f32x8 scratch — so the choice of
+    // state-independent — they only see the f32x16 scratch — so the choice of
     // state doesn't affect their timings.
-    let states: [State; 8] = [State::default(); 8];
+    let states: [State; 16] = [State::default(); 16];
 
     // Pre-fill scratch by running the pipeline once. Subsequent bench
     // iterations reuse these buffers as realistic inputs (post-step-1+2 for
     // gemv, post-step-3 for masked_max, post-step-6 for final_dot).
-    let mut third_dice = vec![f32x8::splat(0.0); N_DICE];
-    let mut second_keepers = vec![f32x8::splat(0.0); N_KEEPERS];
-    let mut second_dice = vec![f32x8::splat(0.0); N_DICE];
-    let mut first_keepers = vec![f32x8::splat(0.0); N_KEEPERS];
-    let mut first_dice = vec![f32x8::splat(0.0); N_DICE];
+    let mut third_dice = vec![f32x16::splat(0.0); N_DICE];
+    let mut second_keepers = vec![f32x16::splat(0.0); N_KEEPERS];
+    let mut second_dice = vec![f32x16::splat(0.0); N_DICE];
+    let mut first_keepers = vec![f32x16::splat(0.0); N_KEEPERS];
+    let mut first_dice = vec![f32x16::splat(0.0); N_DICE];
     phase_entry_actions_fuse(&states, state_scores, &mut third_dice);
     phase_gemv(&mut second_keepers, &third_dice);
     phase_masked_max(&mut second_dice, &second_keepers);
@@ -260,17 +260,39 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("simd_batch_phases");
 
-    // Production path (R5): per-score-class precomputation in the slow arm.
-    // Upper actions get a `[f32x8; 6]` precomputed `state_scores[child]`
-    // table indexed by `count(face, d)`; YAHTZEE gets a 2-entry table
-    // indexed by `is_yahtzee(d)`. Slow-arm gathers per batch drop from
-    // ~14k (R4) to ~300 (R5). Pre-allocate the table outside the bench
-    // loop so the timing is just compute, not allocation.
+    // Production path (R5+R6.5) — slow bucket: 8 default-state copies, all
+    // with `yahtzee_bonus_eligible = false`, but we dispatch via
+    // `<false>` to keep the +100 yahtzee-bonus blend live (i.e. the "may
+    // be yahtzee-eligible" code path). Per-score-class precompute in the
+    // slow arm: upper actions get a `[f32x16; 6]` precomputed
+    // `state_scores[child]` table indexed by `count(face, d)`; YAHTZEE
+    // gets a 2-entry table indexed by `is_yahtzee(d)`. Slow-arm gathers
+    // per batch drop from ~14k (R4) to ~300 (R5).
     group.bench_function("entry_actions_per_count", |b| {
-        let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
-        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        let mut table = vec![f32x16::splat(0.0); N_ACTIONS * N_DICE];
+        let mut out = vec![f32x16::splat(0.0); N_DICE];
         b.iter(|| {
-            phase_entry_actions_per_count(
+            phase_entry_actions_per_count::<false>(
+                black_box(&states),
+                black_box(state_scores),
+                black_box(&mut table),
+                black_box(&mut out),
+            );
+        })
+    });
+
+    // Production path (R5+R6.5) — fast bucket: same 8 default-state copies
+    // (yahtzee_bonus_eligible = false) but dispatched via `<true>` so the
+    // const generic DCE's the entire +100 yahtzee-bonus blend chain at
+    // compile time. Bucket frequency at heavy levels is ~52-95% of states
+    // (no lane in the batch is yahtzee-eligible), so this is the more
+    // common code path in production. Per-batch saving over `<false>` is
+    // small but applies to the majority of work.
+    group.bench_function("entry_actions_per_count_not_yahtzee_elig", |b| {
+        let mut table = vec![f32x16::splat(0.0); N_ACTIONS * N_DICE];
+        let mut out = vec![f32x16::splat(0.0); N_DICE];
+        b.iter(|| {
+            phase_entry_actions_per_count::<true>(
                 black_box(&states),
                 black_box(state_scores),
                 black_box(&mut table),
@@ -283,8 +305,8 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
     // gathers per (state, action, dice) — no per-count precompute. Captures
     // the R5 win as a delta against `entry_actions_per_count`.
     group.bench_function("entry_actions_hoisted", |b| {
-        let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
-        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        let mut table = vec![f32x16::splat(0.0); N_ACTIONS * N_DICE];
+        let mut out = vec![f32x16::splat(0.0); N_DICE];
         b.iter(|| {
             phase_entry_actions_hoisted(
                 black_box(&states),
@@ -300,8 +322,8 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
     // child is d-independent and could have been hoisted). Captures the
     // hoist win as a delta against `entry_actions_hoisted`.
     group.bench_function("entry_actions_vectorized", |b| {
-        let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
-        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        let mut table = vec![f32x16::splat(0.0); N_ACTIONS * N_DICE];
+        let mut out = vec![f32x16::splat(0.0); N_DICE];
         b.iter(|| {
             phase_entry_actions_vectorized(
                 black_box(&states),
@@ -316,8 +338,8 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
     // per-lane work is scalar (one lane at a time). Captures the
     // vectorization win as a delta against entry_actions_vectorized.
     group.bench_function("entry_actions_precomputed", |b| {
-        let mut table = vec![f32x8::splat(0.0); N_ACTIONS * N_DICE];
-        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        let mut table = vec![f32x16::splat(0.0); N_ACTIONS * N_DICE];
+        let mut out = vec![f32x16::splat(0.0); N_DICE];
         b.iter(|| {
             phase_entry_actions_precomputed(
                 black_box(&states),
@@ -331,7 +353,7 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
     // Bench-only baseline: same semantics, build+reduce fused inline. Kept
     // so the precompute win shows up as a delta in the bench output.
     group.bench_function("entry_actions_fuse", |b| {
-        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        let mut out = vec![f32x16::splat(0.0); N_DICE];
         b.iter(|| {
             phase_entry_actions_fuse(
                 black_box(&states),
@@ -342,14 +364,14 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
     });
 
     group.bench_function("gemv", |b| {
-        let mut out = vec![f32x8::splat(0.0); N_KEEPERS];
+        let mut out = vec![f32x16::splat(0.0); N_KEEPERS];
         b.iter(|| {
             phase_gemv(black_box(&mut out), black_box(&third_dice));
         })
     });
 
     group.bench_function("masked_max", |b| {
-        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        let mut out = vec![f32x16::splat(0.0); N_DICE];
         b.iter(|| {
             phase_masked_max(black_box(&mut out), black_box(&second_keepers));
         })
@@ -358,7 +380,7 @@ fn bench_simd_batch_phases(c: &mut Criterion) {
     // Sparse fused gemv+masked_max: drops in for the gemv→masked_max pair
     // above. Compare time vs (gemv + masked_max) to see the sparse fusion win.
     group.bench_function("fused_keeper_round", |b| {
-        let mut out = vec![f32x8::splat(0.0); N_DICE];
+        let mut out = vec![f32x16::splat(0.0); N_DICE];
         b.iter(|| {
             phase_fused_keeper_round(black_box(&mut out), black_box(&third_dice));
         })

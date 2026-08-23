@@ -547,8 +547,16 @@ impl Scores {
         // its meaning ("reachable from default state") regardless of build
         // mode. The mode only controls whether the per-level enumeration
         // *uses* the bitmap as a filter.
+        //
+        // R9 — single bitmap walk after BFS extracts per-level state lists
+        // (`level_frontiers[L]` = state indices with `popcount(entries) == L`,
+        // BFS-reachable only). `set_scores` consumes them in
+        // `BuildMode::Validated` to skip the 1M-state scan in
+        // `collect_states_at_level` (13 × 1M filter-body iterations
+        // dominated the closure-inlined Ir share post-R7).
         scores.set_valid_states();
-        scores.set_scores(backend, mode)?;
+        let level_frontiers = scores.extract_level_frontiers();
+        scores.set_scores(backend, mode, &level_frontiers)?;
         Ok(scores)
     }
 
@@ -556,28 +564,42 @@ impl Scores {
         &mut self,
         backend: &B,
         mode: BuildMode,
+        level_frontiers: &[Vec<usize>],
     ) -> Result<(), B::Error> {
         // Bottom-up by level (most filled entries first) so each level only
         // reads strictly-higher-level state scores. Within a level, all
         // states are independent — that's the parallelism the BuildBackend
         // exploits (rayon on CPU, kernel batch on GPU).
         let trace = std::env::var("YAHTZEE_TRACE_LEVELS").ok().is_some();
+        // R9 — pre-allocate the per-level EV scratch once at the top of
+        // `set_scores` and reuse across all 13 levels. Pre-R9 each call to
+        // `compute_level` allocated its own `Vec<f32>` of `states.len()`
+        // (~67k floats = ~268 KiB at the heaviest level); 13 levels × 268 KiB
+        // = ~3.5 MiB of per-build allocator churn.
+        //
+        // Sized to max(validated frontier sizes, unvalidated level sizes).
+        // Validated runs see at most ~126k states (level 7); unvalidated
+        // runs see up to `C(13, L) × 128` = 219,648 states (level 6 or 7).
+        // The cheap upper bound `NUM_STATES = 2^20` (4 MiB of `f32`) covers
+        // both and avoids the dispatch on `mode`.
+        let mut evs_scratch: Vec<f32> = vec![0.0_f32; NUM_STATES as usize];
         for level in (0..NUM_ENTRY_ACTIONS).rev() {
             let t_collect = std::time::Instant::now();
-            let states = self.collect_states_at_level(level as usize, mode);
+            let states = self.collect_states_at_level(level as usize, mode, level_frontiers);
             let collect_ms = t_collect.elapsed().as_secs_f64() * 1000.0;
             if states.is_empty() {
                 continue;
             }
 
             let t_compute = std::time::Instant::now();
-            let evs = backend.compute_level(&states, self.state_scores_slice())?;
+            let evs_slice = &mut evs_scratch[..states.len()];
+            backend.compute_level(&states, self.state_scores_slice(), evs_slice)?;
             let compute_ms = t_compute.elapsed().as_secs_f64() * 1000.0;
 
             // Write this level's EVs back into the DP buffer. Subsequent
             // (lower) levels read these.
             let t_write = std::time::Instant::now();
-            for (state, ev) in states.iter().zip(evs.iter()) {
+            for (state, ev) in states.iter().zip(evs_slice.iter()) {
                 self.state_scores[usize::from(*state)] = *ev;
             }
             let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
@@ -597,25 +619,41 @@ impl Scores {
     /// state space). In [`BuildMode::Unvalidated`], every structurally
     /// possible state at the level is returned.
     ///
-    /// Returned in `usize`-encoded ascending order; the `BuildBackend`
-    /// doesn't depend on the order, but a stable order makes debugging
-    /// easier.
-    fn collect_states_at_level(&self, level: usize, mode: BuildMode) -> Vec<State> {
-        // Parallel filter is cheap (tens of ms across all 13 levels) and not
-        // worth optimizing further; the inner DP per state dominates.
-        (0..NUM_STATES as usize)
-            .into_par_iter()
-            .filter_map(|idx| {
-                let state: State = idx.into();
-                if state.level() != level {
-                    return None;
-                }
-                match mode {
-                    BuildMode::Validated if !self.valid_state(state) => None,
-                    _ => Some(state),
-                }
-            })
-            .collect()
+    /// In Validated mode this is now a pure lookup into `level_frontiers`
+    /// (BFS-enumerated, length 14, one Vec<usize> per level) followed by an
+    /// idx→State unpack. Pre-R9 this scanned `0..NUM_STATES = 1M` once per
+    /// level — 13M filter-body iterations total — which auto-vectorized
+    /// nicely but was a hidden chunk of total Ir (~15-20% per cachegrind
+    /// post-R7, all inlined into the rayon closure plumbing so it didn't
+    /// show under `collect_states_at_level`'s name).
+    ///
+    /// Unvalidated mode keeps the 1M-scan because the level frontiers only
+    /// contain BFS-reachable states; the unvalidated path needs every
+    /// structurally possible state. This is the rare path (used by
+    /// `test_unvalidated_matches_validated` and direct callers of
+    /// `new_with_unvalidated`); the perf cost is acceptable.
+    fn collect_states_at_level(
+        &self,
+        level: usize,
+        mode: BuildMode,
+        level_frontiers: &[Vec<usize>],
+    ) -> Vec<State> {
+        match mode {
+            BuildMode::Validated => level_frontiers[level]
+                .iter()
+                .map(|&idx| State::from(idx))
+                .collect(),
+            BuildMode::Unvalidated => (0..NUM_STATES as usize)
+                .into_par_iter()
+                .filter_map(|idx| {
+                    let state: State = idx.into();
+                    if state.level() != level {
+                        return None;
+                    }
+                    Some(state)
+                })
+                .collect(),
+        }
     }
 
     /// Read-only view of the DP buffer. The CPU build backend hands this to
@@ -863,6 +901,39 @@ impl Scores {
                 t0.elapsed().as_secs_f64() * 1000.0
             );
         }
+    }
+
+    /// R9 — Post-BFS pass: walk the `valid_states` bitmap once and produce
+    /// a `Vec<Vec<usize>>` of length `NUM_ENTRY_ACTIONS + 1 = 14`, where
+    /// `result[L]` is the list of state indices with `popcount(entries) == L`
+    /// (BFS-reachable states only). Single-threaded; ~536k set bits total →
+    /// ~5M instructions ≈ 1 ms wall.
+    ///
+    /// This replaces the pre-R9 pattern of `collect_states_at_level` scanning
+    /// `0..NUM_STATES = 1M` indices once per level (13M filter-body
+    /// iterations total). Doing the extraction in one bitmap walk after BFS
+    /// — rather than retaining frontiers *inside* BFS — keeps BFS's hot
+    /// loop allocator behavior unchanged. (An earlier R9 attempt retained
+    /// frontiers inside BFS via `mem::replace` and saw a ~20 ms BFS
+    /// regression, presumably from the surviving Vec<usize>s keeping memory
+    /// pressure higher across BFS iterations.)
+    fn extract_level_frontiers(&self) -> Vec<Vec<usize>> {
+        let mut level_frontiers: Vec<Vec<usize>> =
+            (0..=NUM_ENTRY_ACTIONS as usize).map(|_| Vec::new()).collect();
+        for word_idx in 0..VALID_STATES_WORDS {
+            let mut word = self.valid_states[word_idx];
+            while word != 0 {
+                let bit_pos = word.trailing_zeros() as usize;
+                let idx = word_idx * 64 + bit_pos;
+                // Level = popcount(entries) where entries is bits 7..19 of
+                // idx. Avoid the State::from(idx) round-trip — just shift
+                // and count.
+                let level = ((idx >> 7) as u32).count_ones() as usize;
+                level_frontiers[level].push(idx);
+                word &= word - 1;
+            }
+        }
+        level_frontiers
     }
 
     pub fn valid_state(&self, state: State) -> bool {

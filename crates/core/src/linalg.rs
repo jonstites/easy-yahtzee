@@ -207,18 +207,28 @@ pub trait BuildBackend: Send + Sync {
     /// surfacing driver / cuBLAS / kernel errors.
     type Error: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static;
 
-    /// Compute the overall EV of every state in `states`. The returned
-    /// vector is in the same order as the input. `state_scores` is the
-    /// (read-only) DP buffer holding EVs for already-computed levels —
-    /// every state in `states` is at the same level, and the only entries
-    /// of `state_scores` they read are at strictly higher levels (more
-    /// entries filled), so the contents at the level-being-computed don't
-    /// matter.
+    /// Compute the overall EV of every state in `states`, writing each into
+    /// the corresponding position in `out`. `out.len() == states.len()`
+    /// (caller's responsibility — debug-asserted inside each impl). The
+    /// caller may pass an uninitialized / stale slice; every position will
+    /// be overwritten by this call.
+    ///
+    /// `state_scores` is the (read-only) DP buffer holding EVs for
+    /// already-computed levels — every state in `states` is at the same
+    /// level, and the only entries of `state_scores` they read are at
+    /// strictly higher levels (more entries filled), so the contents at
+    /// the level-being-computed don't matter.
+    ///
+    /// R9 — `out: &mut [f32]` (instead of `-> Vec<f32>`) lets the caller
+    /// pre-allocate one buffer at top of `set_scores` and reuse it across
+    /// all 13 DP levels, eliminating 13 per-build allocations (~270 KiB
+    /// each) and the implicit zero-init each `vec![0.0; N]` does.
     fn compute_level(
         &self,
         states: &[State],
         state_scores: &[f32],
-    ) -> Result<Vec<f32>, Self::Error>;
+        out: &mut [f32],
+    ) -> Result<(), Self::Error>;
 }
 
 /// Default [`BuildBackend`] impl: rayon `par_iter` over the per-state EV
@@ -238,12 +248,17 @@ impl BuildBackend for CpuBuildBackend {
         &self,
         states: &[State],
         state_scores: &[f32],
-    ) -> Result<Vec<f32>, Self::Error> {
+        out: &mut [f32],
+    ) -> Result<(), Self::Error> {
+        debug_assert_eq!(states.len(), out.len());
         let backend = NdarrayBackend;
-        Ok(states
+        states
             .par_iter()
-            .map(|state| state_value_with(*state, state_scores, &backend))
-            .collect())
+            .zip(out.par_iter_mut())
+            .for_each(|(state, out_slot)| {
+                *out_slot = state_value_with(*state, state_scores, &backend);
+            });
+        Ok(())
     }
 }
 
@@ -265,11 +280,16 @@ impl<L: LinalgBackend> BuildBackend for CpuBuildBackendWith<L> {
         &self,
         states: &[State],
         state_scores: &[f32],
-    ) -> Result<Vec<f32>, Self::Error> {
-        Ok(states
+        out: &mut [f32],
+    ) -> Result<(), Self::Error> {
+        debug_assert_eq!(states.len(), out.len());
+        states
             .par_iter()
-            .map(|state| state_value_with(*state, state_scores, &self.0))
-            .collect())
+            .zip(out.par_iter_mut())
+            .for_each(|(state, out_slot)| {
+                *out_slot = state_value_with(*state, state_scores, &self.0);
+            });
+        Ok(())
     }
 }
 
